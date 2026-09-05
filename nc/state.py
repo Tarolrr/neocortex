@@ -105,7 +105,21 @@ class State:
         self.db.commit()
 
     def _migrate(self) -> None:
-        """Add columns introduced after a database was first created."""
+        """Apply additive schema changes to new and existing databases."""
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS proposal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL REFERENCES project(id),
+                source TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                spec TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'approved', 'rejected')),
+                created_at REAL NOT NULL,
+                decided_at REAL,
+                reason TEXT
+            )
+        """)
         for table, column, decl in (
             ("project", "mirror", "TEXT"),
             ("task", "merge_commit", "TEXT"),
@@ -139,7 +153,11 @@ class State:
     # --- tasks -----------------------------------------------------------
     def next_task_id(self, project_id: str) -> str:
         """Ids are never reused, even after a task row is deleted."""
-        self.x(
+        with self.db:
+            return self._next_task_id(project_id)
+
+    def _next_task_id(self, project_id: str) -> str:
+        self.db.execute(
             "INSERT INTO task_seq(project_id,last) VALUES(?,1)"
             " ON CONFLICT(project_id) DO UPDATE SET last = last + 1",
             (project_id,),
@@ -150,15 +168,83 @@ class State:
     def add_task(self, project_id: str, title: str, objective: str,
                  acceptance: list[str], boundaries: list[str] | None = None,
                  priority: int = 100, budget_turns: int = 6) -> str:
-        tid = self.next_task_id(project_id)
+        with self.db:
+            return self._add_task(project_id, title, objective, acceptance, boundaries,
+                                  priority, budget_turns)
+
+    def _add_task(self, project_id: str, title: str, objective: str,
+                  acceptance: list[str], boundaries: list[str] | None = None,
+                  priority: int = 100, budget_turns: int = 6) -> str:
+        tid = self._next_task_id(project_id)
         now = time.time()
-        self.x(
+        self.db.execute(
             "INSERT INTO task(id,project_id,title,objective,acceptance,boundaries,status,priority,"
             "budget_turns,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued',?,?,?,?)",
             (tid, project_id, title, objective, json.dumps(acceptance),
              json.dumps(boundaries or []), priority, budget_turns, now, now),
         )
         return tid
+
+    def add_task_spec(self, spec: dict) -> str:
+        """Use the same task fields for file imports and proposal approvals."""
+        with self.db:
+            return self._add_task_spec(spec)
+
+    def _add_task_spec(self, spec: dict) -> str:
+        return self._add_task(spec["project"], spec["title"], spec["objective"],
+                              spec["acceptance"], spec.get("boundaries"),
+                              spec.get("priority", 100), spec.get("budget_turns", 6))
+
+    # --- proposals -------------------------------------------------------
+    def add_proposal(self, project_id: str, source: str, rationale: str,
+                     spec: list[dict]) -> int:
+        if not isinstance(spec, list) or any(
+            not isinstance(task, dict) or task.get("project") != project_id for task in spec
+        ):
+            raise ValueError("proposal specs must be a list of tasks for its project")
+        cur = self.x(
+            "INSERT INTO proposal(project_id,source,rationale,spec,created_at) VALUES(?,?,?,?,?)",
+            (project_id, source, rationale, json.dumps(spec, ensure_ascii=False), time.time()),
+        )
+        return int(cur.lastrowid)
+
+    def approve_proposal(self, proposal_id: int) -> list[str]:
+        # Serialize decisions and commit the whole batch, including task IDs, together.
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self._pending_proposal(proposal_id)
+            specs = json.loads(row["spec"])
+            if not isinstance(specs, list):
+                raise TypeError("proposal spec must be a list")
+            ids = []
+            for spec in specs:
+                if spec["project"] != row["project_id"]:
+                    raise ValueError("proposed task belongs to another project")
+                ids.append(self._add_task_spec(spec))
+            self.db.execute(
+                "UPDATE proposal SET status='approved', decided_at=? WHERE id=?",
+                (time.time(), proposal_id),
+            )
+        return ids
+
+    def reject_proposal(self, proposal_id: int, reason: str) -> None:
+        if not reason.strip():
+            raise ValueError("a rejection reason is required")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            self._pending_proposal(proposal_id)
+            self.db.execute(
+                "UPDATE proposal SET status='rejected', decided_at=?, reason=? WHERE id=?",
+                (time.time(), reason, proposal_id),
+            )
+
+    def _pending_proposal(self, proposal_id: int) -> sqlite3.Row:
+        row = self.one("SELECT * FROM proposal WHERE id=?", (proposal_id,))
+        if row is None:
+            raise ValueError(f"unknown proposal: {proposal_id}")
+        if row["status"] != "pending":
+            raise ValueError(f"proposal {proposal_id} is already {row['status']}")
+        return row
 
     def set_task(self, task_id: str, **fields: Any) -> None:
         fields["updated_at"] = time.time()

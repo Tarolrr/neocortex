@@ -62,6 +62,11 @@ nc answer 7 "use port 8080"    # answers and makes that agent runnable again
 
 ## Reviewing and undoing accepted work
 
+Run `nc why neocortex-T007` to see a task's status, acceptance criteria, every
+run (agent, role, outcome, duration and log path), every message about it, and
+the stored acceptance check output from `$NC_HOME/checks/neocortex-T007.txt`.
+Missing check output is reported explicitly; an unknown task exits with status 1.
+
 A project with a `mirror` remote gets its history pushed there right after the
 arbiter merges — the task branch as `nc/<task-id>` and the runner's base branch
 as `nc/main`, so the mirror can never fight the forge's own base branch. The

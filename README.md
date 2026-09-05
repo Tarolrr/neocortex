@@ -72,7 +72,23 @@ nc answer 7 "use port 8080"    # answers and makes that agent runnable again
 | `max_consecutive_failures` | circuit breaker threshold |
 | `min_free_mb` | preflight refuses to start below this |
 
-Creating a file named `STOP` in `$NC_HOME` stops the loop after the current turn.
+`nc stop` writes a `STOP` file in `$NC_HOME` and `nc run` then exits immediately;
+`nc resume` (optionally `--retry` to requeue blocked tasks) clears it. The circuit
+breaker writes that same file, so a system failing every turn stays down instead
+of being restarted into the same failure every few minutes.
+
+## Unattended operation
+
+`nc run` drains the queue and exits, so it is a natural oneshot unit:
+
+```bash
+cp deploy/neocortex.{service,timer} /etc/systemd/system/
+systemctl enable --now neocortex.timer
+journalctl -u neocortex -f
+```
+
+The timer starts a run every 5 minutes of inactivity. A failing turn costs one
+cycle; three in a row trip the breaker and stop the timer's work until `nc resume`.
 
 ## Development
 

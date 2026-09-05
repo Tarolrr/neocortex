@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Neocortex queue periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=neocortex.service
+
+[Install]
+WantedBy=timers.target

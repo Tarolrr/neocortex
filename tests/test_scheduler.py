@@ -231,6 +231,18 @@ def test_circuit_breaker_stops_the_loop(setup):
     assert scheduler.consecutive_failures >= 2
     assert any(i["kind"] == "circuit_breaker" for i in state.open_incidents())
 
+    # the breaker stays tripped: a restart must not walk into the same failure
+    stop = cfg.home / "STOP"
+    assert stop.exists()
+    before = len(state.q("SELECT * FROM run"))
+    scheduler.run()
+    assert len(state.q("SELECT * FROM run")) == before
+
+    stop.unlink()
+    scheduler.consecutive_failures = 0
+    scheduler.run()
+    assert len(state.q("SELECT * FROM run")) > before
+
 
 def test_turn_budget_is_enforced(setup):
     cfg, state, _repo = setup

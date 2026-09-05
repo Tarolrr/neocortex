@@ -89,6 +89,7 @@ def setup(tmp_path, repo):
 def sched(cfg, state, script) -> Scheduler:
     scheduler = Scheduler(cfg, state)
     scheduler.adapter = ScriptedAdapter(script)
+    scheduler._adapter_for = lambda role: scheduler.adapter
     return scheduler
 
 
@@ -361,3 +362,48 @@ def test_ask_timeout_only_escalates_overdue_unanswered_questions(
     scheduler.preflight = lambda: (True, "test")
     scheduler.run()
     assert len(state.open_incidents()) == expected
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({"worker": "codex", "critic": "claude"}, ["codex", "claude"]),
+    ({"worker": "claude", "critic": "codex"}, ["claude", "codex"]),
+    ({"critic": "codex"}, ["claude", "codex"]),
+    ({}, ["claude", "claude"]),
+])
+def test_scheduler_selects_adapter_for_each_role(setup, monkeypatch, overrides, expected):
+    cfg, state, _repo = setup
+    cfg.adapter = "claude"
+    cfg.adapters = overrides
+    state.add_task("neocortex", "add marker", "create marker.txt", [])
+    scripted = ScriptedAdapter([
+        commit_and_emit("marker.txt", "hi\n", {"outcome": "DONE", "summary": "done"}),
+        emit({"outcome": "YIELD", "summary": "reviewing"}),
+    ])
+    requested = []
+
+    def get_adapter(name):
+        requested.append(name)
+        return scripted
+
+    monkeypatch.setattr("nc.scheduler.get_adapter", get_adapter)
+    scheduler = Scheduler(cfg, state)
+    assert scheduler.step() == protocol.DONE
+    assert scheduler.step() == protocol.YIELD
+    assert requested == expected
+    assert [model for model, _ in scripted.calls] == [
+        cfg.model_for("worker"), cfg.model_for("critic"),
+    ]
+
+
+def test_preflight_uses_worker_adapter(setup, monkeypatch):
+    from unittest.mock import Mock
+
+    cfg, state, _repo = setup
+    cfg.adapters = {"worker": "claude"}
+    adapter = Mock()
+    adapter.available.return_value = False
+    adapter.name = "claude"
+    lookup = Mock(return_value=adapter)
+    monkeypatch.setattr("nc.scheduler.get_adapter", lookup)
+    assert Scheduler(cfg, state).preflight() == (False, "adapter claude is not installed")
+    lookup.assert_called_once_with("claude")

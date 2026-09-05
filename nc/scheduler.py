@@ -27,13 +27,16 @@ class Scheduler:
     def __init__(self, cfg: Config, state: State):
         self.cfg = cfg
         self.state = state
-        self.adapter: Adapter = get_adapter(cfg.adapter)
         self.consecutive_failures = 0
+
+    def _adapter_for(self, role: str) -> Adapter:
+        return get_adapter(self.cfg.adapter_for(role))
 
     # --- preflight --------------------------------------------------------
     def preflight(self) -> tuple[bool, str]:
-        if not self.adapter.available():
-            return False, f"adapter {self.adapter.name} is not installed"
+        adapter = self._adapter_for("worker")
+        if not adapter.available():
+            return False, f"adapter {adapter.name} is not installed"
 
         free_mb = self._free_mb()
         if free_mb is not None and free_mb < self.cfg.min_free_mb:
@@ -42,7 +45,7 @@ class Scheduler:
         probe_dir = self.cfg.home / "preflight"
         probe_dir.mkdir(parents=True, exist_ok=True)
         model = self.cfg.model_for("worker")
-        result = self.adapter.run(
+        result = adapter.run(
             "Reply with exactly: OK", probe_dir, model,
             probe_dir / "probe.log", self.cfg.preflight_timeout_s,
         )
@@ -115,7 +118,8 @@ class Scheduler:
         if agent["role"] == "critic":
             checks_text = self._last_checks_text(task["id"])
 
-        outcome = turn.run_turn(self.state, self.cfg, self.adapter, agent, cwd, branch,
+        adapter = self._adapter_for(agent["role"])
+        outcome = turn.run_turn(self.state, self.cfg, adapter, agent, cwd, branch,
                                 checks_text)
         log.info("%s (%s) -> %s: %s", agent["id"], agent["role"], outcome.kind,
                  outcome.summary[:200])

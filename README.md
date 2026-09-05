@@ -90,11 +90,38 @@ worktrees are discarded; queued, in-progress and in-review tasks are left alone.
 
 | key | meaning |
 | --- | --- |
-| `adapter` | `codex` or `claude` |
+| `adapter` | default adapter: `codex` or `claude` |
+| `adapters` | optional adapter per role (`worker`, `critic`); omitted roles use `adapter` |
 | `models` | model per role (`worker`, `critic`) |
 | `turn_timeout_s` | hard limit for one agent session |
 | `max_consecutive_failures` | circuit breaker threshold |
 | `min_free_mb` | preflight refuses to start below this |
+
+For a Codex worker and an independent Claude critic, set these keys (model
+names must suit the selected vendor):
+
+```json
+{
+  "adapter": "codex",
+  "adapters": {"worker": "codex", "critic": "claude"},
+  "models": {"worker": "gpt-6-astra", "critic": "sonnet"}
+}
+```
+
+Preflight probes the worker's selected adapter and model.
+
+The Claude adapter's command line was verified against the installed
+`/root/.local/bin/claude`, version **2.1.220 (Claude Code)**, using `--version`
+and `--help` on 2026-09-06:
+
+```bash
+claude -p "<prompt>" --permission-mode bypassPermissions --model "<model>"
+```
+
+`-p` selects non-interactive output, `bypassPermissions` is a supported
+permission mode, and `--model` accepts a model name or alias. The adapter omits
+`--model` when its model string is empty and falls back to `~/.local/bin/claude`
+when the binary is absent from `PATH`. Verification used no paid session.
 
 `nc stop` writes a `STOP` file in `$NC_HOME` and `nc run` then exits immediately;
 `nc resume` (optionally `--retry` to requeue blocked tasks) clears it. The circuit

@@ -303,3 +303,61 @@ def test_projects_are_isolated_and_priority_wins(setup, tmp_path):
     scheduler.step()
     assert state.one("SELECT * FROM task WHERE id=?", (urgent,))["status"] == "in_progress"
     assert scheduler.adapter.calls[0][1].name == urgent
+
+
+@pytest.mark.parametrize("agent_count", [1, 2])
+def test_ask_timeout_is_reported_once_per_agent_across_run_cycles(setup, monkeypatch, agent_count):
+    cfg, state, _repo = setup
+    cfg.ask_timeout_s = 0
+    monkeypatch.setattr("nc.scheduler.time.sleep", lambda _: None)
+    monkeypatch.setattr(Scheduler, "preflight", lambda self: (True, "test"))
+    tids = [state.add_task("neocortex", "question", "obj", []) for _ in range(agent_count)]
+    scheduler = sched(cfg, state, [
+        emit({"outcome": "ASK", "to": "owner", "question": "which filename?"})
+        for _ in range(agent_count)
+    ])
+    scheduler.run()
+    for _ in range(3):
+        # Reopening the database also checks persistence across process restarts.
+        reopened = State(cfg.db_path)
+        try:
+            sched(cfg, reopened, []).run()
+        finally:
+            reopened.db.close()
+    incidents = state.open_incidents()
+    assert len(incidents) == agent_count
+    for tid in tids:
+        assert sum(f"worker-{tid}:" in i["detail"] for i in incidents) == 1
+    assert all(i["kind"] == "ask_timeout" for i in incidents)
+
+    state.x("UPDATE incident SET resolved=1")
+    scheduler.run()
+    assert len(state.q("SELECT * FROM incident")) == agent_count
+
+
+@pytest.mark.parametrize("age,has_question,answered,expected", [
+    (59, True, False, 0),
+    (61, True, False, 1),
+    (61, False, False, 0),
+    (61, True, True, 0),
+])
+def test_ask_timeout_only_escalates_overdue_unanswered_questions(
+    setup, monkeypatch, age, has_question, answered, expected,
+):
+    cfg, state, _repo = setup
+    cfg.ask_timeout_s = 60
+    monkeypatch.setattr("nc.scheduler.time.time", lambda: 1000)
+    tid = state.add_task("neocortex", "question", "obj", [])
+    scheduler = sched(cfg, state, [])
+    agent_id = scheduler.spawn_for_queued_task()
+    state.set_agent(agent_id, state="blocked")
+    state.set_task(tid, status="blocked")
+    state.x("UPDATE agent SET updated_at=? WHERE id=?", (1000 - age, agent_id))
+    if has_question:
+        question = state.send(protocol.QUESTION, agent_id, "owner", {"question": "filename?"})
+        if answered:
+            state.send(protocol.ANSWER, "owner", agent_id, {"answer": "marker.txt"},
+                       in_reply_to=question)
+    scheduler.preflight = lambda: (True, "test")
+    scheduler.run()
+    assert len(state.open_incidents()) == expected

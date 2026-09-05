@@ -237,6 +237,23 @@ class Scheduler:
         return path.read_text() if path.exists() else "(none)"
 
     # --- loop -------------------------------------------------------------
+    def _escalate_unanswered_questions(self) -> None:
+        agents = self.state.q(
+            "SELECT a.* FROM agent a WHERE a.state='blocked' AND a.updated_at < ?"
+            " AND EXISTS (SELECT 1 FROM message q WHERE q.sender=a.id AND q.kind=?"
+            " AND NOT EXISTS (SELECT 1 FROM message r WHERE r.in_reply_to=q.id AND r.kind=?))",
+            (time.time() - self.cfg.ask_timeout_s, protocol.QUESTION, protocol.ANSWER),
+        )
+        for agent in agents:
+            detail = f"{agent['id']}: blocked on an unanswered question (task {agent['task_id']})"
+            # Keep deduplication in the database across scheduler restarts and
+            # incident resolution: the timeout is reported once per agent.
+            if not self.state.one(
+                "SELECT 1 FROM incident WHERE kind='ask_timeout' AND detail=?", (detail,),
+            ):
+                self.state.incident("ask_timeout", detail)
+                log.warning("%s", detail)
+
     def run(self, max_turns: int = 0) -> None:
         ok, detail = self.preflight()
         if not ok:
@@ -250,6 +267,7 @@ class Scheduler:
             if (self.cfg.home / "STOP").exists():
                 log.info("stop file present, exiting")
                 return
+            self._escalate_unanswered_questions()
             result = self.step()
             if result == "idle":
                 log.info("no runnable agents; exiting (idle is a valid outcome)")

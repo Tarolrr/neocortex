@@ -1,0 +1,93 @@
+[
+  {
+    "project": "neocortex",
+    "title": "Proposal store: nothing reaches the queue without the owner's approval",
+    "objective": "Add a `proposal` table (id, project_id, source, rationale, spec JSON holding a list of task specs, status pending|approved|rejected, created_at, decided_at) plus `nc proposals`, `nc proposal <id>` (full text of the proposed tasks), `nc approve <id>` and `nc reject <id> \"<reason>\"`. Approving inserts the proposed tasks as queued tasks exactly as `nc task --file` would; rejecting stores the reason and creates nothing. This is the gate that keeps a planner from filling its own queue: the planner in a later task will only ever write proposals.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "$ /root/neocortex/.venv/bin/python -m nc.cli --home /tmp/nc-prop-check proposals",
+      "A test asserts that a pending proposal creates no task rows, that approve creates exactly the proposed tasks with their acceptance criteria intact, and that reject creates none and keeps the reason",
+      "Approving the same proposal twice does not duplicate the tasks",
+      "The schema change is applied by the existing migration mechanism so an existing state.db keeps working"
+    ],
+    "boundaries": [
+      "Only touch nc/state.py, nc/cli.py, README.md and files under tests/",
+      "Do not add an agent role and do not change the scheduler in this task"
+    ],
+    "priority": 10,
+    "budget_turns": 6
+  },
+  {
+    "project": "neocortex",
+    "title": "Owner inputs that wake the planner: nc feedback and nc plan",
+    "objective": "Add `nc feedback \"<text>\"` (optionally --project, --task) storing the text as a message of a new kind `feedback` addressed to the planner, and `nc plan <project> [--note ...]` requesting a planning pass. Both must create-or-wake a single planner agent per project (role `planner`, state runnable) so the existing timer picks it up on its next tick; neither may start a session itself. `nc status` should show pending feedback so a note is never silently lost.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test asserts that feedback followed by plan leaves exactly one runnable planner agent for that project and both messages in its inbox",
+      "A test asserts feedback for an unknown project exits non-zero without writing anything",
+      "Neither command runs an agent session"
+    ],
+    "boundaries": [
+      "Only touch nc/state.py, nc/protocol.py, nc/cli.py, README.md and files under tests/",
+      "Do not implement the planner turn itself here"
+    ],
+    "priority": 20,
+    "budget_turns": 5
+  },
+  {
+    "project": "neocortex",
+    "title": "Planner role: turn feedback and repository state into a bounded proposal",
+    "objective": "Teach the scheduler to run agents of role `planner` and add its prompt to nc/roles.py. Its brief carries the project, the repository layout, open feedback, the currently queued/blocked tasks, and the last accepted tasks; its only permitted product is one proposal written via the outcome file (a `proposal` outcome field holding a list of task specs in the same shape as tasks/neocortex-pool.json), or ASK. It must not edit files, must not create tasks, and must propose at most 5 tasks per turn. Its model comes from config models['planner'] and defaults to the heaviest configured model.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A scripted-adapter test asserts a planner turn creates a pending proposal and zero tasks, and that the tasks appear only after nc approve",
+      "A test asserts a proposal of more than 5 tasks is rejected as a protocol failure rather than silently truncated",
+      "A test asserts the planner brief contains the open feedback and the existing queued tasks",
+      "The planner runs with the model from config models['planner']"
+    ],
+    "boundaries": [
+      "Only touch nc/roles.py, nc/protocol.py, nc/scheduler.py, nc/config.py, README.md and files under tests/",
+      "Do not give the planner a worktree and do not let it commit"
+    ],
+    "priority": 30,
+    "budget_turns": 8
+  },
+  {
+    "project": "neocortex",
+    "title": "Keep the planner from eating the queue",
+    "objective": "A planning pass must be triggered, never spontaneous, and must not starve real work: the scheduler picks planner agents only when no worker or critic is runnable, refuses to run one when the project already has more than 10 queued tasks or a pending proposal, and records how many planner turns each project has spent. Add these limits to config (planner_max_queued, planner_max_pending_proposals).",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test with a runnable worker and a runnable planner asserts the worker runs first",
+      "A test asserts a planner with a pending proposal for its project is skipped and the run ends idle rather than looping",
+      "A test asserts the queued-task ceiling is enforced"
+    ],
+    "boundaries": [
+      "Only touch nc/scheduler.py, nc/config.py, README.md and files under tests/"
+    ],
+    "priority": 40,
+    "budget_turns": 6
+  },
+  {
+    "project": "neocortex",
+    "title": "Onboard the two real projects as separate namespaces",
+    "objective": "Add `nc onboard <project-id> <git-url>` which clones the repository under /root/projects/<id>, registers it with its detected test command, and creates a single queued reconnaissance task for it whose only product is a written REPORT.md in the worktree describing build, test entry points and the three most valuable improvements — no source changes. Onboard aiscreeps and airogue this way; their tasks must never mix with neocortex tasks.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test onboards a local throwaway repository and asserts the project row, the clone and exactly one queued task scoped to that project id",
+      "A test asserts task ids stay per-project and nc tasks --project shows only that project's tasks",
+      "Re-running onboard for an existing project updates it instead of failing"
+    ],
+    "boundaries": [
+      "Only touch nc/cli.py, nc/state.py, README.md and files under tests/",
+      "Do not clone the real repositories from the test suite"
+    ],
+    "priority": 50,
+    "budget_turns": 6
+  }
+]

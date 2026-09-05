@@ -54,13 +54,49 @@ def cmd_task(args) -> int:
     if args.file:
         specs = json.loads(Path(args.file).read_text())
         for spec in specs if isinstance(specs, list) else [specs]:
-            print(state.add_task(spec["project"], spec["title"], spec["objective"],
-                                 spec["acceptance"], spec.get("boundaries"),
-                                 spec.get("priority", 100), spec.get("budget_turns", 6)))
+            print(state.add_task_spec(spec))
         return 0
     tid = state.add_task(args.project, args.title, args.objective, acceptance,
                          args.boundary or [], args.priority, args.budget)
     print(tid)
+    return 0
+
+
+def cmd_proposals(args) -> int:
+    _, state = _open(args)
+    rows = state.q("SELECT * FROM proposal ORDER BY id")
+    for row in rows:
+        print(f"{row['id']} {row['project_id']} {row['status']} "
+              f"source={row['source']} {row['rationale']}")
+    if not rows:
+        print("(no proposals)")
+    return 0
+
+
+def cmd_proposal(args) -> int:
+    _, state = _open(args)
+    row = state.one("SELECT * FROM proposal WHERE id=?", (args.proposal_id,))
+    if row is None:
+        print(f"unknown proposal: {args.proposal_id}", file=sys.stderr)
+        return 1
+    detail = dict(row)
+    detail["spec"] = json.loads(detail["spec"])
+    print(json.dumps(detail, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_decide_proposal(args) -> int:
+    _, state = _open(args)
+    try:
+        if args.cmd == "approve":
+            for task_id in state.approve_proposal(args.proposal_id):
+                print(task_id)
+        else:
+            state.reject_proposal(args.proposal_id, args.reason)
+            print(f"rejected proposal {args.proposal_id}")
+    except (ValueError, KeyError, TypeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return 0
 
 
@@ -351,6 +387,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--priority", type=int, default=100)
     sp.add_argument("--budget", type=int, default=6)
     sp.set_defaults(func=cmd_task)
+
+    sub.add_parser("proposals", help="list proposals and their decisions").set_defaults(
+        func=cmd_proposals,
+    )
+    sp = sub.add_parser("proposal", help="show the full proposed tasks")
+    sp.add_argument("proposal_id", type=int)
+    sp.set_defaults(func=cmd_proposal)
+    for command in ("approve", "reject"):
+        sp = sub.add_parser(command, help=f"{command} a pending proposal")
+        sp.add_argument("proposal_id", type=int)
+        if command == "reject":
+            sp.add_argument("reason")
+        sp.set_defaults(func=cmd_decide_proposal)
 
     sp = sub.add_parser("tasks")
     sp.add_argument("--project")

@@ -152,3 +152,25 @@ performing it. Promote a reviewed state with
 pytest -q
 ruff check .
 ```
+
+## Proposal approval
+
+Proposals hold suggested tasks outside the queue until the owner decides:
+
+```bash
+nc proposals                 # list all proposals and their status
+nc proposal 1                # full rationale, task specs and decision details
+nc approve 1                 # atomically queue every proposed task
+nc reject 2 "Outside scope"   # retain the reason without creating tasks
+```
+
+Producers use `State.add_proposal(project_id, source, rationale, spec)` with a
+JSON-serializable list of task specs. Each spec uses the `nc task --file` fields:
+`project`, `title`, `objective`, `acceptance`, and optional `boundaries`, `priority`
+(default 100), and `budget_turns` (default 6). Tasks must belong to the proposal's
+project. Creating a proposal stores it as `pending` and creates no tasks.
+Approval preserves those fields and records `approved` with a decision timestamp;
+rejection records `rejected`, the timestamp and reason. Decisions are final:
+repeated approval or rejection exits with status 1 and creates nothing. Failed
+batch approval leaves the proposal pending and rolls back every task in the batch.
+Existing state databases gain the proposal table automatically on opening.

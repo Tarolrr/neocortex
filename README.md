@@ -79,6 +79,11 @@ nc rollback neocortex-T007    # reverts its merge commit, pushes the mirror,
                               # and leaves the task blocked
 ```
 
+Run `nc gc` to reclaim disk space by removing worktrees under `$NC_HOME/work`
+for `done` and `blocked` tasks and pruning Git's stale worktree records. It prints
+each removed path and keeps task branches intact. Uncommitted files in those
+worktrees are discarded; queued, in-progress and in-review tasks are left alone.
+
 ## Configuration
 
 `$NC_HOME/config.json`, created by `nc init`:

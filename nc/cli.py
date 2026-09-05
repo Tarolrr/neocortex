@@ -132,6 +132,45 @@ def cmd_agents(args) -> int:
     return 0
 
 
+def cmd_gc(args) -> int:
+    cfg, state = _open(args)
+    work_root = cfg.work_dir.resolve()
+    result = 0
+    repos = set()
+    # Keep task statuses stable while removing their worktrees.
+    with state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        tasks = state.q(
+            "SELECT task.id, project.repo_path FROM task"
+            " JOIN project ON project.id=task.project_id"
+            " WHERE task.status IN ('done', 'blocked') ORDER BY task.id"
+        )
+        for task in tasks:
+            path = work_root / task["id"]
+            if path.is_symlink() or path.resolve().parent != work_root:
+                print(f"refusing worktree outside work directory: {path}", file=sys.stderr)
+                result = 1
+                continue
+            repo = Path(task["repo_path"])
+            repos.add(repo)
+            if not path.exists():
+                continue
+            try:
+                arbiter.git(repo, "worktree", "remove", "--force", str(path))
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                result = 1
+            else:
+                print(f"removed {path}")
+        for repo in sorted(repos):
+            try:
+                arbiter.git(repo, "worktree", "prune")
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                result = 1
+    return result
+
+
 def cmd_inbox(args) -> int:
     _, state = _open(args)
     rows = state.inbox("owner", undelivered_only=not args.all)
@@ -300,6 +339,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_why)
 
     sub.add_parser("agents").set_defaults(func=cmd_agents)
+    sub.add_parser("gc", help="remove done and blocked task worktrees").set_defaults(func=cmd_gc)
 
     sp = sub.add_parser("inbox", help="questions and incidents addressed to you")
     sp.add_argument("--all", action="store_true")

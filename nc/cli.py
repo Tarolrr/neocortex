@@ -54,13 +54,49 @@ def cmd_task(args) -> int:
     if args.file:
         specs = json.loads(Path(args.file).read_text())
         for spec in specs if isinstance(specs, list) else [specs]:
-            print(state.add_task(spec["project"], spec["title"], spec["objective"],
-                                 spec["acceptance"], spec.get("boundaries"),
-                                 spec.get("priority", 100), spec.get("budget_turns", 6)))
+            print(state.add_task_spec(spec))
         return 0
     tid = state.add_task(args.project, args.title, args.objective, acceptance,
                          args.boundary or [], args.priority, args.budget)
     print(tid)
+    return 0
+
+
+def cmd_proposals(args) -> int:
+    _, state = _open(args)
+    rows = state.q("SELECT * FROM proposal ORDER BY id")
+    for row in rows:
+        print(f"{row['id']} {row['project_id']} {row['status']} "
+              f"source={row['source']} {row['rationale']}")
+    if not rows:
+        print("(no proposals)")
+    return 0
+
+
+def cmd_proposal(args) -> int:
+    _, state = _open(args)
+    row = state.one("SELECT * FROM proposal WHERE id=?", (args.proposal_id,))
+    if row is None:
+        print(f"unknown proposal: {args.proposal_id}", file=sys.stderr)
+        return 1
+    detail = dict(row)
+    detail["spec"] = json.loads(detail["spec"])
+    print(json.dumps(detail, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_decide_proposal(args) -> int:
+    _, state = _open(args)
+    try:
+        if args.cmd == "approve":
+            for task_id in state.approve_proposal(args.proposal_id):
+                print(task_id)
+        else:
+            state.reject_proposal(args.proposal_id, args.reason)
+            print(f"rejected proposal {args.proposal_id}")
+    except (ValueError, KeyError, TypeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return 0
 
 
@@ -77,12 +113,120 @@ def cmd_tasks(args) -> int:
     return 0
 
 
+def cmd_why(args) -> int:
+    cfg, state = _open(args)
+    task = state.one("SELECT * FROM task WHERE id=?", (args.task_id,))
+    if task is None:
+        print(f"unknown task: {args.task_id}", file=sys.stderr)
+        return 1
+    print(f"{task['id']}: {task['title']}\nstatus: {task['status']}")
+    print("\nacceptance criteria:")
+    criteria = json.loads(task["acceptance"])
+    for criterion in criteria:
+        print(f"  - {criterion}")
+    if not criteria:
+        print("  (none)")
+
+    print("\nruns:")
+    runs = state.q("SELECT * FROM run WHERE task_id=? ORDER BY started_at, id", (task["id"],))
+    now = time.time()
+    for run in runs:
+        end = run["ended_at"] if run["ended_at"] is not None else now
+        duration = f"{end - run['started_at']:.1f}s"
+        if run["ended_at"] is None:
+            duration += " elapsed"
+        print(f"  #{run['id']} agent={run['agent_id']} role={run['role']} "
+              f"outcome={run['outcome'] or 'running'} duration={duration} "
+              f"log={run['log_path'] or '(none)'}")
+    if not runs:
+        print("  (none)")
+
+    print("\nmessages:")
+    messages = state.q("SELECT * FROM message WHERE task_id=? ORDER BY id", (task["id"],))
+    for message in messages:
+        print(f"  #{message['id']} [{message['kind']}] "
+              f"{message['sender']} -> {message['recipient']}: {message['payload']}")
+    if not messages:
+        print("  (none)")
+
+    check_path = cfg.home / "checks" / f"{task['id']}.txt"
+    print(f"\nacceptance check output ({check_path}):")
+    try:
+        output = check_path.read_text()
+    except FileNotFoundError:
+        print("  (no stored check output)")
+    else:
+        print(output, end="" if output.endswith("\n") else "\n")
+    return 0
+
+
+def cmd_costs(args) -> int:
+    _, state = _open(args)
+    now = time.time()
+    print("Wall time sums run durations, including elapsed time for running turns.")
+    for column, label in (("task_id", "task"), ("role", "role")):
+        print(f"\nby {label}:")
+        rows = state.q(
+            f"SELECT {column} AS name, COUNT(*) AS runs, SUM(tokens) AS tokens,"
+            " COUNT(*) - COUNT(tokens) AS unknown,"
+            " SUM(COALESCE(ended_at, ?) - started_at) AS seconds"
+            f" FROM run GROUP BY {column} ORDER BY {column}",
+            (now,),
+        )
+        for row in rows:
+            tokens = row["tokens"] if row["tokens"] is not None else "unknown"
+            print(f"  {row['name'] or '(none)'} runs={row['runs']} tokens={tokens} "
+                  f"unknown_runs={row['unknown']} wall={row['seconds']:.1f}s")
+        if not rows:
+            print("  (no runs)")
+    return 0
+
+
 def cmd_agents(args) -> int:
     _, state = _open(args)
     for row in state.q("SELECT * FROM agent ORDER BY created_at"):
         print(f"{row['id']:<28} {row['role']:<7} {row['state']:<9} turns={row['turns']} "
               f"{row['task_id'] or ''}")
     return 0
+
+
+def cmd_gc(args) -> int:
+    cfg, state = _open(args)
+    work_root = cfg.work_dir.resolve()
+    result = 0
+    repos = set()
+    # Keep task statuses stable while removing their worktrees.
+    with state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        tasks = state.q(
+            "SELECT task.id, project.repo_path FROM task"
+            " JOIN project ON project.id=task.project_id"
+            " WHERE task.status IN ('done', 'blocked') ORDER BY task.id"
+        )
+        for task in tasks:
+            path = work_root / task["id"]
+            if path.is_symlink() or path.resolve().parent != work_root:
+                print(f"refusing worktree outside work directory: {path}", file=sys.stderr)
+                result = 1
+                continue
+            repo = Path(task["repo_path"])
+            repos.add(repo)
+            if not path.exists():
+                continue
+            try:
+                arbiter.git(repo, "worktree", "remove", "--force", str(path))
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                result = 1
+            else:
+                print(f"removed {path}")
+        for repo in sorted(repos):
+            try:
+                arbiter.git(repo, "worktree", "prune")
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                result = 1
+    return result
 
 
 def cmd_inbox(args) -> int:
@@ -244,11 +388,32 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--budget", type=int, default=6)
     sp.set_defaults(func=cmd_task)
 
+    sub.add_parser("proposals", help="list proposals and their decisions").set_defaults(
+        func=cmd_proposals,
+    )
+    sp = sub.add_parser("proposal", help="show the full proposed tasks")
+    sp.add_argument("proposal_id", type=int)
+    sp.set_defaults(func=cmd_proposal)
+    for command in ("approve", "reject"):
+        sp = sub.add_parser(command, help=f"{command} a pending proposal")
+        sp.add_argument("proposal_id", type=int)
+        if command == "reject":
+            sp.add_argument("reason")
+        sp.set_defaults(func=cmd_decide_proposal)
+
     sp = sub.add_parser("tasks")
     sp.add_argument("--project")
     sp.set_defaults(func=cmd_tasks)
 
+    sp = sub.add_parser("why", help="show a task's status and review evidence")
+    sp.add_argument("task_id")
+    sp.set_defaults(func=cmd_why)
+
+    sub.add_parser("costs", help="show tokens and wall time by task and role").set_defaults(
+        func=cmd_costs,
+    )
     sub.add_parser("agents").set_defaults(func=cmd_agents)
+    sub.add_parser("gc", help="remove done and blocked task worktrees").set_defaults(func=cmd_gc)
 
     sp = sub.add_parser("inbox", help="questions and incidents addressed to you")
     sp.add_argument("--all", action="store_true")

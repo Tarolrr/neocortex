@@ -1,0 +1,2 @@
+[console_scripts]
+nc = nc.cli:main

@@ -27,13 +27,16 @@ class Scheduler:
     def __init__(self, cfg: Config, state: State):
         self.cfg = cfg
         self.state = state
-        self.adapter: Adapter = get_adapter(cfg.adapter)
         self.consecutive_failures = 0
+
+    def _adapter_for(self, role: str) -> Adapter:
+        return get_adapter(self.cfg.adapter_for(role))
 
     # --- preflight --------------------------------------------------------
     def preflight(self) -> tuple[bool, str]:
-        if not self.adapter.available():
-            return False, f"adapter {self.adapter.name} is not installed"
+        adapter = self._adapter_for("worker")
+        if not adapter.available():
+            return False, f"adapter {adapter.name} is not installed"
 
         free_mb = self._free_mb()
         if free_mb is not None and free_mb < self.cfg.min_free_mb:
@@ -42,7 +45,7 @@ class Scheduler:
         probe_dir = self.cfg.home / "preflight"
         probe_dir.mkdir(parents=True, exist_ok=True)
         model = self.cfg.model_for("worker")
-        result = self.adapter.run(
+        result = adapter.run(
             "Reply with exactly: OK", probe_dir, model,
             probe_dir / "probe.log", self.cfg.preflight_timeout_s,
         )
@@ -115,7 +118,8 @@ class Scheduler:
         if agent["role"] == "critic":
             checks_text = self._last_checks_text(task["id"])
 
-        outcome = turn.run_turn(self.state, self.cfg, self.adapter, agent, cwd, branch,
+        adapter = self._adapter_for(agent["role"])
+        outcome = turn.run_turn(self.state, self.cfg, adapter, agent, cwd, branch,
                                 checks_text)
         log.info("%s (%s) -> %s: %s", agent["id"], agent["role"], outcome.kind,
                  outcome.summary[:200])
@@ -237,6 +241,23 @@ class Scheduler:
         return path.read_text() if path.exists() else "(none)"
 
     # --- loop -------------------------------------------------------------
+    def _escalate_unanswered_questions(self) -> None:
+        agents = self.state.q(
+            "SELECT a.* FROM agent a WHERE a.state='blocked' AND a.updated_at < ?"
+            " AND EXISTS (SELECT 1 FROM message q WHERE q.sender=a.id AND q.kind=?"
+            " AND NOT EXISTS (SELECT 1 FROM message r WHERE r.in_reply_to=q.id AND r.kind=?))",
+            (time.time() - self.cfg.ask_timeout_s, protocol.QUESTION, protocol.ANSWER),
+        )
+        for agent in agents:
+            detail = f"{agent['id']}: blocked on an unanswered question (task {agent['task_id']})"
+            # Keep deduplication in the database across scheduler restarts and
+            # incident resolution: the timeout is reported once per agent.
+            if not self.state.one(
+                "SELECT 1 FROM incident WHERE kind='ask_timeout' AND detail=?", (detail,),
+            ):
+                self.state.incident("ask_timeout", detail)
+                log.warning("%s", detail)
+
     def run(self, max_turns: int = 0) -> None:
         ok, detail = self.preflight()
         if not ok:
@@ -250,6 +271,7 @@ class Scheduler:
             if (self.cfg.home / "STOP").exists():
                 log.info("stop file present, exiting")
                 return
+            self._escalate_unanswered_questions()
             result = self.step()
             if result == "idle":
                 log.info("no runnable agents; exiting (idle is a valid outcome)")

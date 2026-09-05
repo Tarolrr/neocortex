@@ -62,6 +62,11 @@ nc answer 7 "use port 8080"    # answers and makes that agent runnable again
 
 ## Reviewing and undoing accepted work
 
+Run `nc why neocortex-T007` to see a task's status, acceptance criteria, every
+run (agent, role, outcome, duration and log path), every message about it, and
+the stored acceptance check output from `$NC_HOME/checks/neocortex-T007.txt`.
+Missing check output is reported explicitly; an unknown task exits with status 1.
+
 A project with a `mirror` remote gets its history pushed there right after the
 arbiter merges — the task branch as `nc/<task-id>` and the runner's base branch
 as `nc/main`, so the mirror can never fight the forge's own base branch. The
@@ -74,17 +79,49 @@ nc rollback neocortex-T007    # reverts its merge commit, pushes the mirror,
                               # and leaves the task blocked
 ```
 
+Run `nc gc` to reclaim disk space by removing worktrees under `$NC_HOME/work`
+for `done` and `blocked` tasks and pruning Git's stale worktree records. It prints
+each removed path and keeps task branches intact. Uncommitted files in those
+worktrees are discarded; queued, in-progress and in-review tasks are left alone.
+
 ## Configuration
 
 `$NC_HOME/config.json`, created by `nc init`:
 
 | key | meaning |
 | --- | --- |
-| `adapter` | `codex` or `claude` |
+| `adapter` | default adapter: `codex` or `claude` |
+| `adapters` | optional adapter per role (`worker`, `critic`); omitted roles use `adapter` |
 | `models` | model per role (`worker`, `critic`) |
 | `turn_timeout_s` | hard limit for one agent session |
 | `max_consecutive_failures` | circuit breaker threshold |
 | `min_free_mb` | preflight refuses to start below this |
+
+For a Codex worker and an independent Claude critic, set these keys (model
+names must suit the selected vendor):
+
+```json
+{
+  "adapter": "codex",
+  "adapters": {"worker": "codex", "critic": "claude"},
+  "models": {"worker": "gpt-6-astra", "critic": "sonnet"}
+}
+```
+
+Preflight probes the worker's selected adapter and model.
+
+The Claude adapter's command line was verified against the installed
+`/root/.local/bin/claude`, version **2.1.220 (Claude Code)**, using `--version`
+and `--help` on 2026-09-06:
+
+```bash
+claude -p "<prompt>" --permission-mode bypassPermissions --model "<model>"
+```
+
+`-p` selects non-interactive output, `bypassPermissions` is a supported
+permission mode, and `--model` accepts a model name or alias. The adapter omits
+`--model` when its model string is empty and falls back to `~/.local/bin/claude`
+when the binary is absent from `PATH`. Verification used no paid session.
 
 `nc stop` writes a `STOP` file in `$NC_HOME` and `nc run` then exits immediately;
 `nc resume` (optionally `--retry` to requeue blocked tasks) clears it. The circuit
@@ -115,3 +152,25 @@ performing it. Promote a reviewed state with
 pytest -q
 ruff check .
 ```
+
+## Proposal approval
+
+Proposals hold suggested tasks outside the queue until the owner decides:
+
+```bash
+nc proposals                 # list all proposals and their status
+nc proposal 1                # full rationale, task specs and decision details
+nc approve 1                 # atomically queue every proposed task
+nc reject 2 "Outside scope"   # retain the reason without creating tasks
+```
+
+Producers use `State.add_proposal(project_id, source, rationale, spec)` with a
+JSON-serializable list of task specs. Each spec uses the `nc task --file` fields:
+`project`, `title`, `objective`, `acceptance`, and optional `boundaries`, `priority`
+(default 100), and `budget_turns` (default 6). Tasks must belong to the proposal's
+project. Creating a proposal stores it as `pending` and creates no tasks.
+Approval preserves those fields and records `approved` with a decision timestamp;
+rejection records `rejected`, the timestamp and reason. Decisions are final:
+repeated approval or rejection exits with status 1 and creates nothing. Failed
+batch approval leaves the proposal pending and rolls back every task in the batch.
+Existing state databases gain the proposal table automatically on opening.

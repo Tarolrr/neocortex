@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS task (
 
 CREATE TABLE IF NOT EXISTS agent (
     id         TEXT PRIMARY KEY,
-    role       TEXT NOT NULL,             -- worker|critic
+    role       TEXT NOT NULL,             -- worker|critic|planner
     project_id TEXT NOT NULL REFERENCES project(id),
     task_id    TEXT REFERENCES task(id),
     state      TEXT NOT NULL,             -- runnable|blocked|done|failed
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS agent (
 
 CREATE TABLE IF NOT EXISTS message (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT NOT NULL,            -- question|answer|review_request|review_verdict|incident
+    kind        TEXT NOT NULL,            -- question|answer|review_request|review_verdict|incident|feedback
     sender      TEXT NOT NULL,            -- agent id or 'owner' or 'scheduler'
     recipient   TEXT NOT NULL,            -- agent id or 'owner'
     task_id     TEXT,
@@ -298,6 +298,50 @@ class State:
             (agent_id, role, project_id, task_id, model, now, now),
         )
         return agent_id
+
+    def planner_feedback(self, project_id: str | None, text: str, model: str,
+                         task_id: str | None = None) -> tuple[str, int]:
+        """Atomically resolve the project, store feedback, and create or wake its planner."""
+        from .protocol import FEEDBACK
+
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if task_id is not None:
+                task = self.one("SELECT project_id FROM task WHERE id=?", (task_id,))
+                if task is None:
+                    raise ValueError(f"unknown task: {task_id}")
+                if project_id is not None and project_id != task["project_id"]:
+                    raise ValueError(f"task {task_id} does not belong to project {project_id}")
+                project_id = task["project_id"]
+            if project_id is None:
+                projects = self.q("SELECT id FROM project")
+                if len(projects) != 1:
+                    raise ValueError("specify --project (or --task) to select a project")
+                project_id = projects[0]["id"]
+            if self.one("SELECT id FROM project WHERE id=?", (project_id,)) is None:
+                raise ValueError(f"unknown project: {project_id}")
+            agent = self.one(
+                "SELECT id FROM agent WHERE role='planner' AND project_id=?", (project_id,),
+            )
+            now = time.time()
+            agent_id = agent["id"] if agent else f"planner-{project_id}"
+            if agent:
+                self.db.execute(
+                    "UPDATE agent SET state='runnable', updated_at=? WHERE id=?", (now, agent_id),
+                )
+            else:
+                self.db.execute(
+                    "INSERT INTO agent(id,role,project_id,state,model,created_at,updated_at)"
+                    " VALUES(?,'planner',?,'runnable',?,?,?)",
+                    (agent_id, project_id, model, now, now),
+                )
+            cur = self.db.execute(
+                "INSERT INTO message(kind,sender,recipient,task_id,payload,created_at)"
+                " VALUES(?,'owner',?,?,?,?)",
+                (FEEDBACK, agent_id, task_id,
+                 json.dumps({"text": text}, ensure_ascii=False), now),
+            )
+            return agent_id, int(cur.lastrowid)
 
     def set_agent(self, agent_id: str, **fields: Any) -> None:
         fields["updated_at"] = time.time()

@@ -225,3 +225,26 @@ A proposed task may declare an optional unique `id` for other tasks in the same
 proposal to reference through `depends_on`. These local IDs must not collide with
 existing task IDs. Approval resolves local references to the newly allocated task
 IDs, including forward references. Other dependencies must name existing tasks.
+
+## Owner feedback and planning requests
+
+```bash
+nc feedback "Keep configuration simple" --project neocortex
+nc feedback "Cover the empty case" --task neocortex-T007
+nc plan neocortex --note "Review the remaining work"
+nc status                    # shows all undelivered feedback, including its text
+```
+
+Feedback uses the task's project when `--task` is supplied, or the sole registered
+project when neither selector is supplied. With multiple projects, specify
+`--project` or `--task`. Unknown projects/tasks and mismatched selectors fail
+without storing a message or waking an agent.
+
+Both commands atomically store an owner message of kind `feedback` (payload
+`{"text": "..."}`) in the project's single planner inbox and make that agent
+runnable. `plan` without a note stores "Request a planning pass." Repeated calls
+preserve every message and reuse the planner, including after it has stopped.
+New planners use `models.planner`, falling back to the first configured model.
+Neither command starts a session: execution belongs to the timer/scheduler.
+Planner turn execution is a separate feature; these commands provide its durable
+inputs. Feedback stays visible in `status` until marked delivered.

@@ -34,7 +34,7 @@ turns, restarts and days.
 pip install -e .
 export NC_HOME=~/.neocortex
 nc init
-nc project neocortex /root/neocortex --test-cmd "pytest -q"
+nc project neocortex /root/neocortex --test-cmd "pytest -q" --mirror origin
 
 nc task --project neocortex \
   --title "Add a health command" \
@@ -58,6 +58,18 @@ When an agent needs you:
 ```bash
 nc inbox                       # questions and incidents addressed to the owner
 nc answer 7 "use port 8080"    # answers and makes that agent runnable again
+```
+
+## Reviewing and undoing accepted work
+
+A project with a `mirror` remote gets its base branch and the task branch pushed
+there right after the arbiter merges, so the diff is reviewable on the forge
+while the queue keeps running; a failed push is an incident, never a block.
+To undo one task:
+
+```bash
+nc rollback neocortex-T007    # reverts its merge commit, pushes the mirror,
+                              # and leaves the task blocked
 ```
 
 ## Configuration
@@ -89,6 +101,11 @@ journalctl -u neocortex -f
 
 The timer starts a run every 5 minutes of inactivity. A failing turn costs one
 cycle; three in a row trip the breaker and stop the timer's work until `nc resume`.
+
+When agents work on Neocortex itself, run the scheduler from a second checkout
+(`/opt/neocortex-runner`) so a merge never rewrites the code of the process
+performing it. Promote a reviewed state with
+`git -C /opt/neocortex-runner pull --ff-only /root/neocortex main`.
 
 ## Development
 

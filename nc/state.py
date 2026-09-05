@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS project (
     title       TEXT NOT NULL,
     repo_path   TEXT NOT NULL,
     test_cmd    TEXT,
+    mirror      TEXT,                     -- git remote to push accepted work to
     quota_share REAL NOT NULL DEFAULT 1.0,
     created_at  REAL NOT NULL
 );
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS task (
     branch       TEXT,
     attempts     INTEGER NOT NULL DEFAULT 0,
     budget_turns INTEGER NOT NULL DEFAULT 6,
+    merge_commit TEXT,
     result       TEXT,
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL
@@ -99,7 +101,18 @@ class State:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(SCHEMA)
+        self._migrate()
         self.db.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created."""
+        for table, column, decl in (
+            ("project", "mirror", "TEXT"),
+            ("task", "merge_commit", "TEXT"),
+        ):
+            known = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if column not in known:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     # --- generic helpers -------------------------------------------------
     def q(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
@@ -116,11 +129,11 @@ class State:
 
     # --- projects --------------------------------------------------------
     def add_project(self, pid: str, title: str, repo_path: str, test_cmd: str | None,
-                    quota_share: float = 1.0) -> None:
+                    quota_share: float = 1.0, mirror: str | None = None) -> None:
         self.x(
-            "INSERT OR REPLACE INTO project(id,title,repo_path,test_cmd,quota_share,created_at)"
-            " VALUES(?,?,?,?,?,?)",
-            (pid, title, repo_path, test_cmd, quota_share, time.time()),
+            "INSERT OR REPLACE INTO project(id,title,repo_path,test_cmd,mirror,quota_share,"
+            "created_at) VALUES(?,?,?,?,?,?,?)",
+            (pid, title, repo_path, test_cmd, mirror, quota_share, time.time()),
         )
 
     # --- tasks -----------------------------------------------------------

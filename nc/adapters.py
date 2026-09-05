@@ -9,7 +9,18 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-TOKENS_RE = re.compile(r"tokens used[:\s]+([\d,]+)", re.IGNORECASE)
+# codex exec's text footer is two lines: "tokens used\n26,457".
+TOKENS_RE = re.compile(
+    r"^[ \t]*tokens used[ \t]*:?[ \t]*\r?\n"
+    r"[ \t]*([0-9]+(?:,[0-9]{3})*)[ \t]*\r?$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def parse_tokens(text: str) -> int | None:
+    """Read the last Codex usage footer, or leave unreported usage unknown."""
+    matches = list(TOKENS_RE.finditer(text))
+    return int(matches[-1].group(1).replace(",", "")) if matches else None
 
 
 @dataclass
@@ -46,8 +57,7 @@ def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionRe
             timed_out = True
             code = 124
     text = log_path.read_text(errors="replace")
-    match = TOKENS_RE.search(text)
-    tokens = int(match.group(1).replace(",", "")) if match else None
+    tokens = parse_tokens(text)
     return SessionResult(exit_code=code, log_path=log_path, tokens=tokens, timed_out=timed_out)
 
 

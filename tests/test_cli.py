@@ -193,3 +193,40 @@ def test_why_unknown_task(tmp_path, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "unknown task: nonexistent-T001\n"
+
+
+def test_costs_empty(tmp_path, capsys):
+    assert main(["--home", str(tmp_path), "costs"]) == 0
+    output = capsys.readouterr().out
+    assert "by task:\n  (no runs)" in output
+    assert "by role:\n  (no runs)" in output
+
+
+def test_costs_totals(tmp_path, capsys, monkeypatch):
+    state = State(Config.load(tmp_path).db_path)
+    state.add_project("demo", "Demo", str(tmp_path), None)
+    first = state.add_task("demo", "First", "objective", [])
+    second = state.add_task("demo", "Second", "objective", [])
+    for role in ("worker", "critic"):
+        state.add_agent(role, role, "demo", None, "model")
+    for task, role, tokens, end in (
+        (first, "worker", 100, 110),
+        (first, "worker", None, 120),
+        (first, "critic", 50, 105),
+        (second, "worker", 0, 100),
+        (None, "critic", None, None),
+    ):
+        run = state.start_run(role, task, role, "model", "")
+        state.x("UPDATE run SET tokens=?, started_at=100, ended_at=? WHERE id=?",
+                (tokens, end, run))
+    state.db.close()
+    monkeypatch.setattr("nc.cli.time.time", lambda: 130)
+
+    assert main(["--home", str(tmp_path), "costs"]) == 0
+
+    output = capsys.readouterr().out
+    assert f"{first} runs=3 tokens=150 unknown_runs=1 wall=35.0s" in output
+    assert f"{second} runs=1 tokens=0 unknown_runs=0 wall=0.0s" in output
+    assert "(none) runs=1 tokens=unknown unknown_runs=1 wall=30.0s" in output
+    assert "worker runs=3 tokens=100 unknown_runs=1 wall=30.0s" in output
+    assert "critic runs=2 tokens=50 unknown_runs=1 wall=35.0s" in output

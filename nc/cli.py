@@ -124,6 +124,28 @@ def cmd_why(args) -> int:
     return 0
 
 
+def cmd_costs(args) -> int:
+    _, state = _open(args)
+    now = time.time()
+    print("Wall time sums run durations, including elapsed time for running turns.")
+    for column, label in (("task_id", "task"), ("role", "role")):
+        print(f"\nby {label}:")
+        rows = state.q(
+            f"SELECT {column} AS name, COUNT(*) AS runs, SUM(tokens) AS tokens,"
+            " COUNT(*) - COUNT(tokens) AS unknown,"
+            " SUM(COALESCE(ended_at, ?) - started_at) AS seconds"
+            f" FROM run GROUP BY {column} ORDER BY {column}",
+            (now,),
+        )
+        for row in rows:
+            tokens = row["tokens"] if row["tokens"] is not None else "unknown"
+            print(f"  {row['name'] or '(none)'} runs={row['runs']} tokens={tokens} "
+                  f"unknown_runs={row['unknown']} wall={row['seconds']:.1f}s")
+        if not rows:
+            print("  (no runs)")
+    return 0
+
+
 def cmd_agents(args) -> int:
     _, state = _open(args)
     for row in state.q("SELECT * FROM agent ORDER BY created_at"):
@@ -338,6 +360,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("task_id")
     sp.set_defaults(func=cmd_why)
 
+    sub.add_parser("costs", help="show tokens and wall time by task and role").set_defaults(
+        func=cmd_costs,
+    )
     sub.add_parser("agents").set_defaults(func=cmd_agents)
     sub.add_parser("gc", help="remove done and blocked task worktrees").set_defaults(func=cmd_gc)
 

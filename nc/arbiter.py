@@ -106,6 +106,32 @@ def integrate(repo: Path, branch: str, task_id: str) -> str:
     return git(repo, "rev-parse", "--short", "HEAD")
 
 
+def mirror(repo: Path, remote: str | None, branch: str | None = None) -> str:
+    """Push accepted work to a review remote. Failure here never blocks the queue."""
+    if not remote:
+        return ""
+    base = base_branch(repo)
+    refs = [base] + ([branch] if branch else [])
+    proc = subprocess.run(
+        ["git", "push", remote, *refs], cwd=repo, capture_output=True, text=True,
+        timeout=300, check=False,
+    )
+    return "" if proc.returncode == 0 else (proc.stderr or proc.stdout).strip()[-500:]
+
+
+def revert(repo: Path, commit: str) -> str:
+    """Undo an accepted merge, keeping it in history."""
+    base = base_branch(repo)
+    if git(repo, "rev-parse", "--abbrev-ref", "HEAD") != base:
+        git(repo, "checkout", base)
+    parents = git(repo, "rev-list", "--parents", "-n", "1", commit).split()
+    args = ["revert", "--no-edit", commit]
+    if len(parents) > 2:                      # a merge commit: revert onto first parent
+        args = ["revert", "--no-edit", "-m", "1", commit]
+    git(repo, *args)
+    return git(repo, "rev-parse", "--short", "HEAD")
+
+
 def checks_summary(results: list[CheckResult]) -> str:
     if not results:
         return "(no automated checks defined)"

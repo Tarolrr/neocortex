@@ -193,8 +193,11 @@ class Scheduler:
         if verdict == "pass":
             repo = Path(project["repo_path"])
             commit = arbiter.integrate(repo, branch, task["id"])
+            error = arbiter.mirror(repo, project["mirror"], branch)
             arbiter.remove_worktree(repo, cwd)
-            self.state.set_task(task["id"], status="done",
+            if error:
+                self.state.incident("mirror_push", f"{task['id']}: {error}")
+            self.state.set_task(task["id"], status="done", merge_commit=commit,
                                 result=f"{outcome.summary} (merged as {commit})")
             self.state.set_agent(worker_id, state="done")
             log.info("task %s accepted and merged as %s", task["id"], commit)

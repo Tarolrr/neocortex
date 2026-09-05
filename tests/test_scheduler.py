@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from nc import protocol
+from nc import cli, protocol
 from nc.adapters import SessionResult
 from nc.config import Config
 from nc.scheduler import Scheduler
@@ -114,6 +114,33 @@ def test_accepted_task_is_merged_only_after_a_passing_critic(setup):
     assert "merged as" in task["result"]
     assert (repo / "marker.txt").exists()               # merged into main
     assert scheduler.step() == "idle"
+
+
+def test_accepted_work_is_mirrored_and_can_be_reverted(setup, tmp_path):
+    cfg, state, repo = setup
+    remote = tmp_path / "mirror.git"
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(remote)], check=True)
+    subprocess.run(["git", "remote", "add", "mirror", str(remote)], cwd=repo, check=True)
+    state.add_project("neocortex", "Neocortex", str(repo), None, mirror="mirror")
+
+    tid = state.add_task("neocortex", "add marker", "create marker.txt", [])
+    scheduler = sched(cfg, state, [
+        commit_and_emit("marker.txt", "hi\n", {"outcome": "DONE", "summary": "done"}),
+        emit({"outcome": "DONE", "verdict": "pass", "summary": "ok"}),
+    ])
+    scheduler.step()
+    scheduler.step()
+
+    task = state.one("SELECT * FROM task WHERE id=?", (tid,))
+    assert task["merge_commit"]
+    mirrored = subprocess.run(["git", "log", "--oneline", "main"], cwd=remote,
+                              capture_output=True, text=True, check=True).stdout
+    assert f"{tid}: accepted by arbiter" in mirrored
+    assert state.open_incidents() == []
+
+    assert cli.main(["--home", str(cfg.home), "rollback", tid]) == 0
+    assert not (repo / "marker.txt").exists()
+    assert state.one("SELECT * FROM task WHERE id=?", (tid,))["status"] == "blocked"
 
 
 def test_failing_acceptance_check_sends_the_worker_back_without_calling_the_critic(setup):
@@ -230,6 +257,18 @@ def test_circuit_breaker_stops_the_loop(setup):
     scheduler.run()
     assert scheduler.consecutive_failures >= 2
     assert any(i["kind"] == "circuit_breaker" for i in state.open_incidents())
+
+    # the breaker stays tripped: a restart must not walk into the same failure
+    stop = cfg.home / "STOP"
+    assert stop.exists()
+    before = len(state.q("SELECT * FROM run"))
+    scheduler.run()
+    assert len(state.q("SELECT * FROM run")) == before
+
+    stop.unlink()
+    scheduler.consecutive_failures = 0
+    scheduler.run()
+    assert len(state.q("SELECT * FROM run")) > before
 
 
 def test_turn_budget_is_enforced(setup):

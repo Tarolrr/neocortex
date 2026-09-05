@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import protocol
+from . import arbiter, protocol
 from .config import Config
 from .scheduler import Scheduler
 from .state import State
@@ -43,7 +43,7 @@ def cmd_init(args) -> int:
 def cmd_project(args) -> int:
     _, state = _open(args)
     state.add_project(args.id, args.title or args.id, str(Path(args.repo).resolve()),
-                      args.test_cmd, args.quota)
+                      args.test_cmd, args.quota, args.mirror)
     print(f"project {args.id} -> {args.repo}")
     return 0
 
@@ -52,13 +52,14 @@ def cmd_task(args) -> int:
     _, state = _open(args)
     acceptance = args.accept or []
     if args.file:
-        spec = json.loads(Path(args.file).read_text())
-        tid = state.add_task(spec["project"], spec["title"], spec["objective"],
-                             spec["acceptance"], spec.get("boundaries"),
-                             spec.get("priority", 100), spec.get("budget_turns", 6))
-    else:
-        tid = state.add_task(args.project, args.title, args.objective, acceptance,
-                             args.boundary or [], args.priority, args.budget)
+        specs = json.loads(Path(args.file).read_text())
+        for spec in specs if isinstance(specs, list) else [specs]:
+            print(state.add_task(spec["project"], spec["title"], spec["objective"],
+                                 spec["acceptance"], spec.get("boundaries"),
+                                 spec.get("priority", 100), spec.get("budget_turns", 6)))
+        return 0
+    tid = state.add_task(args.project, args.title, args.objective, acceptance,
+                         args.boundary or [], args.priority, args.budget)
     print(tid)
     return 0
 
@@ -157,6 +158,24 @@ def cmd_run(args) -> int:
     return 0
 
 
+def cmd_rollback(args) -> int:
+    _, state = _open(args)
+    task = state.one("SELECT * FROM task WHERE id=?", (args.task_id,))
+    if task is None or not task["merge_commit"]:
+        print(f"{args.task_id} has no recorded merge commit", file=sys.stderr)
+        return 1
+    project = state.one("SELECT * FROM project WHERE id=?", (task["project_id"],))
+    repo = Path(project["repo_path"])
+    commit = arbiter.revert(repo, task["merge_commit"])
+    error = arbiter.mirror(repo, project["mirror"])
+    state.set_task(args.task_id, status="blocked",
+                   result=f"reverted by the owner in {commit}")
+    state.incident("rollback", f"{args.task_id} reverted in {commit}")
+    print(f"reverted {task['merge_commit']} in {commit}"
+          + (f"; mirror push failed: {error}" if error else ""))
+    return 0
+
+
 def cmd_stop(args) -> int:
     cfg, _ = _open(args)
     (cfg.home / "STOP").write_text(args.reason or "stopped by the owner\n")
@@ -211,6 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--title")
     sp.add_argument("--test-cmd", dest="test_cmd")
     sp.add_argument("--quota", type=float, default=1.0)
+    sp.add_argument("--mirror", help="git remote to push accepted work to")
     sp.set_defaults(func=cmd_project)
 
     sp = sub.add_parser("task", help="add a task")
@@ -240,6 +260,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_answer)
 
     sub.add_parser("incidents").set_defaults(func=cmd_incidents)
+
+    sp = sub.add_parser("rollback", help="revert an accepted task")
+    sp.add_argument("task_id")
+    sp.set_defaults(func=cmd_rollback)
 
     sp = sub.add_parser("stop", help="stop the loop after the current turn")
     sp.add_argument("reason", nargs="?")

@@ -77,6 +77,53 @@ def cmd_tasks(args) -> int:
     return 0
 
 
+def cmd_why(args) -> int:
+    cfg, state = _open(args)
+    task = state.one("SELECT * FROM task WHERE id=?", (args.task_id,))
+    if task is None:
+        print(f"unknown task: {args.task_id}", file=sys.stderr)
+        return 1
+    print(f"{task['id']}: {task['title']}\nstatus: {task['status']}")
+    print("\nacceptance criteria:")
+    criteria = json.loads(task["acceptance"])
+    for criterion in criteria:
+        print(f"  - {criterion}")
+    if not criteria:
+        print("  (none)")
+
+    print("\nruns:")
+    runs = state.q("SELECT * FROM run WHERE task_id=? ORDER BY started_at, id", (task["id"],))
+    now = time.time()
+    for run in runs:
+        end = run["ended_at"] if run["ended_at"] is not None else now
+        duration = f"{end - run['started_at']:.1f}s"
+        if run["ended_at"] is None:
+            duration += " elapsed"
+        print(f"  #{run['id']} agent={run['agent_id']} role={run['role']} "
+              f"outcome={run['outcome'] or 'running'} duration={duration} "
+              f"log={run['log_path'] or '(none)'}")
+    if not runs:
+        print("  (none)")
+
+    print("\nmessages:")
+    messages = state.q("SELECT * FROM message WHERE task_id=? ORDER BY id", (task["id"],))
+    for message in messages:
+        print(f"  #{message['id']} [{message['kind']}] "
+              f"{message['sender']} -> {message['recipient']}: {message['payload']}")
+    if not messages:
+        print("  (none)")
+
+    check_path = cfg.home / "checks" / f"{task['id']}.txt"
+    print(f"\nacceptance check output ({check_path}):")
+    try:
+        output = check_path.read_text()
+    except FileNotFoundError:
+        print("  (no stored check output)")
+    else:
+        print(output, end="" if output.endswith("\n") else "\n")
+    return 0
+
+
 def cmd_agents(args) -> int:
     _, state = _open(args)
     for row in state.q("SELECT * FROM agent ORDER BY created_at"):
@@ -247,6 +294,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("tasks")
     sp.add_argument("--project")
     sp.set_defaults(func=cmd_tasks)
+
+    sp = sub.add_parser("why", help="show a task's status and review evidence")
+    sp.add_argument("task_id")
+    sp.set_defaults(func=cmd_why)
 
     sub.add_parser("agents").set_defaults(func=cmd_agents)
 

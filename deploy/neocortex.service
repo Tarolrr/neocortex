@@ -1,0 +1,13 @@
+[Unit]
+Description=Neocortex: drain the agent queue once
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/neocortex
+Environment=NC_HOME=/root/.neocortex
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/neocortex/.venv/bin/nc run
+TimeoutStartSec=3600
+# One run drains the queue and exits; the timer decides when to start the next
+# one. A crashed turn therefore costs one cycle, not the system.

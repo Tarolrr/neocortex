@@ -157,6 +157,29 @@ def cmd_run(args) -> int:
     return 0
 
 
+def cmd_stop(args) -> int:
+    cfg, _ = _open(args)
+    (cfg.home / "STOP").write_text(args.reason or "stopped by the owner\n")
+    print(f"wrote {cfg.home / 'STOP'}; `nc run` will exit immediately until `nc resume`")
+    return 0
+
+
+def cmd_resume(args) -> int:
+    cfg, state = _open(args)
+    stop = cfg.home / "STOP"
+    if stop.exists():
+        print(f"removing {stop}: {stop.read_text().strip()}")
+        stop.unlink()
+    state.x("UPDATE incident SET resolved=1 WHERE resolved=0")
+    if args.retry:
+        for row in state.q("SELECT * FROM task WHERE status='blocked'"):
+            state.set_task(row["id"], status="in_progress", attempts=0)
+            state.set_agent(f"worker-{row['id']}", state="runnable")
+            print(f"unblocked {row['id']}")
+    print("resumed")
+    return 0
+
+
 def cmd_status(args) -> int:
     _, state = _open(args)
     for row in state.q("SELECT project_id, status, COUNT(*) AS c FROM task"
@@ -217,6 +240,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_answer)
 
     sub.add_parser("incidents").set_defaults(func=cmd_incidents)
+
+    sp = sub.add_parser("stop", help="stop the loop after the current turn")
+    sp.add_argument("reason", nargs="?")
+    sp.set_defaults(func=cmd_stop)
+
+    sp = sub.add_parser("resume", help="clear STOP and open incidents")
+    sp.add_argument("--retry", action="store_true", help="also requeue blocked tasks")
+    sp.set_defaults(func=cmd_resume)
+
     sub.add_parser("preflight").set_defaults(func=cmd_preflight)
     sub.add_parser("health", help="show state database and counts").set_defaults(func=cmd_health)
     sub.add_parser("step", help="run exactly one agent turn").set_defaults(func=cmd_step)

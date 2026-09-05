@@ -257,7 +257,12 @@ class Scheduler:
                     "circuit_breaker",
                     f"{self.consecutive_failures} consecutive failed turns; stopping",
                 )
-                log.error("circuit breaker tripped after %d failed turns",
+                # The timer would otherwise restart us straight into the same
+                # failure every few minutes. Stay down until a human says go.
+                (self.cfg.home / "STOP").write_text(
+                    f"circuit breaker: {self.consecutive_failures} consecutive failed turns\n"
+                )
+                log.error("circuit breaker tripped after %d failed turns; wrote STOP",
                           self.consecutive_failures)
                 return
             time.sleep(1)

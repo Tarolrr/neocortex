@@ -1,0 +1,89 @@
+[
+  {
+    "project": "neocortex",
+    "title": "nc why <task-id>: one screen of evidence per task",
+    "objective": "Add a `why` subcommand to nc/cli.py that prints, for one task: its status, acceptance criteria, every run (agent, role, outcome, duration, log path), every message about it, and the stored acceptance check output from $NC_HOME/checks/<task>.txt. This is how the owner reviews accepted work without reading the database by hand.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m nc.cli --home /tmp/nc-why-check why nonexistent-T001; test $? -eq 1",
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test builds a task with runs and messages and asserts the output contains the outcome of each run and the check output",
+      "An unknown task id exits non-zero with a clear message rather than a traceback"
+    ],
+    "boundaries": [
+      "Only touch nc/cli.py, README.md and files under tests/",
+      "Do not change the database schema, the scheduler or the protocol"
+    ],
+    "priority": 10,
+    "budget_turns": 4
+  },
+  {
+    "project": "neocortex",
+    "title": "Garbage-collect stale worktrees",
+    "objective": "Add `nc gc`: for every task that is done or blocked, remove its git worktree under $NC_HOME/work and prune, leaving the branch itself intact. Print what was removed. The Orange Pi has little disk, and a worktree per attempted task accumulates forever today.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test creates a worktree for a done task and one for an in_progress task, runs gc, and asserts only the first is gone and its branch still exists",
+      "gc never touches a worktree whose task is queued, in_progress or in_review"
+    ],
+    "boundaries": [
+      "Only touch nc/cli.py, nc/arbiter.py, README.md and files under tests/",
+      "Do not change the database schema or the scheduler"
+    ],
+    "priority": 20,
+    "budget_turns": 4
+  },
+  {
+    "project": "neocortex",
+    "title": "Escalate agents that have been blocked too long",
+    "objective": "The scheduler must notice when an agent has been blocked on an unanswered question for longer than Config.ask_timeout_s and raise an incident once per agent (not once per cycle), so a forgotten question surfaces in `nc incidents` instead of silently stalling the queue. Add the check to Scheduler.run before picking an agent.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test with ask_timeout_s=0 asserts exactly one incident is raised for a blocked agent even after several run cycles",
+      "An agent blocked for less than ask_timeout_s produces no incident"
+    ],
+    "boundaries": [
+      "Only touch nc/scheduler.py, nc/state.py and files under tests/",
+      "Do not change the turn protocol or the outcome handlers"
+    ],
+    "priority": 30,
+    "budget_turns": 5
+  },
+  {
+    "project": "neocortex",
+    "title": "Record what each turn cost",
+    "objective": "Token counts are parsed from CLI output only by a loose regex today and are usually NULL. Make nc/adapters.py extract the token usage that `codex exec` actually reports (inspect a real log under $NC_HOME/runs), fall back to NULL when absent, and add `nc costs` printing tokens and wall-clock time per task and per role from the run table.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m nc.cli --home /tmp/nc-costs-check costs",
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test feeds a real codex log sample to the parser and asserts the token count",
+      "costs works on an empty database without crashing"
+    ],
+    "boundaries": [
+      "Only touch nc/adapters.py, nc/cli.py and files under tests/",
+      "Do not change how sessions are launched"
+    ],
+    "priority": 40,
+    "budget_turns": 5
+  },
+  {
+    "project": "neocortex",
+    "title": "Per-role adapters and a working Claude path",
+    "objective": "Config.models maps role to model, but the adapter is global. Allow config to select an adapter per role (for example worker=codex, critic=claude), so the critic can be a different vendor from the worker — an independent reviewer is worth more when it does not share the author's blind spots. Verify the claude adapter's argument list against the installed CLI at /root/.local/bin/claude and fix it if wrong.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test asserts the scheduler asks for the adapter named in config for each role and falls back to the global adapter when unset",
+      "The claude command line is documented in the README as verified against the installed CLI version"
+    ],
+    "boundaries": [
+      "Only touch nc/config.py, nc/adapters.py, nc/scheduler.py, README.md and files under tests/",
+      "Do not spend a turn running paid sessions; a --version or --help probe is enough"
+    ],
+    "priority": 50,
+    "budget_turns": 5
+  }
+]

@@ -21,6 +21,7 @@ NO_OUTCOME = "NO_OUTCOME"
 VALID_OUTCOMES = {DONE, ASK, YIELD, FAIL}
 
 # Message kinds exchanged through the state's message table.
+FEEDBACK = "feedback"
 QUESTION = "question"
 ANSWER = "answer"
 REVIEW_REQUEST = "review_request"

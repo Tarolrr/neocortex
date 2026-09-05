@@ -259,6 +259,20 @@ def cmd_answer(args) -> int:
     return 0
 
 
+def cmd_feedback(args) -> int:
+    cfg, state = _open(args)
+    text = args.text if args.cmd == "feedback" else (args.note or "Request a planning pass.")
+    try:
+        agent_id, message_id = state.planner_feedback(
+            args.project, text, cfg.model_for("planner"), getattr(args, "task", None),
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"queued feedback #{message_id} for {agent_id}; planner is runnable")
+    return 0
+
+
 def cmd_incidents(args) -> int:
     _, state = _open(args)
     for row in state.open_incidents():
@@ -348,6 +362,15 @@ def cmd_status(args) -> int:
     for row in state.q("SELECT project_id, status, COUNT(*) AS c FROM task"
                        " GROUP BY project_id, status ORDER BY project_id"):
         print(f"{row['project_id']:<12} {row['status']:<12} {row['c']}")
+    feedback = state.q(
+        "SELECT m.*, a.project_id FROM message m JOIN agent a ON a.id=m.recipient"
+        " WHERE m.kind=? AND m.delivered=0 ORDER BY m.id", (protocol.FEEDBACK,),
+    )
+    if feedback:
+        print("\npending feedback:")
+        for row in feedback:
+            print(f"  #{row['id']} {row['project_id']} ({row['task_id'] or '-'}): "
+                  f"{json.loads(row['payload'])['text']}")
     runs = state.q("SELECT * FROM run ORDER BY id DESC LIMIT ?", (args.limit,))
     if runs:
         print("\nlast runs:")
@@ -423,6 +446,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("message_id", type=int)
     sp.add_argument("text")
     sp.set_defaults(func=cmd_answer)
+
+    sp = sub.add_parser("feedback", help="queue owner feedback and wake the project planner")
+    sp.add_argument("text")
+    sp.add_argument("--project")
+    sp.add_argument("--task")
+    sp.set_defaults(func=cmd_feedback)
+
+    sp = sub.add_parser("plan", help="request a planning pass on the next timer tick")
+    sp.add_argument("project")
+    sp.add_argument("--note")
+    sp.set_defaults(func=cmd_feedback)
 
     sub.add_parser("incidents").set_defaults(func=cmd_incidents)
 

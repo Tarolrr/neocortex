@@ -15,6 +15,7 @@ neocortex.egg-info/SOURCES.txt
 neocortex.egg-info/dependency_links.txt
 neocortex.egg-info/entry_points.txt
 neocortex.egg-info/top_level.txt
+tests/test_cli.py
 tests/test_protocol.py
 tests/test_scheduler.py
 tests/test_state.py

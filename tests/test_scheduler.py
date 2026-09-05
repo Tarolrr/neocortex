@@ -133,7 +133,7 @@ def test_accepted_work_is_mirrored_and_can_be_reverted(setup, tmp_path):
 
     task = state.one("SELECT * FROM task WHERE id=?", (tid,))
     assert task["merge_commit"]
-    mirrored = subprocess.run(["git", "log", "--oneline", "main"], cwd=remote,
+    mirrored = subprocess.run(["git", "log", "--oneline", "nc/main"], cwd=remote,
                               capture_output=True, text=True, check=True).stdout
     assert f"{tid}: accepted by arbiter" in mirrored
     assert state.open_incidents() == []

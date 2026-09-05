@@ -62,9 +62,11 @@ nc answer 7 "use port 8080"    # answers and makes that agent runnable again
 
 ## Reviewing and undoing accepted work
 
-A project with a `mirror` remote gets its base branch and the task branch pushed
-there right after the arbiter merges, so the diff is reviewable on the forge
-while the queue keeps running; a failed push is an incident, never a block.
+A project with a `mirror` remote gets its history pushed there right after the
+arbiter merges — the task branch as `nc/<task-id>` and the runner's base branch
+as `nc/main`, so the mirror can never fight the forge's own base branch. The
+diff is reviewable on the forge while the queue keeps running; a failed push is
+an incident, never a block.
 To undo one task:
 
 ```bash

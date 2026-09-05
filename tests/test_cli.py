@@ -1,6 +1,80 @@
+import shutil
+
+import pytest
+
+from nc import arbiter
 from nc.cli import main
 from nc.config import Config
 from nc.state import State
+
+
+@pytest.fixture
+def gc_project(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    arbiter.git(repo, "init", "-b", "main")
+    arbiter.git(repo, "config", "user.email", "nc@test")
+    arbiter.git(repo, "config", "user.name", "nc")
+    arbiter.git(repo, "commit", "--allow-empty", "-m", "seed")
+    cfg = Config(home=tmp_path / "home")
+    cfg.home.mkdir()
+    state = State(cfg.db_path)
+    state.add_project("demo", "Demo", str(repo), None)
+    yield cfg, state, repo
+    state.db.close()
+
+
+def test_gc_removes_only_done_and_blocked(gc_project, capsys):
+    cfg, state, repo = gc_project
+    worktrees = {}
+    for status in ("done", "blocked", "queued", "in_progress", "in_review", "failed"):
+        task = state.add_task("demo", status, "objective", [])
+        state.set_task(task, status=status)
+        path, branch = arbiter.ensure_worktree(repo, cfg.work_dir, task)
+        (path / "uncommitted.txt").write_text(status)
+        worktrees[status] = path, branch
+
+    assert main(["--home", str(cfg.home), "gc"]) == 0
+
+    output = capsys.readouterr().out.splitlines()
+    registered = arbiter.git(repo, "worktree", "list", "--porcelain")
+    for status, (path, branch) in worktrees.items():
+        removed = status in ("done", "blocked")
+        assert path.exists() is not removed
+        assert (f"removed {path}" in output) is removed
+        assert (f"worktree {path}\n" in registered) is not removed
+        assert arbiter.git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+    assert len(output) == 2
+    assert main(["--home", str(cfg.home), "gc"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_gc_prunes_missing_worktree(gc_project):
+    cfg, state, repo = gc_project
+    task = state.add_task("demo", "Done", "objective", [])
+    state.set_task(task, status="done")
+    path, branch = arbiter.ensure_worktree(repo, cfg.work_dir, task)
+    shutil.rmtree(path)
+
+    assert main(["--home", str(cfg.home), "gc"]) == 0
+
+    assert str(path) not in arbiter.git(repo, "worktree", "list", "--porcelain")
+    assert arbiter.git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+
+
+def test_gc_reports_removal_failure(gc_project, capsys):
+    cfg, state, repo = gc_project
+    task = state.add_task("demo", "Done", "objective", [])
+    state.set_task(task, status="done")
+    path, _ = arbiter.ensure_worktree(repo, cfg.work_dir, task)
+    arbiter.git(repo, "worktree", "lock", str(path))
+
+    assert main(["--home", str(cfg.home), "gc"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "failed" in captured.err
+    assert path.exists()
 
 
 def test_health_empty_home(tmp_path, capsys):

@@ -128,6 +128,23 @@ def cmd_preflight(args) -> int:
     return 0 if ok else 1
 
 
+def cmd_health(args) -> int:
+    cfg, state = _open(args)
+    print(f"database: {cfg.db_path}")
+    counts = dict.fromkeys(
+        ("queued", "in_progress", "in_review", "done", "failed", "blocked"), 0,
+    )
+    for row in state.q("SELECT status, COUNT(*) AS c FROM task GROUP BY status"):
+        counts[row["status"]] = row["c"]
+    for status, count in counts.items():
+        print(f"tasks {status}: {count}")
+    runnable = state.one("SELECT COUNT(*) AS c FROM agent WHERE state='runnable'")["c"]
+    incidents = state.one("SELECT COUNT(*) AS c FROM incident WHERE resolved=0")["c"]
+    print(f"runnable agents: {runnable}")
+    print(f"open incidents: {incidents}")
+    return 0
+
+
 def cmd_step(args) -> int:
     cfg, state = _open(args)
     print(Scheduler(cfg, state).step())
@@ -201,6 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("incidents").set_defaults(func=cmd_incidents)
     sub.add_parser("preflight").set_defaults(func=cmd_preflight)
+    sub.add_parser("health", help="show state database and counts").set_defaults(func=cmd_health)
     sub.add_parser("step", help="run exactly one agent turn").set_defaults(func=cmd_step)
 
     sp = sub.add_parser("run", help="run turns until idle or a stop condition")

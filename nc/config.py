@@ -20,6 +20,7 @@ class Config:
         "worker": "gpt-6-astra",
         "critic": "gpt-6-astra",
     })
+    adapters: dict[str, str] = field(default_factory=dict)
     turn_timeout_s: int = 900
     preflight_timeout_s: int = 120
     max_consecutive_failures: int = 3
@@ -63,3 +64,6 @@ class Config:
 
     def model_for(self, role: str) -> str:
         return self.models.get(role, next(iter(self.models.values())))
+
+    def adapter_for(self, role: str) -> str:
+        return self.adapters.get(role, self.adapter)

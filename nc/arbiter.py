@@ -111,7 +111,9 @@ def mirror(repo: Path, remote: str | None, branch: str | None = None) -> str:
     if not remote:
         return ""
     base = base_branch(repo)
-    refs = [base] + ([branch] if branch else [])
+    # The mirror is a review surface, not the project's upstream: the runner's own
+    # history lands on nc/<base> so it can never fight the forge's real base branch.
+    refs = [f"{base}:refs/heads/nc/{base}"] + ([branch] if branch else [])
     proc = subprocess.run(
         ["git", "push", remote, *refs], cwd=repo, capture_output=True, text=True,
         timeout=300, check=False,

@@ -202,3 +202,154 @@ def test_scheduler_lock_covers_selection_and_outcome(browser, monkeypatch):
     assert scheduler.step() == "idle"
     operations.requeue_task(cfg, state, tid, budget=10)
     assert state.one("SELECT budget_turns FROM task WHERE id=?", (tid,))[0] == 10
+
+
+@pytest.mark.parametrize("action", ["fresh", "rollback"])
+def test_database_contention_precedes_repository_changes(browser, monkeypatch, action):
+    import sqlite3
+
+    from nc import arbiter, operations
+
+    cfg, state, tid, _, _ = browser
+    if action == "rollback":
+        state.set_task(tid, status="done", merge_commit="abc123")
+    calls = []
+    monkeypatch.setattr(arbiter, "remove_worktree", lambda *args: calls.append(args))
+    monkeypatch.setattr(arbiter, "revert", lambda *args: calls.append(args))
+    other = State(cfg.db_path, initialize=False, timeout=0.01)
+    before = list(state.db.iterdump())
+    state.db.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            if action == "fresh":
+                operations.requeue_task(cfg, other, tid, fresh=True)
+            else:
+                operations.rollback_task(other, tid)
+    finally:
+        state.db.rollback()
+        other.db.close()
+    assert calls == []
+    assert list(state.db.iterdump()) == before
+
+
+def test_rollback_records_once(browser, monkeypatch):
+    from nc import arbiter, operations
+
+    _, state, tid, _, _ = browser
+    state.set_task(tid, status="done", merge_commit="abc123")
+    calls = []
+
+    def revert(*args):
+        calls.append(args)
+        return "def456"
+
+    monkeypatch.setattr(arbiter, "revert", revert)
+    result = operations.rollback_task(state, tid)
+    assert result["commit"] == "def456"
+    assert state.one("SELECT status FROM task WHERE id=?", (tid,))[0] == "blocked"
+    assert len(state.q("SELECT * FROM incident WHERE kind='rollback'")) == 1
+    with pytest.raises(ValueError, match="not accepted"):
+        operations.rollback_task(state, tid)
+    assert len(calls) == 1
+
+
+def test_feedback_proposal_decisions_and_answers(browser):
+    _, state, tid, server, request = browser
+
+    def post(page, action, form):
+        _, headers, body = request(page)
+        token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+        return request(action, "POST", {"csrf_token": token, **form},
+                       {"Cookie": headers["Set-Cookie"].split(";")[0],
+                        "Origin": f"http://127.0.0.1:{server.server_port}"})
+
+    feedback = "/p/one/feedback"
+    assert post(feedback, feedback, {"text": "Plan <script>x</script>"})[0] == 303
+    assert not state.q("SELECT * FROM run")
+    spec = [{"project": "one", "title": "Proposed", "objective": "x", "acceptance": []}]
+    pid = state.add_proposal("one", "planner", "<script>rationale</script>", spec)
+    page = f"/proposals/{pid}"
+    before = list(state.db.iterdump())
+    assert "<script>rationale" not in request(page)[2]
+    assert list(state.db.iterdump()) == before
+    status, headers, _ = post(page, page + "/approve", {"force": "1"})
+    assert status == 303
+    assert "approved:" in request(headers["Location"])[2]
+    assert state.one("SELECT status FROM proposal WHERE id=?", (pid,))[0] == "approved"
+    pid = state.add_proposal("one", "planner", "reject this", spec)
+    page = f"/proposals/{pid}"
+    assert post(page, page + "/reject", {"reason": "No thanks"})[0] == 303
+    assert state.one("SELECT status FROM proposal WHERE id=?", (pid,))[0] == "rejected"
+    state.add_agent("worker-test", "worker", "one", tid, "model")
+    mid = state.send("ASK", "worker-test", "owner", {"question": "<script>q</script>"}, tid)
+    assert "<script>q" not in request("/inbox")[2]
+    assert post("/inbox", f"/messages/{mid}/answer", {"text": "Continue"})[0] == 303
+    assert state.one("SELECT delivered FROM message WHERE id=?", (mid,))[0] == 1
+
+
+def test_cli_ui_explicit_home_port_and_shutdown(tmp_path, monkeypatch):
+    from nc import cli, ui
+
+    monkeypatch.setenv("NC_HOME", str(tmp_path / "unused"))
+    home = tmp_path / "explicit"
+    servers = []
+    original = ui.make_server
+
+    def make(cfg, port):
+        assert cfg.home == home
+        assert port == 0
+        server = original(cfg, port)
+        servers.append(server)
+
+        def stop():
+            raise KeyboardInterrupt
+
+        server.serve_forever = stop
+        return server
+
+    monkeypatch.setattr(ui, "make_server", make)
+    assert cli.main(["ui", "--home", str(home), "--port", "0"]) == 0
+    assert servers[0].socket.fileno() == -1
+    assert not (tmp_path / "unused").exists()
+
+
+@pytest.mark.parametrize("action", ["fresh", "rollback"])
+def test_active_run_prevents_repository_changes(browser, monkeypatch, action):
+    from nc import arbiter, operations
+
+    cfg, state, tid, _, _ = browser
+    if action == "rollback":
+        state.set_task(tid, status="done", merge_commit="abc123")
+    state.add_agent("active", "worker", "one", tid, "model")
+    state.start_run("active", tid, "worker", "model", "unused")
+    calls = []
+    monkeypatch.setattr(arbiter, "remove_worktree", lambda *args: calls.append(args))
+    monkeypatch.setattr(arbiter, "revert", lambda *args: calls.append(args))
+    before = list(state.db.iterdump())
+    with pytest.raises(ValueError, match="active run"):
+        if action == "fresh":
+            operations.requeue_task(cfg, state, tid, fresh=True)
+        else:
+            operations.rollback_task(state, tid)
+    assert calls == []
+    assert list(state.db.iterdump()) == before
+
+
+def test_real_git_revert_failure_preserves_database(browser, tmp_path):
+    from nc import arbiter, operations
+
+    _, state, tid, _, _ = browser
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    arbiter.git(repo, "init", "-b", "main")
+    arbiter.git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.test",
+                "commit", "--allow-empty", "-m", "initial")
+    state.x("UPDATE project SET repo_path=? WHERE id='one'", (str(repo),))
+    state.set_task(tid, status="done", merge_commit="0000000000000000000000000000000000000000")
+    before = list(state.db.iterdump())
+    head = arbiter.git(repo, "rev-parse", "HEAD")
+    with pytest.raises(RuntimeError):
+        operations.rollback_task(state, tid)
+    assert list(state.db.iterdump()) == before
+    assert arbiter.git(repo, "rev-parse", "HEAD") == head
+    assert not state.db.in_transaction

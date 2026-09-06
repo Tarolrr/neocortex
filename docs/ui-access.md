@@ -54,3 +54,13 @@ outcome integration; cancel, requeue and rollback report a retry message while
 it is busy. This deliberately serializes lifecycle changes across projects on
 this single-worker host without holding a SQLite transaction during agent work.
 Fresh requeue checks Git cleanup before resetting task and agent state.
+
+Fresh requeue and rollback reserve the SQLite write before touching Git, so
+contention leaves the repository untouched. Rollback records its task transition
+and incident together, and only accepted tasks can be rolled back. Answers share
+the lifecycle lock to avoid racing scheduler outcome integration.
+
+To check packaging in a disposable environment, build and install a wheel, then
+run that environment's Python with `-I scripts/check_installed_ui.py`. The check
+loads the installed package and requests its CSS over a temporary loopback
+server; run it from a writable directory for its temporary isolated home.

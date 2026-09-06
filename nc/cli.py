@@ -366,7 +366,7 @@ def cmd_rollback(args) -> int:
     _, state = _open(args)
     try:
         result = operations.rollback_task(state, args.task_id)
-    except LookupError as exc:
+    except (LookupError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"reverted {result['reverted_commit']} in {result['commit']}"

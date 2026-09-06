@@ -27,6 +27,7 @@ import logging
 import re
 import secrets
 import sqlite3
+import subprocess
 import urllib.parse
 from collections.abc import Callable
 from http import HTTPStatus
@@ -304,7 +305,7 @@ def _proposal_list_page(state: State, project: dict, flash: str, error: str) -> 
     return _page("Proposals", "projects", body)
 
 
-def _proposal_detail_page(state: State, detail: dict, csrf: str, error: str) -> str:
+def _proposal_detail_page(state: State, detail: dict, csrf: str, error: str, flash: str = "") -> str:
     spec_json = json.dumps(detail["spec"], indent=2, ensure_ascii=False)
     findings = "".join(f"<li>{_e(f)}</li>" for f in detail["findings"])
     revisions = "".join(
@@ -337,7 +338,7 @@ def _proposal_detail_page(state: State, detail: dict, csrf: str, error: str) -> 
 <button type="submit">Reject proposal</button>
 </form></details>"""
     body = f"""
-{_flash('error', error)}
+{_flash('ok', flash)}{_flash('error', error)}
 <h2>Proposal #{detail['id']} ({_e(detail['status'])})</h2>
 <p><a href="/p/{_e(detail['project_id'])}/proposals">back to proposals</a></p>
 <p>{_e(detail['rationale'])}</p>
@@ -577,7 +578,7 @@ def _view_proposals(h: Handler, state, params, query):
 def _view_proposal(h: Handler, state, params, query):
     detail = operations.proposal_detail(state, int(params["proposal_id"]))
     h.send_html(HTTPStatus.OK, _proposal_detail_page(
-        state, detail, h.csrf_token, query.get("error", ""),
+        state, detail, h.csrf_token, query.get("error", ""), query.get("ok", ""),
     ))
 
 
@@ -743,7 +744,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._end(_error_page(HTTPStatus.NOT_FOUND, str(exc)))
         except sqlite3.OperationalError as exc:
             self._contention(exc)
-        except RuntimeError as exc:
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
             self.send_response(HTTPStatus.CONFLICT)
             self._end(_error_page(HTTPStatus.CONFLICT, str(exc)))
         except ValueError as exc:

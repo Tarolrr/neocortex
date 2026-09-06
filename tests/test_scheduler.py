@@ -144,6 +144,64 @@ def test_accepted_work_is_mirrored_and_can_be_reverted(setup, tmp_path):
     assert state.one("SELECT * FROM task WHERE id=?", (tid,))["status"] == "blocked"
 
 
+def test_a_dependent_task_waits_until_its_dependency_is_accepted(setup):
+    cfg, state, _repo = setup
+    first = state.add_task("neocortex", "base", "create marker.txt", [], priority=10)
+    second = state.add_task("neocortex", "follow-up", "extend marker.txt", [], priority=20,
+                            depends_on=[first])
+
+    scheduler = sched(cfg, state, [
+        commit_and_emit("marker.txt", "hi\n", {"outcome": "DONE", "summary": "done"}),
+        emit({"outcome": "DONE", "verdict": "pass", "summary": "ok"}),
+        commit_and_emit("marker.txt", "hi again\n", {"outcome": "DONE", "summary": "done"}),
+    ])
+
+    scheduler.step()                                     # worker on the dependency
+    assert state.one("SELECT * FROM task WHERE id=?", (second,))["status"] == "queued"
+    assert state.one("SELECT * FROM agent WHERE task_id=?", (second,)) is None
+
+    scheduler.step()                                     # critic accepts the dependency
+    assert state.unmet_dependencies(second) == []
+    scheduler.step()
+    assert state.one("SELECT * FROM task WHERE id=?", (second,))["status"] == "in_review"
+
+
+def test_a_dependent_task_stays_queued_while_its_dependency_is_blocked(setup):
+    cfg, state, _repo = setup
+    first = state.add_task("neocortex", "base", "create marker.txt", [], priority=10)
+    second = state.add_task("neocortex", "follow-up", "extend it", [], priority=20,
+                            depends_on=[first])
+    state.set_task(first, status="blocked")
+
+    scheduler = sched(cfg, state, [])
+    assert scheduler.next_ready_task() is None
+    assert state.unmet_dependencies(second) == [first]
+
+
+def test_requeue_restarts_a_blocked_task_from_the_base_branch(setup):
+    cfg, state, _repo = setup
+    tid = state.add_task("neocortex", "add marker", "create marker.txt", [])
+    scheduler = sched(cfg, state, [
+        commit_and_emit("marker.txt", "stale\n", {"outcome": "DONE", "summary": "done"}),
+        emit({"outcome": "DONE", "verdict": "rework", "summary": "no", "findings": ["redo"]}),
+        commit_and_emit("marker.txt", "fresh\n", {"outcome": "DONE", "summary": "done"}),
+    ])
+    scheduler.step()
+    scheduler.step()
+    state.set_task(tid, status="blocked")
+
+    assert cli.main(["--home", str(cfg.home), "requeue", tid, "--fresh"]) == 0
+    task = state.one("SELECT * FROM task WHERE id=?", (tid,))
+    assert task["status"] == "queued" and task["attempts"] == 0
+    assert all(agent["turns"] == 0 and agent["state"] == "blocked"
+               for agent in state.q("SELECT * FROM agent WHERE task_id=?", (tid,)))
+    assert not (cfg.work_dir / tid).exists()
+
+    scheduler.step()
+    worktree = cfg.work_dir / tid
+    assert (worktree / "marker.txt").read_text() == "fresh\n"
+
+
 def test_failing_acceptance_check_sends_the_worker_back_without_calling_the_critic(setup):
     cfg, state, _repo = setup
     tid = state.add_task("neocortex", "add marker", "create marker.txt",

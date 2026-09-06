@@ -60,6 +60,32 @@ nc inbox                       # questions and incidents addressed to the owner
 nc answer 7 "use port 8080"    # answers and makes that agent runnable again
 ```
 
+## Ordering tasks
+
+A task can name tasks it builds on, and no worker is spawned for it until every
+one of them is accepted:
+
+```bash
+nc task --project neocortex --title "..." --objective "..." \
+  --after neocortex-T009 --after neocortex-T010
+```
+
+In a JSON pool the same field is `"depends_on": ["neocortex-T009"]`. A
+dependency that is blocked, failed or absent stays unmet, so the queue moves on
+to independent work instead of starting a task whose premise does not exist yet.
+`nc tasks` shows `waits-for=` for anything still waiting.
+
+To restart a task the reviewer or the owner stopped:
+
+```bash
+nc requeue neocortex-T009            # queued again, same branch and history
+nc requeue neocortex-T009 --fresh    # also drops its branch and worktree, so
+                                     # the next attempt starts from the base
+```
+
+Use `--fresh` when the task's premise changed — for example when it must now be
+built on work merged after its branch was created.
+
 ## Reviewing and undoing accepted work
 
 Run `nc why neocortex-T007` to see a task's status, acceptance criteria, every

@@ -161,13 +161,25 @@ def test_missing_machine_check(tmp_path):
     assert any('no machine-checkable acceptance' in f for f in findings(state, pid))
 
 
-@pytest.mark.parametrize('boundary', ['nc/state.py', 'src/', 'Do not modify nc/state.py'])
-def test_path_boundary(tmp_path, boundary):
-    _, state = setup_state(tmp_path)
+@pytest.mark.parametrize('boundary', [
+    'nc/state.py', 'src/', 'Do not modify nc/state.py',
+    '/root/neocortex/nc/state.py', '/src/', 'Do not modify /root/neocortex/nc/state.py',
+])
+def test_path_boundary(tmp_path, capsys, boundary):
+    cfg, state = setup_state(tmp_path)
     tasks = specs()
     tasks[0]['boundaries'] = [boundary]
     pid = state.add_proposal('demo', 'planner', 'Rationale', tasks)
     assert any('boundary names a path' in f for f in findings(state, pid))
+    argv = ['--home', str(cfg.home), 'approve', str(pid)]
+    assert main(argv) == 1
+    assert boundary in capsys.readouterr().err
+    assert state.one('SELECT status FROM proposal')['status'] == 'pending'
+    assert not state.q('SELECT * FROM task')
+    assert main([*argv, '--force']) == 0
+    assert f'overriding finding: task 1: boundary names a path instead of an invariant: {boundary}' in (
+        capsys.readouterr().err
+    )
 
 
 def test_clean_proposal_with_invariants_and_local_dependencies(tmp_path):
@@ -176,7 +188,8 @@ def test_clean_proposal_with_invariants_and_local_dependencies(tmp_path):
     tasks = specs()
     tasks[0].update(id='first', depends_on=[existing],
                     boundaries=['Public API must remain backward compatible',
-                                'nc/state.py must preserve database compatibility'])
+                                'nc/state.py must preserve database compatibility',
+                                '/root/neocortex/nc/state.py must preserve database compatibility'])
     tasks[1]['depends_on'] = ['first']
     pid = state.add_proposal('demo', 'planner', 'Rationale', tasks)
     assert findings(state, pid) == []

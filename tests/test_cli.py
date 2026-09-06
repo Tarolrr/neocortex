@@ -232,3 +232,137 @@ def test_costs_totals(tmp_path, capsys, monkeypatch):
     assert "(none) runs=1 tokens=unknown unknown_runs=1 wall=30.0s" in output
     assert "worker runs=3 tokens=100 unknown_runs=1 wall=30.0s" in output
     assert "critic runs=2 tokens=50 unknown_runs=1 wall=35.0s" in output
+
+
+def test_resume_retry_does_not_revive_concurrently_cancelled_task(gc_project, monkeypatch, capsys):
+    cfg, state, _repo = gc_project
+    task = state.add_task("demo", "Superseded", "objective", [])
+    state.set_task(task, status="blocked", attempts=3)
+    agent = state.add_agent(f"worker-{task}", "worker", "demo", task, "m")
+    state.set_agent(agent, state="blocked")
+    original_q = State.q
+    snapshots = {}
+
+    def cancel_after_selection(connection, sql, params=()):
+        rows = original_q(connection, sql, params)
+        if sql == "SELECT * FROM task WHERE status='blocked'":
+            assert connection is not state
+            state.cancel_task(task, "concurrent cancellation")
+            snapshots["task"] = dict(state.one("SELECT * FROM task WHERE id=?", (task,)))
+            snapshots["agent"] = dict(state.one("SELECT * FROM agent WHERE id=?", (agent,)))
+        return rows
+
+    monkeypatch.setattr(State, "q", cancel_after_selection)
+    assert main(["--home", str(cfg.home), "resume", "--retry"]) == 0
+    assert dict(state.one("SELECT * FROM task WHERE id=?", (task,))) == snapshots["task"]
+    assert dict(state.one("SELECT * FROM agent WHERE id=?", (agent,))) == snapshots["agent"]
+    assert "unblocked" not in capsys.readouterr().out
+
+
+def test_cancel_history_and_restoration(gc_project, capsys):
+    from nc.scheduler import Scheduler
+
+    cfg, state, repo = gc_project
+    task = state.add_task("demo", "Superseded", "original objective", ["original check"])
+    dep = state.add_task("demo", "Dependent", "wait", [], depends_on=[task])
+    state.set_task(task, status="blocked", result="old result")
+    agent = state.add_agent(f"worker-{task}", "worker", "demo", task, "m")
+    state.set_agent(agent, state="blocked", memo="old memo")
+    run = state.start_run(agent, task, "worker", "m", "/old/log")
+    state.end_run(run, "ASK")
+    question = state.send("question", agent, "owner", {"question": "old question"}, task)
+    path, branch = arbiter.ensure_worktree(repo, cfg.work_dir, task)
+    before_run = dict(state.one("SELECT * FROM run WHERE id=?", (run,)))
+    before_question = dict(state.one("SELECT * FROM message WHERE id=?", (question,)))
+
+    def cli(*args):
+        return main(["--home", str(cfg.home), *args])
+
+    assert cli("cancel", task, "--reason", "superseded by the canonical copy") == 0
+    assert path.exists()
+    assert arbiter.git(repo, "rev-parse", "--verify", branch)
+    assert dict(state.one("SELECT * FROM run WHERE id=?", (run,))) == before_run
+    assert dict(state.one("SELECT * FROM message WHERE id=?", (question,))) == before_question
+    assert state.one("SELECT result FROM task WHERE id=?", (task,))["result"] == "old result"
+    assert state.one("SELECT memo FROM agent WHERE id=?", (agent,))["memo"] == "old memo"
+    capsys.readouterr()
+    assert cli("tasks") == 0
+    assert not any(line.startswith(task) for line in capsys.readouterr().out.splitlines())
+    assert cli("tasks", "--all", "--project", "demo") == 0
+    assert task in capsys.readouterr().out
+    assert cli("why", task) == 0
+    evidence = capsys.readouterr().out
+    for text in ("cancelled", "superseded by the canonical copy", "old question",
+                 "/old/log", "original objective", "original check"):
+        assert text in evidence
+    assert cli("why", dep) == 0
+    assert "cancelled; dependency remains unmet" in capsys.readouterr().out
+    assert cli("answer", str(question), "yes") == 1
+    assert cli("resume", "--retry") == 0
+    scheduler = Scheduler(cfg, state)
+    with pytest.raises(ValueError, match="cancelled"):
+        state.start_run(agent, task, "worker", "m", "new log")
+    assert scheduler.next_ready_task() is None
+    assert scheduler.pick() is None
+    # Even stale agent state cannot schedule or escalate a cancelled task.
+    state.set_agent(agent, state="runnable")
+    assert scheduler.pick() is None
+    state.set_agent(agent, state="blocked")
+    state.x("UPDATE agent SET updated_at=0 WHERE id=?", (agent,))
+    scheduler._escalate_unanswered_questions()
+    assert not state.open_incidents()
+    assert state.unmet_dependencies(dep) == [task]
+    assert cli("requeue", task) == 0
+    assert scheduler.next_ready_task()["id"] == task
+    assert scheduler.pick()["id"] == agent
+    assert cli("why", task) == 0
+    assert "superseded by the canonical copy" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("status", ["queued", "blocked", "failed"])
+def test_cancel_atomic_and_idempotent(gc_project, status):
+    import sqlite3
+
+    _, state, _ = gc_project
+    task = state.add_task("demo", "task", "objective", [])
+    state.set_task(task, status=status)
+    state.add_agent("worker", "worker", "demo", task, "m")
+    before = list(state.db.iterdump())
+    state.db.execute("""
+        CREATE TEMP TRIGGER reject_cancel BEFORE INSERT ON message
+        WHEN NEW.kind='cancellation'
+        BEGIN SELECT RAISE(ABORT, 'injected failure'); END
+    """)
+    with pytest.raises(sqlite3.IntegrityError):
+        state.cancel_task(task, "obsolete")
+    assert list(state.db.iterdump()) == before
+    state.db.execute("DROP TRIGGER reject_cancel")
+    assert state.cancel_task(task, "obsolete")
+    after = list(state.db.iterdump())
+    assert not state.cancel_task(task, "different reason")
+    assert list(state.db.iterdump()) == after
+
+
+@pytest.mark.parametrize("status,active", [
+    ("queued", True), ("blocked", True), ("failed", True),
+    ("in_progress", False), ("in_review", False), ("done", False),
+])
+def test_cancel_rejects_without_changes(gc_project, status, active):
+    cfg, state, _ = gc_project
+    task = state.add_task("demo", "task", "objective", [])
+    state.set_task(task, status=status)
+    state.add_agent("worker", "worker", "demo", task, "m")
+    if active:
+        state.start_run("worker", task, "worker", "m", "log")
+    before = list(state.db.iterdump())
+    assert main(["--home", str(cfg.home), "cancel", task, "--reason", "obsolete"]) == 1
+    assert list(state.db.iterdump()) == before
+
+
+def test_cancel_unknown_and_blank_reason(gc_project):
+    cfg, state, _ = gc_project
+    before = list(state.db.iterdump())
+    assert main(["--home", str(cfg.home), "cancel", "missing", "--reason", "obsolete"]) == 1
+    with pytest.raises(ValueError, match="reason"):
+        state.cancel_task("missing", " ")
+    assert list(state.db.iterdump()) == before

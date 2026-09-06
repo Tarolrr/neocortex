@@ -63,6 +63,17 @@ def cmd_task(args) -> int:
     return 0
 
 
+def cmd_cancel(args) -> int:
+    _, state = _open(args)
+    try:
+        changed = state.cancel_task(args.task_id, args.reason)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"{args.task_id} " + ("cancelled" if changed else "already cancelled"))
+    return 0
+
+
 def cmd_requeue(args) -> int:
     """Put a task back in the queue, optionally from a clean branch off the base."""
     cfg, state = _open(args)
@@ -147,11 +158,13 @@ def cmd_decide_proposal(args) -> int:
 
 def cmd_tasks(args) -> int:
     _, state = _open(args)
-    sql = "SELECT * FROM task"
+    sql = "SELECT * FROM task WHERE 1=1"
     params: tuple = ()
     if args.project:
-        sql += " WHERE project_id=?"
+        sql += " AND project_id=?"
         params = (args.project,)
+    if not args.all:
+        sql += " AND status != 'cancelled'"
     for row in state.q(sql + " ORDER BY priority, created_at", params):
         unmet = state.unmet_dependencies(row["id"])
         waiting = f" waits-for={','.join(unmet)}" if unmet else ""
@@ -172,6 +185,10 @@ def cmd_why(args) -> int:
         unmet = state.unmet_dependencies(task["id"])
         print(f"depends on: {', '.join(depends_on)}"
               + (f" (waiting for {', '.join(unmet)})" if unmet else " (all accepted)"))
+    for dep in depends_on:
+        other = state.one("SELECT status FROM task WHERE id=?", (dep,))
+        if other is not None and other["status"] == "cancelled":
+            print(f"  {dep}: cancelled; dependency remains unmet (inspect with nc why {dep})")
     print(f"\nobjective:\n{task['objective']}")
     print("\nacceptance criteria:")
     criteria = json.loads(task["acceptance"])
@@ -297,17 +314,33 @@ def cmd_inbox(args) -> int:
 
 def cmd_answer(args) -> int:
     _, state = _open(args)
-    question = state.one("SELECT * FROM message WHERE id=?", (args.message_id,))
-    if question is None:
-        print(f"no message #{args.message_id}", file=sys.stderr)
-        return 1
-    agent_id = question["sender"]
-    state.send(protocol.ANSWER, "owner", agent_id, {"answer": args.text},
-               task_id=question["task_id"], in_reply_to=question["id"])
-    state.mark_delivered([question["id"]])
-    state.set_agent(agent_id, state="runnable")
-    if question["task_id"]:
-        state.set_task(question["task_id"], status="in_progress")
+    with state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        question = state.one("SELECT * FROM message WHERE id=?", (args.message_id,))
+        if question is None:
+            print(f"no message #{args.message_id}", file=sys.stderr)
+            return 1
+        if state.one(
+            "SELECT 1 FROM task WHERE status='cancelled' AND"
+            " (id=? OR id=(SELECT task_id FROM agent WHERE id=?))",
+            (question["task_id"], question["sender"]),
+        ):
+            print("task is cancelled; use nc requeue explicitly to restore it", file=sys.stderr)
+            return 1
+        agent_id = question["sender"]
+        now = time.time()
+        state.db.execute(
+            "INSERT INTO message(kind,sender,recipient,payload,task_id,in_reply_to,created_at)"
+            " VALUES(?,'owner',?,?,?,?,?)",
+            (protocol.ANSWER, agent_id, json.dumps({"answer": args.text}),
+             question["task_id"], question["id"], now),
+        )
+        state.db.execute("UPDATE message SET delivered=1 WHERE id=?", (question["id"],))
+        state.db.execute("UPDATE agent SET state='runnable', updated_at=? WHERE id=?",
+                         (now, agent_id))
+        if question["task_id"]:
+            state.db.execute("UPDATE task SET status='in_progress', updated_at=? WHERE id=?",
+                             (now, question["task_id"]))
     print(f"answered {agent_id}; it is runnable again")
     return 0
 
@@ -403,8 +436,19 @@ def cmd_resume(args) -> int:
     state.x("UPDATE incident SET resolved=1 WHERE resolved=0")
     if args.retry:
         for row in state.q("SELECT * FROM task WHERE status='blocked'"):
-            state.set_task(row["id"], status="in_progress", attempts=0)
-            state.set_agent(f"worker-{row['id']}", state="runnable")
+            # Selection may be stale: serialize the guarded transition and
+            # worker update with cancellation, which retires both together.
+            with state.db:
+                changed = state.db.execute(
+                    "UPDATE task SET status='in_progress', attempts=0, updated_at=?"
+                    " WHERE id=? AND status='blocked'", (time.time(), row["id"]),
+                ).rowcount
+                if not changed:
+                    continue
+                state.db.execute(
+                    "UPDATE agent SET state='runnable', updated_at=? WHERE id=?",
+                    (time.time(), f"worker-{row['id']}"),
+                )
             print(f"unblocked {row['id']}")
     print("resumed")
     return 0
@@ -490,7 +534,13 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("reason")
         sp.set_defaults(func=cmd_decide_proposal)
 
+    sp = sub.add_parser("cancel", help="retire a superseded task while preserving history")
+    sp.add_argument("task_id")
+    sp.add_argument("--reason", required=True)
+    sp.set_defaults(func=cmd_cancel)
+
     sp = sub.add_parser("tasks")
+    sp.add_argument("--all", action="store_true", help="include cancelled tasks")
     sp.add_argument("--project")
     sp.set_defaults(func=cmd_tasks)
 

@@ -172,6 +172,7 @@ def cmd_why(args) -> int:
         unmet = state.unmet_dependencies(task["id"])
         print(f"depends on: {', '.join(depends_on)}"
               + (f" (waiting for {', '.join(unmet)})" if unmet else " (all accepted)"))
+    print(f"\nobjective:\n{task['objective']}")
     print("\nacceptance criteria:")
     criteria = json.loads(task["acceptance"])
     for criterion in criteria:

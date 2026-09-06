@@ -208,3 +208,20 @@ rejection records `rejected`, the timestamp and reason. Decisions are final:
 repeated approval or rejection exits with status 1 and creates nothing. Failed
 batch approval leaves the proposal pending and rolls back every task in the batch.
 Existing state databases gain the proposal table automatically on opening.
+
+Proposals store deterministic `findings` at creation and refresh them before
+approval. Both `nc proposal` and `nc proposals` show the findings. Unknown
+dependencies, cycles, missing acceptance commands starting with `$`, path-only
+boundaries (such as `src/api.py` or `Do not modify src/api.py`), and direct textual
+acceptance/boundary conflicts block approval. Invariants such as “Public API must
+remain backward compatible” are valid boundaries. Text checks recognize simple
+action/target conflicts (“Change the public API” versus “Do not change the public
+API”); they cannot prove arbitrary natural-language requirements consistent.
+Commands are never executed by these checks, and no model is called.
+`nc approve 1 --force` overrides findings and prints each override. Even a clean
+proposal stays pending until the owner approves it; checks never edit its spec.
+
+A proposed task may declare an optional unique `id` for other tasks in the same
+proposal to reference through `depends_on`. These local IDs must not collide with
+existing task IDs. Approval resolves local references to the newly allocated task
+IDs, including forward references. Other dependencies must name existing tasks.

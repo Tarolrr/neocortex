@@ -9,6 +9,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from .proposals import check_proposal
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS project (
     id          TEXT PRIMARY KEY,
@@ -121,6 +123,7 @@ class State:
             )
         """)
         for table, column, decl in (
+            ("proposal", "findings", "TEXT NOT NULL DEFAULT '[]'"),
             ("project", "mirror", "TEXT"),
             ("task", "merge_commit", "TEXT"),
             ("task", "depends_on", "TEXT NOT NULL DEFAULT '[]'"),
@@ -220,12 +223,17 @@ class State:
         ):
             raise ValueError("proposal specs must be a list of tasks for its project")
         cur = self.x(
-            "INSERT INTO proposal(project_id,source,rationale,spec,created_at) VALUES(?,?,?,?,?)",
-            (project_id, source, rationale, json.dumps(spec, ensure_ascii=False), time.time()),
+            "INSERT INTO proposal(project_id,source,rationale,spec,created_at,findings)"
+            " VALUES(?,?,?,?,?,?)",
+            (project_id, source, rationale, json.dumps(spec, ensure_ascii=False), time.time(),
+             json.dumps(self._proposal_findings(spec))),
         )
         return int(cur.lastrowid)
 
-    def approve_proposal(self, proposal_id: int) -> list[str]:
+    def _proposal_findings(self, specs: list[dict]) -> list[str]:
+        return check_proposal(specs, {r["id"] for r in self.q("SELECT id FROM task")})
+
+    def approve_proposal(self, proposal_id: int, force: bool = False) -> list[str]:
         # Serialize decisions and commit the whole batch, including task IDs, together.
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
@@ -233,11 +241,23 @@ class State:
             specs = json.loads(row["spec"])
             if not isinstance(specs, list):
                 raise TypeError("proposal spec must be a list")
+            findings = self._proposal_findings(specs)
+            self.db.execute("UPDATE proposal SET findings=? WHERE id=?",
+                            (json.dumps(findings), proposal_id))
+            if findings and not force:
+                # Persist refreshed findings even though no tasks are created.
+                self.db.commit()
+                raise ValueError("proposal has findings (use --force to override):\n"
+                                 + "\n".join(findings))
             ids = []
             for spec in specs:
                 if spec["project"] != row["project_id"]:
                     raise ValueError("proposed task belongs to another project")
                 ids.append(self._add_task_spec(spec))
+            local_ids = {spec["id"]: tid for spec, tid in zip(specs, ids) if spec.get("id")}
+            for spec, tid in zip(specs, ids):
+                deps = [local_ids.get(dep, dep) for dep in spec.get("depends_on", [])]
+                self.db.execute("UPDATE task SET depends_on=? WHERE id=?", (json.dumps(deps), tid))
             self.db.execute(
                 "UPDATE proposal SET status='approved', decided_at=? WHERE id=?",
                 (time.time(), proposal_id),

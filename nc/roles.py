@@ -111,6 +111,10 @@ Repository layout (tracked files):
 Open feedback and other messages addressed to you:
 {feedback}
 
+Revision request (null means ordinary planning). When present, revise this original
+full specification using the linked owner feedback. DONE replaces this proposal:
+{revision}
+
 Queued and blocked tasks, including recorded blocking reasons:
 {tasks}
 

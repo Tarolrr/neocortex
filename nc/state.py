@@ -107,7 +107,7 @@ class State:
         self.db.commit()
 
     def _migrate(self) -> None:
-        """Apply additive schema changes to new and existing databases."""
+        """Apply schema changes to new and existing databases, preserving stored history."""
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS proposal (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,12 +116,31 @@ class State:
                 rationale TEXT NOT NULL,
                 spec TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending', 'approved', 'rejected')),
+                    CHECK(status IN ('pending', 'approved', 'rejected', 'superseded')),
                 created_at REAL NOT NULL,
                 decided_at REAL,
                 reason TEXT
             )
         """)
+        # Rebuild the old CHECK constraint, preserving every column and review.
+        schema = self.db.execute(
+            "SELECT sql FROM sqlite_master WHERE name='proposal'"
+        ).fetchone()[0]
+        if "'superseded'" not in schema:
+            self.db.commit()
+            self.db.execute("PRAGMA foreign_keys=OFF")
+            try:
+                with self.db:
+                    self.db.execute("BEGIN IMMEDIATE")
+                    self.db.execute(
+                        ("CREATE TABLE proposal_new (" + schema.split("(", 1)[1])
+                        .replace("'rejected'", "'rejected', 'superseded'")
+                    )
+                    self.db.execute("INSERT INTO proposal_new SELECT * FROM proposal")
+                    self.db.execute("DROP TABLE proposal")
+                    self.db.execute("ALTER TABLE proposal_new RENAME TO proposal")
+            finally:
+                self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS plan_review (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,6 +150,14 @@ class State:
                 findings TEXT NOT NULL DEFAULT '[]',
                 recommendation TEXT NOT NULL DEFAULT '',
                 UNIQUE(proposal_id, spec)
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS proposal_revision (
+                original_id INTEGER PRIMARY KEY REFERENCES proposal(id),
+                feedback_id INTEGER NOT NULL UNIQUE REFERENCES message(id),
+                planner_id TEXT NOT NULL REFERENCES agent(id),
+                replacement_id INTEGER UNIQUE REFERENCES proposal(id)
             )
         """)
         for table, column, decl in (
@@ -263,18 +290,42 @@ class State:
 
     # --- proposals -------------------------------------------------------
     def add_proposal(self, project_id: str, source: str, rationale: str,
-                     spec: list[dict]) -> int:
+                     spec: list[dict], revision_id: int | None = None) -> int:
         if not isinstance(spec, list) or any(
             not isinstance(task, dict) or task.get("project") != project_id for task in spec
         ):
             raise ValueError("proposal specs must be a list of tasks for its project")
-        cur = self.x(
-            "INSERT INTO proposal(project_id,source,rationale,spec,created_at,findings)"
-            " VALUES(?,?,?,?,?,?)",
-            (project_id, source, rationale, json.dumps(spec, ensure_ascii=False), time.time(),
-             json.dumps(self._proposal_findings(spec))),
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if revision_id is not None:
+                revision = self.one(
+                    "SELECT r.* FROM proposal_revision r JOIN proposal p ON p.id=r.original_id"
+                    " WHERE r.original_id=? AND r.planner_id=? AND p.project_id=?"
+                    " AND r.replacement_id IS NULL", (revision_id, source, project_id),
+                )
+                if revision is None:
+                    raise ValueError("revision already replaced or belongs to another planner")
+            cur = self.db.execute(
+                "INSERT INTO proposal(project_id,source,rationale,spec,created_at,findings)"
+                " VALUES(?,?,?,?,?,?)",
+                (project_id, source, rationale, json.dumps(spec, ensure_ascii=False), time.time(),
+                 json.dumps(self._proposal_findings(spec))),
+            )
+            proposal_id = int(cur.lastrowid)
+            if revision_id is not None:
+                self.db.execute(
+                    "UPDATE proposal_revision SET replacement_id=? WHERE original_id=?",
+                    (proposal_id, revision_id),
+                )
+        return proposal_id
+
+    def pending_revision(self, planner_id: str) -> sqlite3.Row | None:
+        return self.one(
+            "SELECT r.*, p.spec, m.payload FROM proposal_revision r"
+            " JOIN proposal p ON p.id=r.original_id JOIN message m ON m.id=r.feedback_id"
+            " WHERE r.planner_id=? AND r.replacement_id IS NULL ORDER BY r.original_id LIMIT 1",
+            (planner_id,),
         )
-        return int(cur.lastrowid)
 
     def _proposal_findings(self, specs: list[dict]) -> list[str]:
         return check_proposal(specs, {r["id"] for r in self.q("SELECT id FROM task")})
@@ -326,7 +377,10 @@ class State:
         if row is None:
             raise ValueError(f"unknown proposal: {proposal_id}")
         if row["status"] != "pending":
-            raise ValueError(f"proposal {proposal_id} is already {row['status']}")
+            raise ValueError(
+                f"proposal {proposal_id} is already {row['status']}; only pending proposals"
+                f" can be changed. Inspect nc proposal {proposal_id} for details and revision links."
+            )
         return row
 
     def set_task(self, task_id: str, **fields: Any) -> None:
@@ -346,12 +400,22 @@ class State:
         return agent_id
 
     def planner_feedback(self, project_id: str | None, text: str, model: str,
-                         task_id: str | None = None) -> tuple[str, int]:
+                         task_id: str | None = None,
+                         proposal_id: int | None = None) -> tuple[str, int]:
         """Atomically resolve the project, store feedback, and create or wake its planner."""
         from .protocol import FEEDBACK
 
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
+            if task_id is not None and proposal_id is not None:
+                raise ValueError("--task and --proposal are mutually exclusive")
+            if proposal_id is not None:
+                proposal = self._pending_proposal(proposal_id)
+                if project_id is not None and project_id != proposal["project_id"]:
+                    raise ValueError(
+                        f"proposal {proposal_id} does not belong to project {project_id}"
+                    )
+                project_id = proposal["project_id"]
             if task_id is not None:
                 task = self.one("SELECT project_id FROM task WHERE id=?", (task_id,))
                 if task is None:
@@ -387,7 +451,16 @@ class State:
                 (FEEDBACK, agent_id, task_id,
                  json.dumps({"text": text}, ensure_ascii=False), now),
             )
-            return agent_id, int(cur.lastrowid)
+            message_id = int(cur.lastrowid)
+            if proposal_id is not None:
+                self.db.execute(
+                    "UPDATE proposal SET status='superseded' WHERE id=?", (proposal_id,),
+                )
+                self.db.execute(
+                    "INSERT INTO proposal_revision(original_id,feedback_id,planner_id)"
+                    " VALUES(?,?,?)", (proposal_id, message_id, agent_id),
+                )
+            return agent_id, message_id
 
     def set_agent(self, agent_id: str, **fields: Any) -> None:
         fields["updated_at"] = time.time()

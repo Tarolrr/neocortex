@@ -320,3 +320,20 @@ history. Cancelled tasks do not run or escalate unanswered questions, and neithe
 `nc answer` nor `nc resume --retry` restores them. Only explicit `nc requeue`
 restores eligibility. A cancelled prerequisite remains unmet; use `nc why` on
 the dependent task to inspect that condition.
+
+To revise a pending proposal, inspect its full specification and advisory review
+with `nc proposal ID`, then run
+`nc feedback --proposal ID "Describe the revision you want"`.
+You may also supply `--project PROJECT` to verify the project; `--task` and
+`--proposal` are mutually exclusive. This immediately marks the original
+superseded and unapprovable, preserves its specs and review, and wakes the planner.
+The planner receives the original full specs and your feedback. Normal capacity
+limits and worker/critic priority still apply.
+
+Use `nc proposals` and `nc proposal ID` to follow the replacement link. Inspect
+the new pending replacement and its fresh advisory review before explicitly
+running `nc approve NEW_ID`; only approval creates tasks. Proposal detail includes
+revision lineage and feedback on both ends. To iterate again, address feedback to
+the new pending replacement. Approved, rejected, and superseded proposals cannot
+receive revision requests. If planning asks a question, answer with `nc answer`;
+after a failed session, `nc plan PROJECT` retries with the revision context intact.

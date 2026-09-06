@@ -891,3 +891,133 @@ def test_queue_limit_waits_without_spinning_and_resumes_at_limit(setup, monkeypa
     state.set_task(queued[0], status='done')
     assert scheduler.step() == protocol.ASK
     assert scheduler.step() == 'idle'
+
+
+def test_proposal_revision_cycle(setup, capsys):
+    cfg, state, _ = setup
+    original_specs = [planner_spec(id='first', objective='Original full objective'),
+                      planner_spec(depends_on=['first'])]
+    original = state.add_proposal('neocortex', 'planner', 'OLD rationale', original_specs)
+    scheduler = sched(cfg, state, [
+        emit({'outcome': 'DONE', 'findings': ['Old finding'], 'recommendation': 'Revise'}),
+        emit({'outcome': 'DONE', 'summary': 'PRIVATE revised rationale',
+              'proposal': original_specs}),
+        emit({'outcome': 'DONE', 'findings': ['New finding'], 'recommendation': 'Advisory'}),
+        emit({'outcome': 'DONE', 'proposal': original_specs}),
+        emit({'outcome': 'DONE', 'findings': [], 'recommendation': 'Ready'}),
+    ])
+    scheduler.adapter.run_planner = scheduler.adapter.run
+    assert scheduler.step() == protocol.DONE
+    argv = ['--home', str(cfg.home)]
+    assert cli.main([*argv, 'feedback', '--proposal', str(original), 'Owner revision text']) == 0
+    assert cli.main([*argv, 'approve', str(original), '--force']) == 1
+    assert scheduler.step() == protocol.DONE
+    revision = state.one('SELECT * FROM proposal_revision')
+    replacement = revision['replacement_id']
+    assert replacement != original
+    assert state.one('SELECT status FROM proposal WHERE id=?', (original,))[0] == 'superseded'
+    assert len(state.q("SELECT * FROM proposal WHERE status='pending'")) == 1
+    assert not state.q('SELECT * FROM task')
+    brief = scheduler.adapter.briefs[1]
+    assert 'Original full objective' in brief and 'Owner revision text' in brief
+    assert json.dumps(json.dumps(original_specs))[1:-1] in brief
+    assert scheduler.step() == protocol.DONE
+    assert 'PRIVATE' not in scheduler.adapter.briefs[2]
+    assert len(state.q('SELECT * FROM plan_review')) == 2
+    assert state.one('SELECT findings FROM proposal WHERE id=?', (replacement,))[0] == '[]'
+    capsys.readouterr()
+    assert cli.main([*argv, 'proposal', str(original)]) == 0
+    detail = json.loads(capsys.readouterr().out)
+    assert detail['spec'] == original_specs
+    assert detail['plan_review']['findings'] == ['Old finding']
+    assert detail['revisions'][0]['replacement_id'] == replacement
+    assert detail['revisions'][0]['feedback']['text'] == 'Owner revision text'
+    assert cli.main([*argv, 'proposal', str(replacement)]) == 0
+    detail = json.loads(capsys.readouterr().out)
+    assert detail['plan_review']['findings'] == ['New finding']
+    assert detail['revisions'][0]['original_id'] == original
+    assert cli.main([*argv, 'feedback', '--proposal', str(replacement), 'One more iteration']) == 0
+    assert scheduler.step() == protocol.DONE
+    assert scheduler.step() == protocol.DONE
+    latest = state.one("SELECT * FROM proposal WHERE status='pending'")
+    assert state.one('SELECT replacement_id FROM proposal_revision WHERE original_id=?',
+                     (replacement,))[0] == latest['id']
+    assert not state.q('SELECT * FROM task')
+    ids = state.approve_proposal(latest['id'])
+    assert json.loads(state.one('SELECT depends_on FROM task WHERE id=?', (ids[1],))[0]) == [
+        ids[0],
+    ]
+
+
+@pytest.mark.parametrize('failure', ['ask', 'invalid', 'missing', 'exception'])
+def test_revision_survives_retry(setup, failure):
+    cfg, state, _ = setup
+    original = state.add_proposal('neocortex', 'planner', '', [planner_spec(objective='Keep me')])
+    aid, _ = state.planner_feedback(None, 'Retain revision feedback', 'model',
+                                   proposal_id=original)
+
+    def fail_session(cwd, outcome_path):
+        raise RuntimeError('session crashed')
+
+    first = {
+        'ask': emit({'outcome': 'ASK', 'to': 'owner', 'question': 'Which behavior?'}),
+        'invalid': emit({'outcome': 'DONE', 'proposal': []}),
+        'missing': nothing,
+        'exception': fail_session,
+    }[failure]
+    scheduler = sched(cfg, state, [
+        first, emit({'outcome': 'DONE', 'proposal': [planner_spec()]}),
+    ])
+    scheduler.step()
+    assert state.pending_revision(aid) is not None
+    assert len(state.q('SELECT * FROM proposal')) == 1
+    # Re-open the database to ensure the context is durable, including after ASK delivery.
+    reopened = State(cfg.db_path)
+    assert reopened.pending_revision(aid) is not None
+    reopened.db.close()
+    state.planner_feedback('neocortex', 'Retry now', 'model')
+    assert scheduler.step() == protocol.DONE
+    assert 'Keep me' in scheduler.adapter.briefs[1]
+    assert 'Retain revision feedback' in scheduler.adapter.briefs[1]
+    assert state.pending_revision(aid) is None
+    assert len(state.q('SELECT * FROM proposal')) == 2
+
+
+@pytest.mark.parametrize('role', ['worker', 'critic', 'capacity'])
+def test_revision_respects_other_work(setup, role):
+    cfg, state, _ = setup
+    original = state.add_proposal('neocortex', 'planner', '', [planner_spec()])
+    aid, _ = state.planner_feedback(None, 'Revise', 'model', proposal_id=original)
+    scheduler = sched(cfg, state, [])
+    if role == 'capacity':
+        state.add_proposal('neocortex', 'other', '', [planner_spec()])
+        assert scheduler.pick() is None
+        assert 'pending proposals' in state.one('SELECT planner_skip_reason FROM project')[0]
+    else:
+        tid = state.add_task('neocortex', 'Work', 'Do work', ['$ true'])
+        state.add_agent('priority-agent', role, 'neocortex', tid, 'model')
+        assert scheduler.pick()['id'] == 'priority-agent'
+    assert state.pending_revision(aid) is not None
+
+
+@pytest.mark.parametrize('timed_out', [False, True])
+def test_revision_rejects_done_from_failed_session(setup, timed_out):
+    cfg, state, _ = setup
+    original = state.add_proposal('neocortex', 'planner', '', [planner_spec()])
+    aid, _ = state.planner_feedback(None, 'Revise', 'model', proposal_id=original)
+    scheduler = sched(cfg, state, [
+        emit({'outcome': 'DONE', 'proposal': [planner_spec()]}),
+    ])
+    run = scheduler.adapter.run
+
+    def failed_run(*args):
+        result = run(*args)
+        result.exit_code = 1
+        result.timed_out = timed_out
+        return result
+
+    scheduler.adapter.run = failed_run
+    assert scheduler.step() == protocol.FAIL
+    assert state.pending_revision(aid) is not None
+    assert len(state.q('SELECT * FROM proposal')) == 1
+    assert not state.q('SELECT * FROM task')

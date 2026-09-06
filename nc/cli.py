@@ -132,6 +132,15 @@ def cmd_proposal(args) -> int:
         "SELECT status, findings, recommendation FROM plan_review"
         " WHERE proposal_id=? AND spec=?", (row["id"], row["spec"]),
     )
+    detail["revisions"] = [
+        {**dict(r), "feedback": json.loads(r["feedback"])}
+        for r in state.q(
+            "SELECT r.*, m.payload AS feedback FROM proposal_revision r"
+            " JOIN message m ON m.id=r.feedback_id"
+            " WHERE r.original_id=? OR r.replacement_id=? ORDER BY r.original_id",
+            (row["id"], row["id"]),
+        )
+    ]
     detail["plan_review"] = dict(review) if review else None
     if review:
         detail["plan_review"]["findings"] = json.loads(review["findings"])
@@ -353,6 +362,7 @@ def cmd_feedback(args) -> int:
     try:
         agent_id, message_id = state.planner_feedback(
             args.project, text, cfg.model_for("planner"), getattr(args, "task", None),
+            getattr(args, "proposal", None),
         )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
@@ -602,7 +612,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("feedback", help="queue owner feedback and wake the project planner")
     sp.add_argument("text")
     sp.add_argument("--project")
-    sp.add_argument("--task")
+    selectors = sp.add_mutually_exclusive_group()
+    selectors.add_argument("--task")
+    selectors.add_argument("--proposal", type=int)
     sp.set_defaults(func=cmd_feedback)
 
     sp = sub.add_parser("plan", help="request a planning pass on the next timer tick")

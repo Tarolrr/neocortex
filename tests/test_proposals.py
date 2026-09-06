@@ -270,3 +270,28 @@ def test_approval_rechecks_and_persists_findings(tmp_path):
     assert findings(state, pid)
     assert state.one('SELECT status FROM proposal')['status'] == 'pending'
     assert not state.q('SELECT * FROM task')
+
+
+def test_revision_migrates_old_status_constraint_preserving_review(tmp_path):
+    cfg, state = setup_state(tmp_path)
+    pid = state.add_proposal('demo', 'planner', 'Original rationale', specs())
+    original = dict(state.one('SELECT * FROM proposal'))
+    state.x("INSERT INTO plan_review(proposal_id,spec,status,recommendation)"
+            " VALUES(?,?,'done','Original review')", (pid, original['spec']))
+    # Recreate the previous release's constraint, retaining its complete data.
+    schema = state.one("SELECT sql FROM sqlite_master WHERE name='proposal'")[0]
+    state.db.execute('PRAGMA foreign_keys=OFF')
+    with state.db:
+        state.db.execute(schema.replace('CREATE TABLE proposal', 'CREATE TABLE old_proposal')
+                         .replace(", 'superseded'", ''))
+        state.db.execute('INSERT INTO old_proposal SELECT * FROM proposal')
+        state.db.execute('DROP TABLE proposal')
+        state.db.execute('ALTER TABLE old_proposal RENAME TO proposal')
+    state.db.close()
+    migrated = State(cfg.db_path)
+    assert dict(migrated.one('SELECT * FROM proposal')) == original
+    assert migrated.one('SELECT recommendation FROM plan_review')[0] == 'Original review'
+    migrated.planner_feedback(None, 'Revise', 'model', proposal_id=pid)
+    assert migrated.one('SELECT status FROM proposal')[0] == 'superseded'
+    assert not migrated.q('PRAGMA foreign_key_check')
+    migrated.db.close()

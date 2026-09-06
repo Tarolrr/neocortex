@@ -83,9 +83,13 @@ def cmd_requeue(args) -> int:
     state.x("UPDATE agent SET state='blocked', turns=0 WHERE task_id=?", (task["id"],))
     state.x("UPDATE message SET delivered=1 WHERE task_id=? AND recipient='owner'",
             (task["id"],))
-    state.set_task(task["id"], status="queued", attempts=0,
-                   result=args.reason or "requeued by the owner")
-    print(f"{task['id']} queued again" + (" from a fresh branch" if args.fresh else ""))
+    fields = {"status": "queued", "attempts": 0,
+              "result": args.reason or "requeued by the owner"}
+    if args.budget:
+        fields["budget_turns"] = args.budget
+    state.set_task(task["id"], **fields)
+    print(f"{task['id']} queued again" + (" from a fresh branch" if args.fresh else "")
+          + (f", budget {args.budget} turns" if args.budget else ""))
     return 0
 
 
@@ -429,6 +433,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--fresh", action="store_true",
                     help="discard its branch and worktree and start from the base branch")
     sp.add_argument("--reason")
+    sp.add_argument("--budget", type=int,
+                    help="new turn budget for the task, for work that needs more room")
     sp.set_defaults(func=cmd_requeue)
 
     sub.add_parser("proposals", help="list proposals and their decisions").set_defaults(

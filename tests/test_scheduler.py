@@ -202,6 +202,30 @@ def test_requeue_restarts_a_blocked_task_from_the_base_branch(setup):
     assert (worktree / "marker.txt").read_text() == "fresh\n"
 
 
+def test_a_longer_attempt_budget_keeps_a_reworking_task_alive(setup):
+    cfg, state, _repo = setup
+    cfg.max_attempts = 5
+    tid = state.add_task("neocortex", "add marker", "create marker.txt", [])
+    scheduler = sched(cfg, state, [nothing, nothing, nothing])
+
+    for _ in range(3):
+        scheduler.step()
+
+    task = state.one("SELECT * FROM task WHERE id=?", (tid,))
+    assert (task["status"], task["attempts"]) == ("in_progress", 3)
+    assert state.one("SELECT * FROM agent WHERE id=?", (f"worker-{tid}",))["state"] == "runnable"
+
+
+def test_requeue_can_raise_the_turn_budget(setup):
+    cfg, state, _repo = setup
+    tid = state.add_task("neocortex", "add marker", "create marker.txt", [], budget_turns=2)
+    state.set_task(tid, status="blocked")
+
+    assert cli.main(["--home", str(cfg.home), "requeue", tid, "--budget", "9"]) == 0
+    task = state.one("SELECT * FROM task WHERE id=?", (tid,))
+    assert (task["status"], task["budget_turns"]) == ("queued", 9)
+
+
 def test_failing_acceptance_check_sends_the_worker_back_without_calling_the_critic(setup):
     cfg, state, _repo = setup
     tid = state.add_task("neocortex", "add marker", "create marker.txt",

@@ -81,10 +81,18 @@ To restart a task the reviewer or the owner stopped:
 nc requeue neocortex-T009            # queued again, same branch and history
 nc requeue neocortex-T009 --fresh    # also drops its branch and worktree, so
                                      # the next attempt starts from the base
+nc requeue neocortex-T009 --budget 12  # and give it more turns than it had
 ```
 
 Use `--fresh` when the task's premise changed — for example when it must now be
-built on work merged after its branch was created.
+built on work merged after its branch was created; use `--budget` when the task
+turned out to be larger than the estimate it was queued with.
+
+A task is blocked after `max_attempts` failed turns or rework cycles (3 by
+default, set it in `$NC_HOME/config.json`) and after `budget_turns` turns of its
+own. Both are deliberately small: an agent that cannot converge in a few rounds
+usually needs the task rewritten rather than more attempts. Raise them for work
+that is genuinely large, not to push a task through a review it keeps failing.
 
 ## Reviewing and undoing accepted work
 

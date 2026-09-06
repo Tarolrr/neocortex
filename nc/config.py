@@ -74,6 +74,8 @@ class Config:
     def model_for(self, role: str) -> str:
         if role in self.models:
             return self.models[role]
+        if role == "plan_critic":
+            return self.model_for("planner")
         if role == "planner":
             return max(self.models.values(), key=lambda model: PLANNER_MODEL_PRIORITY.get(model, 0))
         return next(iter(self.models.values()))

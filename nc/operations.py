@@ -20,7 +20,7 @@ import json
 import time
 from pathlib import Path
 
-from . import arbiter
+from . import arbiter, protocol
 from .config import Config
 from .lifecycle import lifecycle_lock
 from .state import State
@@ -272,7 +272,7 @@ def inbox(state: State, include_delivered: bool = False) -> list[dict]:
 
 
 def answerable_question(state: State, question) -> bool:
-    if question["kind"] != "ASK" or question["recipient"] != "owner" or question["delivered"]:
+    if question["kind"] != protocol.QUESTION or question["recipient"] != "owner" or question["delivered"]:
         return False
     agent = state.one("SELECT * FROM agent WHERE id=?", (question["sender"],))
     if agent is None or agent["task_id"] != question["task_id"]:

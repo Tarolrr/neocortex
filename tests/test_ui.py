@@ -5,6 +5,7 @@ import urllib.parse
 
 import pytest
 
+from nc import protocol
 from nc.config import Config
 from nc.state import State
 from nc.ui import make_server
@@ -281,7 +282,7 @@ def test_feedback_proposal_decisions_and_answers(browser):
     assert post(page, page + "/reject", {"reason": "No thanks"})[0] == 303
     assert state.one("SELECT status FROM proposal WHERE id=?", (pid,))[0] == "rejected"
     state.add_agent("worker-test", "worker", "one", tid, "model")
-    mid = state.send("ASK", "worker-test", "owner", {"question": "<script>q</script>"}, tid)
+    mid = state.send(protocol.QUESTION, "worker-test", "owner", {"question": "<script>q</script>"}, tid)
     assert "<script>q" not in request("/inbox")[2]
     assert post("/inbox", f"/messages/{mid}/answer", {"text": "Continue"})[0] == 303
     assert state.one("SELECT delivered FROM message WHERE id=?", (mid,))[0] == 1
@@ -381,7 +382,7 @@ def test_invalid_requeue_budget_has_no_effect(browser, monkeypatch, budget):
 def test_historical_or_nonquestion_answer_rejected(browser, invalid):
     _, state, tid, server, request = browser
     state.add_agent("questioner", "worker", "one", tid, "model")
-    mid = state.send("ASK", "questioner", "owner", {"question": "Continue?"}, tid)
+    mid = state.send(protocol.QUESTION, "questioner", "owner", {"question": "Continue?"}, tid)
     if invalid == "done":
         state.set_task(tid, status="done", merge_commit="accepted")
     elif invalid == "delivered":

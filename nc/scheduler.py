@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
@@ -301,13 +302,20 @@ class Scheduler:
                     )
                 ], attempt=False)
                 return
-            error = arbiter.mirror(repo, project["mirror"], branch)
-            arbiter.remove_worktree(repo, cwd)
-            if error:
-                self.state.incident("mirror_push", f"{task['id']}: {error}")
+            # Persist acceptance before cleanup so owner rollback remains available.
             self.state.set_task(task["id"], status="done", merge_commit=commit,
                                 result=f"{outcome.summary} (merged as {commit})")
             self.state.set_agent(worker_id, state="done")
+            try:
+                error = arbiter.mirror(repo, project["mirror"], branch)
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+                error = str(exc)
+            if error:
+                self.state.incident("mirror_push", f"{task['id']}: {error}")
+            try:
+                arbiter.remove_worktree(repo, cwd)
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+                self.state.incident("worktree_cleanup", f"{task['id']}: {exc}")
             log.info("task %s accepted and merged as %s", task["id"], commit)
         elif verdict == "reject":
             self._block(task, agent, f"critic rejected the approach: {outcome.summary}")

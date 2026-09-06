@@ -1021,3 +1021,97 @@ def test_revision_rejects_done_from_failed_session(setup, timed_out):
     assert state.pending_revision(aid) is not None
     assert len(state.q('SELECT * FROM proposal')) == 1
     assert not state.q('SELECT * FROM task')
+
+
+@pytest.mark.parametrize("role", ["worker", "planner"])
+@pytest.mark.parametrize("channel", ["cli", "http"])
+def test_owner_answers_scheduler_question(setup, role, channel, capsys):
+    import http.client
+    import threading
+    import urllib.parse
+
+    from nc.ui import make_server
+
+    cfg, state, _repo = setup
+    if role == "worker":
+        tid = state.add_task("neocortex", "question", "ask owner", [])
+        agent_id = f"worker-{tid}"
+    else:
+        tid = None
+        agent_id = "planner-neocortex"
+        state.add_agent(agent_id, "planner", "neocortex", None, "model")
+    scheduler = sched(cfg, state, [emit({
+        "outcome": "ASK", "to": "owner", "question": "<script>scope?</script>",
+    })])
+    assert scheduler.step() == protocol.ASK
+    question = state.inbox("owner")[0]
+    assert question["kind"] == protocol.QUESTION
+    if channel == "cli":
+        assert cli.main([
+            "--home", str(cfg.home), "answer", str(question["id"]), "Proceed",
+        ]) == 0
+        assert f"answered {agent_id}; it is runnable again" in capsys.readouterr().out
+    else:
+        server = make_server(cfg, 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        try:
+            conn.request("GET", "/inbox")
+            response = conn.getresponse()
+            cookie = response.getheader("Set-Cookie").split(";")[0]
+            body = response.read().decode()
+            assert response.status == 200
+            assert "<script>scope?" not in body
+            assert "&lt;script&gt;scope?" in body
+            path = f'/messages/{question["id"]}/answer'
+            assert path in body
+            token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+            conn.request("POST", path, urllib.parse.urlencode({
+                "csrf_token": token, "text": "Proceed",
+            }), {"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded",
+                 "Origin": f"http://127.0.0.1:{server.server_port}"})
+            response = conn.getresponse()
+            response.read()
+            assert response.status == 303
+        finally:
+            conn.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+    assert state.one("SELECT state FROM agent WHERE id=?", (agent_id,))[0] == "runnable"
+    assert state.one("SELECT delivered FROM message WHERE id=?", (question["id"],))[0] == 1
+    answer = state.one("SELECT * FROM message WHERE in_reply_to=?", (question["id"],))
+    assert answer["kind"] == protocol.ANSWER
+    assert json.loads(answer["payload"]) == {"answer": "Proceed"}
+    if tid:
+        assert state.one("SELECT status FROM task WHERE id=?", (tid,))[0] == "in_progress"
+
+
+def test_acceptance_survives_locked_worktree_and_allows_rollback(setup):
+    from nc import arbiter, operations
+
+    cfg, state, repo = setup
+    tid = state.add_task("neocortex", "marker", "create marker", [])
+    scheduler = sched(cfg, state, [
+        commit_and_emit("marker.txt", "accepted\n", {"outcome": "DONE", "summary": "done"}),
+        emit({"outcome": "DONE", "verdict": "pass", "summary": "accepted"}),
+    ])
+    assert scheduler.step() == protocol.DONE
+    worktree = cfg.work_dir / tid
+    arbiter.git(repo, "worktree", "lock", str(worktree))
+    assert scheduler.step() == protocol.DONE
+    task = state.one("SELECT * FROM task WHERE id=?", (tid,))
+    assert task["status"] == "done"
+    assert task["merge_commit"] == arbiter.git(repo, "rev-parse", "--short", "HEAD")
+    assert (repo / "marker.txt").read_text() == "accepted\n"
+    assert worktree.exists()
+    assert all(a["state"] == "done" for a in state.q(
+        "SELECT * FROM agent WHERE task_id=?", (tid,),
+    ))
+    incident = state.one("SELECT * FROM incident WHERE kind='worktree_cleanup'")
+    assert tid in incident["detail"] and "locked" in incident["detail"]
+    result = operations.rollback_task(state, tid)
+    assert result["reverted_commit"] == task["merge_commit"]
+    assert not (repo / "marker.txt").exists()
+    assert state.one("SELECT status FROM task WHERE id=?", (tid,))[0] == "blocked"

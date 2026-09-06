@@ -21,7 +21,7 @@ def specs():
          'acceptance': ['$ pytest -q', 'Preserve all criteria'],
          'boundaries': ['Only this repo'], 'priority': 7, 'budget_turns': 3},
         {'project': 'demo', 'title': 'Second', 'objective': 'Another task',
-         'acceptance': ['Human review']},
+         'acceptance': ['$ pytest -q', 'Human review']},
     ]
 
 
@@ -83,7 +83,7 @@ def test_failed_approval_rolls_back_entire_batch(tmp_path):
     del tasks[1]['acceptance']
     pid = state.add_proposal('demo', 'planner', 'Rationale', tasks)
     with pytest.raises(KeyError):
-        state.approve_proposal(pid)
+        state.approve_proposal(pid, force=True)
     assert state.q('SELECT * FROM task') == []
     assert state.q('SELECT * FROM task_seq') == []
     row = state.one('SELECT * FROM proposal WHERE id=?', (pid,))
@@ -118,3 +118,106 @@ def test_unknown_proposal(tmp_path, capsys, command):
 def test_empty_proposals(tmp_path, capsys):
     assert main(['--home', str(tmp_path), 'proposals']) == 0
     assert '(no proposals)' in capsys.readouterr().out
+
+
+def findings(state, pid):
+    return json.loads(state.one('SELECT findings FROM proposal WHERE id=?', (pid,))['findings'])
+
+
+def test_unknown_dependency_refused_and_force_reports_override(tmp_path, capsys):
+    cfg, state = setup_state(tmp_path)
+    tasks = specs()
+    tasks[0]['depends_on'] = ['missing']
+    pid = state.add_proposal('demo', 'planner', 'Rationale', tasks)
+    assert any('unknown dependency missing' in f for f in findings(state, pid))
+    argv = ['--home', str(cfg.home)]
+    assert main([*argv, 'proposals']) == 0
+    assert 'unknown dependency missing' in capsys.readouterr().out
+    assert main([*argv, 'proposal', str(pid)]) == 0
+    assert json.loads(capsys.readouterr().out)['findings'] == findings(state, pid)
+    assert main([*argv, 'approve', str(pid)]) == 1
+    assert 'unknown dependency missing' in capsys.readouterr().err
+    assert not state.q('SELECT * FROM task')
+    assert main([*argv, 'approve', str(pid), '--force']) == 0
+    assert 'overriding finding: task 1: unknown dependency missing' in capsys.readouterr().err
+    assert json.loads(state.one('SELECT spec FROM proposal')['spec']) == tasks
+
+
+def test_dependency_cycle(tmp_path):
+    _, state = setup_state(tmp_path)
+    tasks = specs()
+    tasks[0].update(id='first', depends_on=['second'])
+    tasks[1].update(id='second', depends_on=['first'])
+    pid = state.add_proposal('demo', 'planner', 'Rationale', tasks)
+    assert any('dependency cycle' in f for f in findings(state, pid))
+    assert not any('unknown dependency' in f for f in findings(state, pid))
+
+
+def test_missing_machine_check(tmp_path):
+    _, state = setup_state(tmp_path)
+    tasks = specs()
+    tasks[0]['acceptance'] = ['Human review']
+    pid = state.add_proposal('demo', 'planner', 'Rationale', tasks)
+    assert any('no machine-checkable acceptance' in f for f in findings(state, pid))
+
+
+@pytest.mark.parametrize('boundary', [
+    'nc/state.py', 'src/', 'Do not modify nc/state.py',
+    '/root/neocortex/nc/state.py', '/src/', 'Do not modify /root/neocortex/nc/state.py',
+])
+def test_path_boundary(tmp_path, capsys, boundary):
+    cfg, state = setup_state(tmp_path)
+    tasks = specs()
+    tasks[0]['boundaries'] = [boundary]
+    pid = state.add_proposal('demo', 'planner', 'Rationale', tasks)
+    assert any('boundary names a path' in f for f in findings(state, pid))
+    argv = ['--home', str(cfg.home), 'approve', str(pid)]
+    assert main(argv) == 1
+    assert boundary in capsys.readouterr().err
+    assert state.one('SELECT status FROM proposal')['status'] == 'pending'
+    assert not state.q('SELECT * FROM task')
+    assert main([*argv, '--force']) == 0
+    assert f'overriding finding: task 1: boundary names a path instead of an invariant: {boundary}' in (
+        capsys.readouterr().err
+    )
+
+
+def test_clean_proposal_with_invariants_and_local_dependencies(tmp_path):
+    _, state = setup_state(tmp_path)
+    existing = state.add_task('demo', 'Existing', 'Objective', ['$ true'])
+    tasks = specs()
+    tasks[0].update(id='first', depends_on=[existing],
+                    boundaries=['Public API must remain backward compatible',
+                                'nc/state.py must preserve database compatibility',
+                                '/root/neocortex/nc/state.py must preserve database compatibility'])
+    tasks[1]['depends_on'] = ['first']
+    pid = state.add_proposal('demo', 'planner', 'Rationale', tasks)
+    assert findings(state, pid) == []
+    assert state.one('SELECT status FROM proposal')['status'] == 'pending'
+    ids = state.approve_proposal(pid)
+    assert json.loads(state.one('SELECT depends_on FROM task WHERE id=?',
+                               (ids[1],))['depends_on']) == [ids[0]]
+
+
+def test_direct_textual_conflict(tmp_path):
+    _, state = setup_state(tmp_path)
+    tasks = specs()
+    tasks[0]['boundaries'] = ['Do not change the public API']
+    tasks[0]['acceptance'] += ['Change the public API to accept a new argument']
+    pid = state.add_proposal('demo', 'planner', 'Rationale', tasks)
+    assert any('acceptance conflicts with boundary' in f for f in findings(state, pid))
+
+
+def test_approval_rechecks_and_persists_findings(tmp_path):
+    _, state = setup_state(tmp_path)
+    existing = state.add_task('demo', 'Existing', 'Objective', ['$ true'])
+    tasks = specs()
+    tasks[0]['depends_on'] = [existing]
+    pid = state.add_proposal('demo', 'planner', 'Rationale', tasks)
+    assert findings(state, pid) == []
+    state.x('DELETE FROM task WHERE id=?', (existing,))
+    with pytest.raises(ValueError, match='unknown dependency'):
+        state.approve_proposal(pid)
+    assert findings(state, pid)
+    assert state.one('SELECT status FROM proposal')['status'] == 'pending'
+    assert not state.q('SELECT * FROM task')

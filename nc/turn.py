@@ -85,7 +85,12 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row) -> protocol.
     }))
     run_id = state.start_run(agent["id"], None, "planner", agent["model"], str(log_path))
     state.end_run(run_id, outcome.kind, outcome.summary)
-    state.set_agent(agent["id"], state="runnable", turns=agent["turns"] + 1)
+    # Preserve any owner wake received since this agent was picked.
+    state.x(
+        "UPDATE agent SET turns=turns+1,"
+        " state=CASE WHEN updated_at=? THEN 'blocked' ELSE state END WHERE id=?",
+        (agent["updated_at"], agent["id"]),
+    )
     return outcome
 
 

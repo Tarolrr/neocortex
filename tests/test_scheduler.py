@@ -518,14 +518,16 @@ def test_feedback_and_plan_are_picked_up_on_next_scheduler_tick(setup, monkeypat
     # Exercise the timer's run loop, bypassing only its external model probe.
     monkeypatch.setattr(scheduler, "preflight", lambda: (True, "test"))
     monkeypatch.setattr("nc.scheduler.time.sleep", lambda _: None)
-    scheduler.run(max_turns=1)
+    scheduler.run(max_turns=3)
+    assert len(state.q("SELECT * FROM run")) == 1
+    assert scheduler.step() == "idle"
     run = state.one("SELECT * FROM run")
     assert (run["agent_id"], run["task_id"], run["outcome"]) == (
         planner["id"], None, protocol.YIELD,
     )
     assert run["ended_at"] is not None
     assert state.one("SELECT * FROM agent")["turns"] == 1
-    assert state.one("SELECT * FROM agent")["state"] == "runnable"
+    assert state.one("SELECT * FROM agent")["state"] == "blocked"
     assert state.q("SELECT * FROM task") == []
     assert [json.loads(m["payload"])["text"] for m in state.inbox(planner["id"])] == [
         "Keep it simple", "Review tests",
@@ -544,3 +546,27 @@ def test_placeholder_planner_does_not_starve_queued_work(setup):
     scheduler = sched(cfg, state, [emit({"outcome": "YIELD"})])
     assert scheduler.step() == protocol.YIELD
     assert state.one("SELECT * FROM run")["agent_id"] == f"worker-{tid}"
+
+
+def test_placeholder_preserves_new_owner_wake(setup, monkeypatch):
+    cfg, state, _repo = setup
+    agent_id, _ = state.planner_feedback("neocortex", "First", cfg.model_for("planner"))
+    scheduler = Scheduler(cfg, state)
+    end_run = state.end_run
+
+    def feedback_during_turn(*args, **kwargs):
+        end_run(*args, **kwargs)
+        state.planner_feedback("neocortex", "New request", cfg.model_for("planner"))
+
+    monkeypatch.setattr(state, "end_run", feedback_during_turn)
+    assert scheduler.step() == protocol.YIELD
+    assert state.one("SELECT * FROM agent")["state"] == "runnable"
+    monkeypatch.setattr(state, "end_run", end_run)
+    assert scheduler.step() == protocol.YIELD
+    assert scheduler.step() == "idle"
+    assert len(state.inbox(agent_id)) == 2
+    assert cli.main(["--home", str(cfg.home), "plan", "neocortex"]) == 0
+    assert scheduler.step() == protocol.YIELD
+    assert scheduler.step() == "idle"
+    assert len(state.q("SELECT * FROM agent")) == 1
+    assert len(state.inbox(agent_id)) == 3

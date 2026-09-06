@@ -560,9 +560,10 @@ def test_feedback_and_plan_are_picked_up_on_next_scheduler_tick(setup, monkeypat
     cfg, state, _repo = setup
 
     def unexpected(*args, **kwargs):
-        pytest.fail("planner placeholder must not start a session or create a worktree")
+        pytest.fail("planner must not create a worktree")
 
-    monkeypatch.setattr("nc.scheduler.get_adapter", unexpected)
+    adapter = ScriptedAdapter([emit({"outcome": "ASK", "question": "Which scope?"})])
+    monkeypatch.setattr("nc.scheduler.get_adapter", lambda _: adapter)
     monkeypatch.setattr("nc.scheduler.arbiter.ensure_worktree", unexpected)
     monkeypatch.setattr("nc.turn.run_turn", unexpected)
     assert cli.main([
@@ -588,23 +589,18 @@ def test_feedback_and_plan_are_picked_up_on_next_scheduler_tick(setup, monkeypat
     assert scheduler.step() == "idle"
     run = state.one("SELECT * FROM run")
     assert (run["agent_id"], run["task_id"], run["outcome"]) == (
-        planner["id"], None, protocol.YIELD,
+        planner["id"], None, protocol.ASK,
     )
     assert run["ended_at"] is not None
     assert state.one("SELECT * FROM agent")["turns"] == 1
     assert state.one("SELECT * FROM agent")["state"] == "blocked"
     assert state.q("SELECT * FROM task") == []
-    assert [json.loads(m["payload"])["text"] for m in state.inbox(planner["id"])] == [
-        "Keep it simple", "Review tests",
-    ]
-    capsys.readouterr()
-    assert cli.main(["--home", str(cfg.home), "status"]) == 0
-    output = capsys.readouterr().out
-    assert "pending feedback:" in output
-    assert "Keep it simple" in output and "Review tests" in output
+    assert state.inbox(planner["id"]) == []
+    assert "Keep it simple" in adapter.briefs[0]
+    assert "Review tests" in adapter.briefs[0]
 
 
-def test_placeholder_planner_does_not_starve_queued_work(setup):
+def test_planner_does_not_starve_queued_work(setup):
     cfg, state, _repo = setup
     state.planner_feedback("neocortex", "Review tests", cfg.model_for("planner"))
     tid = state.add_task("neocortex", "work", "obj", [])
@@ -613,10 +609,10 @@ def test_placeholder_planner_does_not_starve_queued_work(setup):
     assert state.one("SELECT * FROM run")["agent_id"] == f"worker-{tid}"
 
 
-def test_placeholder_preserves_new_owner_wake(setup, monkeypatch):
+def test_planner_preserves_new_owner_wake(setup, monkeypatch):
     cfg, state, _repo = setup
     agent_id, _ = state.planner_feedback("neocortex", "First", cfg.model_for("planner"))
-    scheduler = Scheduler(cfg, state)
+    scheduler = sched(cfg, state, [emit({"outcome": "ASK", "question": "Scope?"})] * 3)
     end_run = state.end_run
 
     def feedback_during_turn(*args, **kwargs):
@@ -624,14 +620,83 @@ def test_placeholder_preserves_new_owner_wake(setup, monkeypatch):
         state.planner_feedback("neocortex", "New request", cfg.model_for("planner"))
 
     monkeypatch.setattr(state, "end_run", feedback_during_turn)
-    assert scheduler.step() == protocol.YIELD
+    assert scheduler.step() == protocol.ASK
     assert state.one("SELECT * FROM agent")["state"] == "runnable"
     monkeypatch.setattr(state, "end_run", end_run)
-    assert scheduler.step() == protocol.YIELD
+    assert scheduler.step() == protocol.ASK
     assert scheduler.step() == "idle"
-    assert len(state.inbox(agent_id)) == 2
+    assert len(state.inbox(agent_id)) == 0
     assert cli.main(["--home", str(cfg.home), "plan", "neocortex"]) == 0
-    assert scheduler.step() == protocol.YIELD
+    assert scheduler.step() == protocol.ASK
     assert scheduler.step() == "idle"
     assert len(state.q("SELECT * FROM agent")) == 1
-    assert len(state.inbox(agent_id)) == 3
+    assert len(state.inbox(agent_id)) == 0
+
+
+def planner_spec(**extra):
+    return {"project": "neocortex", "title": "Improve behavior", "objective": "Bounded change",
+            "acceptance": ["$ true"], "boundaries": ["Existing behavior must remain compatible"],
+            **extra}
+
+
+def test_planner_proposal_requires_approval(setup, monkeypatch):
+    cfg, state, repo = setup
+    cfg.models["planner"] = "planner-model"
+    state.planner_feedback("neocortex", "Plan a change", "old-model")
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "summary": "Two ordered changes",
+                                    "proposal": [planner_spec(id="first"),
+                                                 planner_spec(depends_on=["first"])]})])
+    scheduler = Scheduler(cfg, state)
+    monkeypatch.setattr(scheduler, "_adapter_for", lambda role: adapter)
+    monkeypatch.setattr("nc.scheduler.arbiter.ensure_worktree",
+                        lambda *args: pytest.fail("planner received a worktree"))
+    before = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo)
+    assert scheduler.step() == protocol.DONE
+    assert state.q("SELECT * FROM task") == []
+    proposals = state.q("SELECT * FROM proposal")
+    assert len(proposals) == 1 and proposals[0]["status"] == "pending"
+    assert adapter.calls[0][0] == "planner-model"
+    assert adapter.calls[0][1].parent == cfg.runs_dir
+    assert not cfg.work_dir.exists()
+    assert subprocess.check_output(["git", "status", "--porcelain"], cwd=repo) == before
+    assert cli.main(["--home", str(cfg.home), "approve", str(proposals[0]["id"])]) == 0
+    tasks = state.q("SELECT * FROM task ORDER BY id")
+    assert len(tasks) == 2
+    assert json.loads(tasks[1]["depends_on"]) == [tasks[0]["id"]]
+
+
+def test_planner_rejects_oversized_batch(setup):
+    cfg, state, _ = setup
+    aid, _ = state.planner_feedback("neocortex", "Plan", cfg.model_for("planner"))
+    scheduler = sched(cfg, state, [emit({"outcome": "DONE",
+                                       "proposal": [planner_spec()] * 6})])
+    assert scheduler.step() == protocol.FAIL
+    assert "one and five" in state.one("SELECT * FROM run")["detail"]
+    assert scheduler.consecutive_failures == 1
+    assert state.q("SELECT * FROM proposal") == []
+    assert state.q("SELECT * FROM task") == []
+    assert len(state.inbox(aid)) == 1
+
+
+def test_planner_brief_includes_state(setup):
+    from nc.turn import build_planner_brief
+
+    cfg, state, _ = setup
+    feedback = "Full feedback " + "x" * 1000 + " END"
+    aid, mid = state.planner_feedback("neocortex", feedback, cfg.model_for("planner"))
+    done = state.add_task("neocortex", "Accepted change", "objective", [])
+    state.set_task(done, status="done")
+    blocked = state.add_task("neocortex", "Blocked change", "objective", [])
+    state.set_task(blocked, status="blocked")
+    state.send(protocol.INCIDENT, "scheduler", "owner", {"reason": "turn budget exhausted"},
+               task_id=blocked)
+    state.add_task("neocortex", "Queued change", "objective", [], depends_on=[blocked])
+    state.send(protocol.QUESTION, "worker", "owner", {"question": "Missing input?"},
+               task_id=blocked)
+    brief, ids = build_planner_brief(state, state.one("SELECT * FROM agent WHERE id=?", (aid,)),
+                                     cfg.runs_dir / "outcome.json")
+    for value in (feedback, "neocortex", "README.md", "Accepted change", "Blocked change",
+                  "Queued change", "turn budget exhausted", "Missing input?",
+                  "Waiting for accepted dependencies"):
+        assert value in brief
+    assert ids == [mid]

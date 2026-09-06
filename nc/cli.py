@@ -95,6 +95,8 @@ def cmd_proposals(args) -> int:
     for row in rows:
         print(f"{row['id']} {row['project_id']} {row['status']} "
               f"source={row['source']} {row['rationale']}")
+        for finding in json.loads(row["findings"]):
+            print(f"  finding: {finding}")
     if not rows:
         print("(no proposals)")
     return 0
@@ -108,6 +110,7 @@ def cmd_proposal(args) -> int:
         return 1
     detail = dict(row)
     detail["spec"] = json.loads(detail["spec"])
+    detail["findings"] = json.loads(detail["findings"])
     print(json.dumps(detail, indent=2, ensure_ascii=False))
     return 0
 
@@ -116,7 +119,11 @@ def cmd_decide_proposal(args) -> int:
     _, state = _open(args)
     try:
         if args.cmd == "approve":
-            for task_id in state.approve_proposal(args.proposal_id):
+            ids = state.approve_proposal(args.proposal_id, force=args.force)
+            row = state.one("SELECT findings FROM proposal WHERE id=?", (args.proposal_id,))
+            for finding in json.loads(row["findings"]):
+                print(f"overriding finding: {finding}", file=sys.stderr)
+            for task_id in ids:
                 print(task_id)
         else:
             state.reject_proposal(args.proposal_id, args.reason)
@@ -440,6 +447,8 @@ def build_parser() -> argparse.ArgumentParser:
     for command in ("approve", "reject"):
         sp = sub.add_parser(command, help=f"{command} a pending proposal")
         sp.add_argument("proposal_id", type=int)
+        if command == "approve":
+            sp.add_argument("--force", action="store_true", help="override proposal findings")
         if command == "reject":
             sp.add_argument("reason")
         sp.set_defaults(func=cmd_decide_proposal)

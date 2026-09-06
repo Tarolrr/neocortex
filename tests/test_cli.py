@@ -129,7 +129,8 @@ def test_health_counts(tmp_path, capsys):
 def test_why_evidence(tmp_path, capsys):
     state = State(Config.load(tmp_path).db_path)
     state.add_project("demo", "Demo", str(tmp_path), None)
-    task = state.add_task("demo", "Review me", "objective", ["$ pytest -q", "Works well"])
+    objective = "Explain the cobalt migration.\n\n  Preserve every indented detail.\nFinish with evidence."
+    task = state.add_task("demo", "Review me", objective, ["$ pytest -q", "Works well"])
     other = state.add_task("demo", "Unrelated", "objective", [])
     state.set_task(task, status="done")
     for index, (role, outcome) in enumerate(
@@ -153,6 +154,7 @@ def test_why_evidence(tmp_path, capsys):
 
     output = capsys.readouterr().out
     assert f"{task}: Review me\nstatus: done" in output
+    assert f"\nobjective:\n{objective}\n\nacceptance criteria:" in output
     assert "$ pytest -q" in output
     assert "Works well" in output
     for index, (role, outcome) in enumerate(

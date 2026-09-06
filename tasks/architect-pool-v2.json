@@ -1,0 +1,66 @@
+[
+  {
+    "project": "neocortex",
+    "title": "Planner role: turn feedback and repository state into one bounded proposal",
+    "objective": "Add a planner role that runs as a project-level agent (no task, no worktree) and ends its turn by recording exactly one pending proposal through the existing proposal store, or by asking the owner a question. Read nc/state.py, nc/cli.py and nc/scheduler.py first: the feedback message kind, the planner agent and the scheduler's ability to run a taskless agent already exist from neocortex-T009, and the proposal table and nc approve already exist from neocortex-T008 - use them as they are instead of inventing parallel mechanisms. The planner's brief must contain the project id and repository layout, the open feedback addressed to it, the queued and blocked tasks with the reason each one is blocked, and the recently accepted tasks. Each proposed task must carry a title, objective, acceptance criteria, boundaries and, when it builds on another task in the same proposal or on an existing task, a depends_on list, so the queue can order them. The planner uses config.models['planner'], which defaults to the heaviest configured model. It proposes at most five tasks per turn; a larger batch is a protocol failure with a clear reason, never a silent truncation. Change whatever modules the objective requires, including the scheduler and the prompt modules.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test drives a scripted planner turn and asserts that it creates exactly one pending proposal and zero tasks, and that the tasks appear only after nc approve",
+      "A test asserts that a planner batch of more than five tasks is rejected as a failed turn with a reason, leaving no proposal behind",
+      "A test asserts the planner brief contains the open feedback and the blocked tasks with their reasons",
+      "A proposed task that declares depends_on keeps that field after approval",
+      "The planner writes no files in the repository and is never given a worktree"
+    ],
+    "boundaries": [
+      "Do not change what approval means: proposals stay pending until the owner approves them, and rejected proposals never create tasks",
+      "Do not let the planner create tasks, edit repository files or merge anything",
+      "Do not change the worker and critic contract",
+      "If an input the objective requires does not exist in this checkout, ask the owner instead of inventing a source for it"
+    ],
+    "priority": 30,
+    "budget_turns": 8,
+    "depends_on": ["neocortex-T009"]
+  },
+  {
+    "project": "neocortex",
+    "title": "Keep the planner from eating the queue",
+    "objective": "Make planner turns rare and bounded. A planner only runs when it was triggered by nc feedback or nc plan, when no worker and no critic is runnable, when its project has no pending proposal waiting for the owner, and when the project's queued task count is at or below a configurable limit. Add planner_max_queued and planner_max_pending_proposals to the configuration with sane defaults, and record for each project when its planner last ran so a skipped planner can be explained. A planner that is skipped goes back to waiting rather than spinning.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test asserts a runnable worker or critic is always chosen before a runnable planner",
+      "A test asserts the planner is skipped while its project has a pending proposal, and runs once that proposal is approved or rejected",
+      "A test asserts the planner is skipped while the queued task count exceeds planner_max_queued",
+      "A test asserts a scheduler run with only a skipped planner ends idle instead of looping"
+    ],
+    "boundaries": [
+      "Do not make the planner run on its own without an owner trigger",
+      "Do not delay or starve workers and critics to make room for the planner",
+      "Do not silently drop the trigger: a skipped planner stays waiting for its next chance"
+    ],
+    "priority": 40,
+    "budget_turns": 6,
+    "depends_on": ["neocortex-T013"]
+  },
+  {
+    "project": "neocortex",
+    "title": "Onboard the two real projects as separate namespaces",
+    "objective": "Add nc onboard <project-id> <git-url> [--dir DIR]. It clones the repository into /root/projects/<project-id> when that directory does not exist yet, registers or updates the project in the state database, detects and records a test command when the repository makes one obvious, and queues exactly one reconnaissance task for that project. The reconnaissance task's only output is REPORT.md in the project repository - what the project is, how it is built and tested, and the three most valuable things to do next - with no other source change. Running onboard again on an existing project updates its registration instead of failing. Task ids and agents stay namespaced by project, so onboarding never touches neocortex tasks. The owner has authorised writing clones under /root/projects and registering them in the state database; the two real repositories are https://github.com/Tarolrr/aiscreeps and https://github.com/Tarolrr/airogue, but tests must use throwaway local repositories created by the test itself, never those two.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test onboards a local throwaway repository and asserts the project is registered and exactly one queued reconnaissance task exists for it",
+      "A test asserts onboarding the same project twice updates it and does not create a second reconnaissance task",
+      "A test asserts tasks of the onboarded project keep their own id sequence and do not affect the neocortex project",
+      "The reconnaissance task's acceptance criteria require REPORT.md and forbid other source changes"
+    ],
+    "boundaries": [
+      "Do not clone or contact the real aiscreeps and airogue repositories from the tests",
+      "Do not change how existing projects are registered or how their tasks are numbered",
+      "Do not give the onboarded project any task beyond the single reconnaissance task"
+    ],
+    "priority": 45,
+    "budget_turns": 6
+  }
+]

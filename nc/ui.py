@@ -470,6 +470,10 @@ def _post_task_new(h: Handler, state, params, query, form):
         ))
         return
     try:
+        if not form.get("title", "").strip() or not form.get("objective", "").strip():
+            raise ValueError("title and objective are required")
+        if budget_turns < 1:
+            raise ValueError("turn budget must be greater than zero")
         tid = operations.create_task(state, project["id"], form.get("title", ""),
                                      form.get("objective", ""), acceptance, boundaries,
                                      priority, budget_turns, after)
@@ -499,7 +503,7 @@ def _post_task_import(h: Handler, state, params, query, form):
         ))
         return
     try:
-        ids = operations.import_tasks(state, specs)
+        ids = operations.import_tasks(state, specs, project=project["id"])
     except (KeyError, TypeError, ValueError) as exc:
         h.send_html(HTTPStatus.BAD_REQUEST, _task_import_page(
             project, h.csrf_token, f"invalid task spec: {exc}", raw,

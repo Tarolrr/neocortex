@@ -47,16 +47,13 @@ def cmd_task(args) -> int:
     acceptance = args.accept or []
     if args.file:
         specs = json.loads(Path(args.file).read_text())
-        for tid in operations.import_tasks(state, specs):
-            print(tid)
+        for spec in specs if isinstance(specs, list) else [specs]:
+            for tid in operations.import_tasks(state, spec):
+                print(tid)
         return 0
-    try:
-        tid = operations.create_task(state, args.project, args.title, args.objective,
-                                     acceptance, args.boundary or [], args.priority,
-                                     args.budget, args.after or [])
-    except (ValueError, LookupError) as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+    tid = operations.create_task(state, args.project, args.title, args.objective,
+                                 acceptance, args.boundary or [], args.priority,
+                                 args.budget, args.after or [])
     print(tid)
     return 0
 

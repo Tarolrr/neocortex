@@ -69,22 +69,40 @@ def create_task(state: State, project_id: str, title: str, objective: str,
                 acceptance: list[str], boundaries: list[str] | None = None,
                 priority: int = 100, budget_turns: int = 6,
                 depends_on: list[str] | None = None) -> str:
-    if not project_id:
-        raise ValueError("project is required")
-    if get_project(state, project_id) is None:  # pragma: no cover - get_project raises first
-        raise LookupError(f"unknown project: {project_id}")
-    if not title or not title.strip():
-        raise ValueError("title is required")
-    if not objective or not objective.strip():
-        raise ValueError("objective is required")
-    return state.add_task(project_id, title.strip(), objective, acceptance,
+    return state.add_task(project_id, title, objective, acceptance,
                           boundaries, priority, budget_turns, depends_on)
 
 
-def import_tasks(state: State, specs: list[dict] | dict) -> list[str]:
-    """Same normalization as `nc task --file`: a bare object is one task."""
+def import_tasks(state: State, specs: list[dict] | dict,
+                 project: str | None = None) -> list[str]:
+    """Import browser batches atomically within the selected project.
+
+    CLI callers omit project and retain the historical per-item import semantics.
+    """
     items = specs if isinstance(specs, list) else [specs]
-    return [state.add_task_spec(spec) for spec in items]
+    if project is None:
+        return [state.add_task_spec(spec) for spec in items]
+    get_project(state, project)
+    for spec in items:
+        if not isinstance(spec, dict):
+            raise TypeError("each task must be a JSON object")
+        if spec.get("project") != project:
+            raise ValueError("each task must belong to the selected project")
+        for key in ("title", "objective"):
+            if not isinstance(spec.get(key), str) or not spec[key].strip():
+                raise ValueError(f"{key} is required and must be text")
+        for key in ("acceptance", "boundaries", "depends_on"):
+            value = spec.get(key, [] if key != "acceptance" else None)
+            if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+                raise ValueError(f"{key} must be a list of strings")
+        for key, default in (("priority", 100), ("budget_turns", 6)):
+            value = spec.get(key, default)
+            if type(value) is not int or (key == "budget_turns" and value < 1):
+                raise ValueError(f"{key} must be an integer" +
+                                 (" greater than zero" if key == "budget_turns" else ""))
+    with state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        return [state._add_task_spec(spec) for spec in items]
 
 
 def task_detail(state: State, cfg: Config, task_id: str) -> dict:

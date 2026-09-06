@@ -98,3 +98,44 @@ def test_busy_database_returns_retryable_error(browser):
     finally:
         state.db.rollback()
     assert state.one("SELECT status FROM task WHERE id=?", (tid,))["status"] == "queued"
+
+
+@pytest.mark.parametrize("invalid", [None, 1, "text", [],
+    {"project": "two", "title": "other", "objective": "x", "acceptance": []},
+    {"project": "one", "title": "bad", "objective": "x", "acceptance": "oops"},
+    {"project": "one", "title": "bad", "objective": "x", "acceptance": [],
+     "budget_turns": False},
+])
+def test_import_rejects_invalid_batch_without_writes(browser, invalid):
+    import json
+
+    _, state, _, server, request = browser
+    path = "/p/one/tasks/import"
+    _, headers, body = request(path)
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    good = {"project": "one", "title": "valid", "objective": "x", "acceptance": []}
+    before = list(state.db.iterdump())
+    status, _, body = request(path, "POST",
+        {"csrf_token": token, "spec": json.dumps([good, invalid])},
+        {"Cookie": headers["Set-Cookie"].split(";")[0],
+         "Origin": f"http://127.0.0.1:{server.server_port}"})
+    assert status == 400, body
+    assert list(state.db.iterdump()) == before
+
+
+def test_import_valid_batch(browser):
+    import json
+
+    _, state, _, server, request = browser
+    path = "/p/one/tasks/import"
+    _, headers, body = request(path)
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    specs = [{"project": "one", "title": title, "objective": "x", "acceptance": []}
+             for title in ("first", "second")]
+    status, _, body = request(path, "POST",
+        {"csrf_token": token, "spec": json.dumps(specs)},
+        {"Cookie": headers["Set-Cookie"].split(";")[0],
+         "Origin": f"http://127.0.0.1:{server.server_port}"})
+    assert status == 303, body
+    assert [r["title"] for r in state.q("SELECT title FROM task ORDER BY id")][-2:] == [
+        "first", "second"]

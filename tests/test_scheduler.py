@@ -574,9 +574,12 @@ def planner_spec(**extra):
             **extra}
 
 
-def test_planner_proposal_requires_approval(setup, monkeypatch):
+@pytest.mark.parametrize("planner_override", [None, "gpt-5.6-luna"])
+def test_planner_proposal_requires_approval(setup, monkeypatch, planner_override):
     cfg, state, repo = setup
-    cfg.models["planner"] = "planner-model"
+    cfg.models = {"worker": "gpt-5.6-luna", "critic": "gpt-6-astra"}
+    if planner_override is not None:
+        cfg.models["planner"] = planner_override
     state.planner_feedback("neocortex", "Plan a change", "old-model")
     adapter = ScriptedAdapter([emit({"outcome": "DONE", "summary": "Two ordered changes",
                                     "proposal": [planner_spec(id="first"),
@@ -590,7 +593,8 @@ def test_planner_proposal_requires_approval(setup, monkeypatch):
     assert state.q("SELECT * FROM task") == []
     proposals = state.q("SELECT * FROM proposal")
     assert len(proposals) == 1 and proposals[0]["status"] == "pending"
-    assert adapter.calls[0][0] == "planner-model"
+    assert adapter.calls[0][0] == (planner_override or "gpt-6-astra")
+    assert state.one("SELECT model FROM run")["model"] == adapter.calls[0][0]
     assert adapter.calls[0][1].parent == cfg.runs_dir
     assert not cfg.work_dir.exists()
     assert subprocess.check_output(["git", "status", "--porcelain"], cwd=repo) == before

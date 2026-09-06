@@ -7,6 +7,14 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+# Local planner selection policy, lightest to heaviest. Unknown model names
+# retain configuration order below known models; use models.planner to override.
+PLANNER_MODEL_PRIORITY = {
+    model: rank for rank, model in enumerate((
+        "gpt-5.6-luna", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra",
+    ), start=1)
+}
+
 
 def default_home() -> Path:
     return Path(os.environ.get("NC_HOME", Path.home() / ".neocortex"))
@@ -64,7 +72,11 @@ class Config:
         self.config_path.write_text(json.dumps(data, indent=2))
 
     def model_for(self, role: str) -> str:
-        return self.models.get(role, next(iter(self.models.values())))
+        if role in self.models:
+            return self.models[role]
+        if role == "planner":
+            return max(self.models.values(), key=lambda model: PLANNER_MODEL_PRIORITY.get(model, 0))
+        return next(iter(self.models.values()))
 
     def adapter_for(self, role: str) -> str:
         return self.adapters.get(role, self.adapter)

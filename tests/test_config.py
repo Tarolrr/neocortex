@@ -14,3 +14,21 @@ def test_old_config_uses_global_adapter(tmp_path):
     cfg = Config.load(tmp_path)
     assert cfg.adapter_for("worker") == "claude"
     assert cfg.adapter_for("critic") == "claude"
+
+
+def test_planner_defaults_to_heaviest_model_regardless_of_order():
+    for models in (
+        {"worker": "gpt-5.6-luna", "critic": "gpt-6-astra"},
+        {"critic": "gpt-6-astra", "worker": "gpt-5.6-luna"},
+    ):
+        cfg = Config(models=models)
+        assert cfg.model_for("planner") == "gpt-6-astra"
+        assert cfg.model_for("worker") == "gpt-5.6-luna"
+        assert cfg.model_for("critic") == "gpt-6-astra"
+        cfg.models["planner"] = "gpt-5.6-luna"
+        assert cfg.model_for("planner") == "gpt-5.6-luna"
+
+
+def test_unknown_models_keep_configuration_order():
+    cfg = Config(models={"worker": "custom-first", "critic": "custom-second"})
+    assert cfg.model_for("planner") == "custom-first"

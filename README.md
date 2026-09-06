@@ -20,6 +20,10 @@ queued task -> worker turn(s) -> arbiter runs acceptance checks -> critic review
   never accept its own work: its `DONE` means "ready for review".
 - **Arbiter** is plain code. It runs the acceptance criteria that are shell
   commands, merges the branch when the critic passes it, and counts attempts.
+  If the accepted branch no longer merges into the base branch, it aborts the
+  merge, records a `merge_conflict` incident and returns the task to the worker
+  with the conflicting files; this does not count as an attempt, and a new critic
+  reviews the resolved result again.
 - **Critic** is a separate session that sees the diff, the acceptance criteria
   and the check output — deliberately *not* the worker's account of what it did.
 - **Scheduler** picks one runnable agent per turn, preflights the model before

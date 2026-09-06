@@ -117,6 +117,71 @@ def test_accepted_task_is_merged_only_after_a_passing_critic(setup):
     assert scheduler.step() == "idle"
 
 
+def test_merge_conflict_after_a_pass_sends_the_worker_back_without_an_attempt(setup):
+    cfg, state, repo = setup
+    tid = state.add_task("neocortex", "update README", "update README", [])
+
+    def resolve_conflict(cwd: Path, outcome_path: Path) -> None:
+        subprocess.run(["git", "merge", "main"], cwd=cwd, check=False,
+                       capture_output=True, text=True)
+        (cwd / "README.md").write_text("from main\nfrom worker\n")
+        subprocess.run(["git", "add", "README.md"], cwd=cwd, check=True)
+        subprocess.run(["git", "commit", "-m", "merged"], cwd=cwd, check=True)
+        outcome_path.parent.mkdir(parents=True, exist_ok=True)
+        outcome_path.write_text(json.dumps({
+            "outcome": "DONE", "summary": "resolved the merge conflict",
+        }))
+
+    scheduler = sched(cfg, state, [
+        commit_and_emit("README.md", "from worker\n",
+                        {"outcome": "DONE", "summary": "updated README"}),
+        emit({"outcome": "DONE", "verdict": "pass", "summary": "criteria met"}),
+        resolve_conflict,
+        emit({"outcome": "DONE", "verdict": "pass", "summary": "resolved"}),
+    ])
+
+    assert scheduler.step() == protocol.DONE
+    subprocess.run(["git", "checkout", "main"], cwd=repo, check=True)
+    (repo / "README.md").write_text("from main\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "main update"], cwd=repo, check=True)
+
+    assert scheduler.step() == protocol.DONE
+    task = state.one("SELECT * FROM task WHERE id=?", (tid,))
+    assert (task["status"], task["attempts"]) == ("in_progress", 0)
+    assert state.one("SELECT * FROM agent WHERE id=?", (f"worker-{tid}",))["state"] == "runnable"
+    assert state.one("SELECT * FROM agent WHERE id=?", (f"critic-{tid}-1",))["state"] == "done"
+    assert state.one("SELECT * FROM incident WHERE kind='merge_conflict'")
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                          capture_output=True, text=True, check=True).stdout == ""
+    assert (repo / "README.md").read_text() == "from main\n"
+
+    assert scheduler.step() == protocol.DONE
+    assert "no longer merges into main" in scheduler.adapter.briefs[2]
+    assert scheduler.step() == protocol.DONE
+    assert state.one("SELECT * FROM task WHERE id=?", (tid,))["status"] == "done"
+    assert (repo / "README.md").read_text() == "from main\nfrom worker\n"
+
+
+def test_unexpected_handler_error_blocks_the_task_instead_of_crashing(setup, monkeypatch):
+    cfg, state, _repo = setup
+    tid = state.add_task("neocortex", "add marker", "create marker.txt", [])
+    scheduler = sched(cfg, state, [
+        commit_and_emit("marker.txt", "hello\n",
+                        {"outcome": "DONE", "summary": "created marker.txt"}),
+        emit({"outcome": "DONE", "verdict": "pass", "summary": "criteria met"}),
+    ])
+    monkeypatch.setattr("nc.scheduler.arbiter.integrate",
+                        lambda *_args: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    assert scheduler.step() == protocol.DONE
+    assert scheduler.step() == "error"
+    assert state.one("SELECT * FROM task WHERE id=?", (tid,))["status"] == "blocked"
+    assert state.one("SELECT * FROM incident WHERE kind='handler_error'")
+    assert scheduler.step() == "idle"
+
+
 def test_accepted_work_is_mirrored_and_can_be_reverted(setup, tmp_path):
     cfg, state, repo = setup
     remote = tmp_path / "mirror.git"

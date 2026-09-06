@@ -147,7 +147,22 @@ class Scheduler:
             protocol.NO_OUTCOME: self._on_fail,
             protocol.DONE: self._on_done,
         }[outcome.kind]
-        handler(agent, task, project, cwd, branch, outcome)
+        try:
+            handler(agent, task, project, cwd, branch, outcome)
+        except Exception as exc:
+            log.exception("error handling %s for %s", outcome.kind,
+                          task["id"] if task else agent["id"])
+            self.state.incident(
+                "handler_error",
+                f"{task['id'] if task else agent['id']}: {exc!r}",
+            )
+            if task is not None:
+                self._block(task, agent, f"scheduler error while applying "
+                             f"{outcome.kind}: {exc}")
+            else:
+                self.state.set_agent(agent["id"], state="blocked")
+            self.consecutive_failures += 1
+            return "error"
         return outcome.kind
 
     # --- outcome handlers -------------------------------------------------
@@ -210,7 +225,19 @@ class Scheduler:
 
         if verdict == "pass":
             repo = Path(project["repo_path"])
-            commit = arbiter.integrate(repo, branch, task["id"])
+            try:
+                commit = arbiter.integrate(repo, branch, task["id"])
+            except arbiter.MergeConflict as exc:
+                base = arbiter.base_branch(repo)
+                self.state.incident("merge_conflict", f"{task['id']}: {exc}")
+                self._rework(agent, task, [
+                    (
+                        f"The critic accepted your work, but the branch no longer merges into {base}: "
+                        f"conflicts in {', '.join(exc.files)}. Merge {base} into your branch, resolve the "
+                        f"conflicts, keep the acceptance checks green and commit. Do not rewrite history."
+                    )
+                ], attempt=False)
+                return
             error = arbiter.mirror(repo, project["mirror"], branch)
             arbiter.remove_worktree(repo, cwd)
             if error:
@@ -225,9 +252,9 @@ class Scheduler:
             self._rework(agent, task, outcome.findings or [outcome.summary])
 
     # --- helpers ----------------------------------------------------------
-    def _rework(self, agent, task, findings: list[str]) -> None:
+    def _rework(self, agent, task, findings: list[str], *, attempt: bool = True) -> None:
         worker_id = f"worker-{task['id']}"
-        attempts = task["attempts"] + 1
+        attempts = task["attempts"] + (1 if attempt else 0)
         self.state.send(protocol.REVIEW_VERDICT, "arbiter", worker_id,
                         {"verdict": "rework", "summary": "acceptance not met",
                          "findings": findings}, task_id=task["id"])

@@ -162,9 +162,20 @@ permission mode, and `--model` accepts a model name or alias. The adapter omits
 when the binary is absent from `PATH`. Verification used no paid session.
 
 `nc stop` writes a `STOP` file in `$NC_HOME` and `nc run` then exits immediately;
-`nc resume` (optionally `--retry` to requeue blocked tasks) clears it. The circuit
+`nc resume` clears STOP and closes all open incidents, recording the resolution
+time and the note `Closed by nc resume`. Its optional `--retry` also requeues
+blocked tasks. The circuit
 breaker writes that same file, so a system failing every turn stays down instead
 of being restarted into the same failure every few minutes.
+
+`nc incidents` lists open incidents. Use `nc resolve <incident-id> --reason TEXT`
+to acknowledge only the selected incident with an owner resolution note and time.
+This does not assert repository repair, clear STOP, requeue tasks, or wake agents.
+`nc incidents --all` includes closed incidents and their resolution details.
+Unknown IDs fail without changing incident data; resolving an already closed
+incident preserves its original resolution. Incident details and timeout
+deduplication remain intact. Older closures without metadata display an unknown
+time and no recorded note.
 
 ## Unattended operation
 

@@ -35,6 +35,8 @@ class Config:
     max_attempts: int = 3
     min_free_mb: int = 120
     max_turns_per_cycle: int = 0          # 0 = unlimited, bounded by budget/tasks
+    planner_max_queued: int = 5
+    planner_max_pending_proposals: int = 1
     ask_timeout_s: int = 24 * 3600
 
     @property

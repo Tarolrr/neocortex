@@ -795,3 +795,69 @@ def test_plan_critic_requires_restricted_adapter(setup):
     assert scheduler.step() == protocol.FAIL
     assert scheduler.adapter.calls == []
     assert scheduler.step() == 'idle'
+
+
+@pytest.mark.parametrize('role', ['worker', 'critic'])
+def test_runnable_task_agents_always_precede_planner(setup, role):
+    cfg, state, _ = setup
+    aid, _ = state.planner_feedback('neocortex', 'Plan', cfg.model_for('planner'))
+    tid = state.add_task('neocortex', 'Work', 'Objective', [])
+    state.set_task(tid, status='in_progress')
+    state.add_agent('active', role, 'neocortex', tid, cfg.model_for(role))
+    scheduler = sched(cfg, state, [])
+    assert scheduler.pick()['id'] == 'active'
+    assert state.one('SELECT state FROM agent WHERE id=?', (aid,))['state'] == 'waiting'
+    assert len(state.inbox(aid)) == 1
+
+
+@pytest.mark.parametrize('decision', ['approve', 'reject'])
+def test_pending_proposal_defers_planner_until_owner_decision(setup, decision):
+    cfg, state, _ = setup
+    aid, _ = state.planner_feedback('neocortex', 'Plan', cfg.model_for('planner'))
+    pid = state.add_proposal('neocortex', 'planner', 'rationale', [planner_spec()])
+    scheduler = sched(cfg, state, [emit({'outcome': 'ASK', 'question': 'Scope?'})])
+    assert scheduler.pick() is None
+    project = state.one('SELECT * FROM project')
+    assert project['planner_last_ran_at'] is None
+    assert 'pending proposals' in project['planner_skip_reason']
+    assert state.one('SELECT state FROM agent WHERE id=?', (aid,))['state'] == 'waiting'
+    assert len(state.inbox(aid)) == 1
+    if decision == 'approve':
+        for tid in state.approve_proposal(pid):
+            # Approved work must finish before the planner gets a turn.
+            state.set_task(tid, status='done')
+    else:
+        state.reject_proposal(pid, 'Not needed')
+    assert scheduler.step() == protocol.ASK
+    project = state.one('SELECT * FROM project')
+    assert project['planner_last_ran_at'] is not None
+    assert project['planner_skip_reason'] is None
+    assert scheduler.step() == 'idle'
+
+
+def test_queue_limit_waits_without_spinning_and_resumes_at_limit(setup, monkeypatch):
+    cfg, state, _ = setup
+    cfg.planner_max_queued = 1
+    aid, _ = state.planner_feedback('neocortex', 'Plan', cfg.model_for('planner'))
+    blocked = state.add_task('neocortex', 'Blocked', 'Objective', [])
+    state.set_task(blocked, status='blocked')
+    queued = [state.add_task('neocortex', 'Queued', 'Objective', [], depends_on=[blocked])
+              for _ in range(2)]
+    scheduler = sched(cfg, state, [emit({'outcome': 'ASK', 'question': 'Scope?'})])
+    monkeypatch.setattr(scheduler, 'preflight', lambda: (True, 'test'))
+    monkeypatch.setattr('nc.scheduler.time.sleep',
+                        lambda _: pytest.fail('skipped planner kept scheduler running'))
+    scheduler.run()
+    assert not scheduler.adapter.calls
+    assert state.one('SELECT state FROM agent WHERE id=?', (aid,))['state'] == 'waiting'
+    assert 'queued tasks 2' in state.one('SELECT * FROM project')['planner_skip_reason']
+    # Waiting and the trigger survive restarting the scheduler/database.
+    reopened = State(cfg.db_path)
+    try:
+        assert Scheduler(cfg, reopened).step() == 'idle'
+    finally:
+        reopened.db.close()
+    assert len(state.inbox(aid)) == 1
+    state.set_task(queued[0], status='done')
+    assert scheduler.step() == protocol.ASK
+    assert scheduler.step() == 'idle'

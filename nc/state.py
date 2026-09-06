@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS agent (
     role       TEXT NOT NULL,             -- worker|critic|planner
     project_id TEXT NOT NULL REFERENCES project(id),
     task_id    TEXT REFERENCES task(id),
-    state      TEXT NOT NULL,             -- runnable|blocked|done|failed
+    state      TEXT NOT NULL,             -- runnable|waiting|blocked|done|failed
     model      TEXT NOT NULL,
     turns      INTEGER NOT NULL DEFAULT 0,
     memo       TEXT NOT NULL DEFAULT '',  -- compact decision journal carried between turns
@@ -136,6 +136,8 @@ class State:
         for table, column, decl in (
             ("proposal", "findings", "TEXT NOT NULL DEFAULT '[]'"),
             ("project", "mirror", "TEXT"),
+            ("project", "planner_last_ran_at", "REAL"),
+            ("project", "planner_skip_reason", "TEXT"),
             ("task", "merge_commit", "TEXT"),
             ("task", "depends_on", "TEXT NOT NULL DEFAULT '[]'"),
         ):

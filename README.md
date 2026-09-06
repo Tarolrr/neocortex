@@ -265,8 +265,14 @@ under the local priority policy: `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`,
 `gpt-5.5`, then `gpt-5.6-luna`. Unknown names rank below these and retain
 configuration order on ties; set `models.planner` explicitly for other models.
 Neither command starts a session: execution belongs to the timer/scheduler.
-The scheduler can pick project planners without a task. For now their turn is a
-placeholder that records `YIELD` without a model session, then blocks the agent
-until another `feedback` or `plan` request wakes it. This prevents repeated turns
-on the same note. The planning prompt and proposal handling are separate features. Feedback remains
-pending through placeholder turns and stays visible in `status` until delivered.
+Planner turns run only after task workers, task critics, and pending proposal reviews.
+`planner_max_queued` (default 5) limits the project's queued tasks; planning waits
+when the count exceeds it. `planner_max_pending_proposals` (default 1) blocks
+planning when the project's pending proposal count reaches that capacity. Set it
+to 0 to pause planning. These settings live in `config.json`.
+Skipped planners enter `waiting`, retaining their owner feedback for the next
+scheduler tick. They do not keep an otherwise idle scheduler running. Once the
+gates clear, the existing trigger can run without another owner request.
+Projects record `planner_last_ran_at` and `planner_skip_reason` for inspection.
+A completed planning turn records a proposal for owner approval or asks the owner
+a question; it does not automatically schedule another planning turn.

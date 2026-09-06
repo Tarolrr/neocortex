@@ -67,18 +67,47 @@ class Scheduler:
     def pick(self) -> sqlite3.Row | None:
         """Critics first, then workers by task priority, then project planners."""
         query = (
-            "SELECT a.* FROM agent a LEFT JOIN task t ON t.id = a.task_id"
-            " WHERE a.state='runnable'"
-            " AND (t.id IS NOT NULL OR (a.role='planner' AND a.task_id IS NULL))"
-            " ORDER BY CASE a.role WHEN 'critic' THEN 0 WHEN 'planner' THEN 2 ELSE 1 END,"
-            " t.priority, t.created_at, a.updated_at, a.id"
-            " LIMIT 1"
+            "SELECT a.* FROM agent a JOIN task t ON t.id = a.task_id"
+            " WHERE a.state='runnable' AND a.role IN ('worker','critic')"
+            " ORDER BY CASE a.role WHEN 'critic' THEN 0 ELSE 1 END,"
+            " t.priority, t.created_at, a.updated_at, a.id LIMIT 1"
         )
-        row = self.state.one(query)
-        if row and row["role"] != "planner":
-            return row
-        self.spawn_for_queued_task()
-        return self.state.one(query)
+        work = self.state.one(query)
+        if work is None:
+            self.spawn_for_queued_task()
+            work = self.state.one(query)
+        planner = None
+        for candidate in self.state.q(
+            "SELECT * FROM agent WHERE role='planner' AND task_id IS NULL"
+            " AND state IN ('runnable','waiting') ORDER BY updated_at, id"
+        ):
+            project_id = candidate["project_id"]
+            counts = self.state.one(
+                "SELECT (SELECT COUNT(*) FROM task WHERE project_id=?"
+                " AND status='queued') AS queued,"
+                " (SELECT COUNT(*) FROM proposal WHERE project_id=?"
+                " AND status='pending') AS pending", (project_id, project_id),
+            )
+            reason = None
+            if work is not None:
+                reason = "worker or critic is runnable"
+            elif counts["pending"] >= self.cfg.planner_max_pending_proposals:
+                reason = (f"pending proposals {counts['pending']} reached "
+                          f"planner_max_pending_proposals={self.cfg.planner_max_pending_proposals}")
+            elif counts["queued"] > self.cfg.planner_max_queued:
+                reason = (f"queued tasks {counts['queued']} exceed "
+                          f"planner_max_queued={self.cfg.planner_max_queued}")
+            if reason:
+                if candidate["state"] != "waiting":
+                    self.state.set_agent(candidate["id"], state="waiting")
+                self.state.x("UPDATE project SET planner_skip_reason=? WHERE id=?",
+                             (reason, project_id))
+                log.info("%s waiting: %s", candidate["id"], reason)
+            elif planner is None:
+                if candidate["state"] == "waiting":
+                    self.state.set_agent(candidate["id"], state="runnable")
+                planner = self.state.one("SELECT * FROM agent WHERE id=?", (candidate["id"],))
+        return work if work is not None else planner
 
     def next_ready_task(self) -> sqlite3.Row | None:
         """A task is ready once every task it depends on has been accepted."""

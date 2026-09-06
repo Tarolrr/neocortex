@@ -151,6 +151,8 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
     (run_dir / "brief.md").write_text(brief)
     model = cfg.model_for("planner")
     run_id = state.start_run(agent["id"], None, "planner", model, str(log_path))
+    state.x("UPDATE project SET planner_last_ran_at=?, planner_skip_reason=NULL WHERE id=?",
+            (time.time(), agent["project_id"]))
     run_session = getattr(adapter, "run_planner", adapter.run)
     result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
     outcome = protocol.read_outcome(outcome_path)

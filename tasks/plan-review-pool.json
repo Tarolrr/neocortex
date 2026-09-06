@@ -1,0 +1,45 @@
+[
+  {
+    "project": "neocortex",
+    "title": "Check proposals for the defects that block a worker before the owner sees them",
+    "objective": "Add deterministic checks that run on a proposal when it is recorded and again before it is approved, so structurally broken plans never reach a worker. A proposal is flagged when a proposed task declares a dependency that is neither an existing task nor another task in the same proposal, when the dependencies inside the proposal form a cycle, when a task has no machine-checkable acceptance criterion (none starting with '$'), when a boundary names a source file or directory instead of stating what must not break, or when a task's acceptance criteria cannot be met without changing something its own boundaries forbid as far as a textual check can tell. Findings are stored with the proposal and printed by nc proposal and nc proposals; nc approve refuses a proposal with findings unless it is given --force, and says which finding it is overriding.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test asserts a proposal whose task depends on an unknown id is flagged and that nc approve refuses it without --force",
+      "A test asserts a dependency cycle inside one proposal is flagged",
+      "A test asserts a task with no '$' acceptance criterion is flagged",
+      "A test asserts a boundary naming a file path is flagged while a boundary stating an invariant is not",
+      "A test asserts a clean proposal has no findings and is approved without --force"
+    ],
+    "boundaries": [
+      "Do not make the checks a substitute for the owner's approval: a clean proposal still waits for it",
+      "Do not silently rewrite a proposal to fix a finding",
+      "Do not call a model from these checks"
+    ],
+    "priority": 35,
+    "budget_turns": 6
+  },
+  {
+    "project": "neocortex",
+    "title": "Plan critic: review a proposal against the repository before the owner reads it",
+    "objective": "Add a plan critic role that reviews one pending proposal and attaches its findings to it, so the owner reads the plan together with an independent opinion of it. It runs after a planner turn, sees the proposal and the repository as it is now, and does not see the planner's rationale for the plan being right. It looks for the defects that make a worker stall: a task whose objective assumes a table, command, message kind or module that does not exist yet and is not produced by one of its declared dependencies; a task that needs information only the owner has, such as a repository URL or a permission; boundaries that forbid what the objective requires; acceptance criteria that cannot be checked from the task's own worktree; and a batch whose tasks are ordered wrongly. Its verdict is advisory: findings and a recommendation, never an approval, never a rejection, never an edit to the proposal. Use config.models['plan_critic'], defaulting to the planner's model.",
+    "acceptance": [
+      "$ /root/neocortex/.venv/bin/python -m pytest -q",
+      "$ /root/neocortex/.venv/bin/python -m ruff check .",
+      "A test drives a scripted plan critic over a proposal and asserts its findings are stored and shown by nc proposal",
+      "A test asserts the plan critic's brief contains the proposed tasks and the repository state but not the planner's rationale",
+      "A test asserts the proposal stays pending whatever the plan critic says, and that only nc approve creates tasks",
+      "A test asserts the plan critic never runs while a worker or critic is runnable"
+    ],
+    "boundaries": [
+      "Do not let the plan critic approve, reject or edit a proposal",
+      "Do not let it write files in the repository or take a worktree",
+      "Do not run it more than once per proposal unless the proposal changed",
+      "Do not let it delay workers and critics"
+    ],
+    "priority": 38,
+    "budget_turns": 7,
+    "depends_on": ["neocortex-T013", "neocortex-T016"]
+  }
+]

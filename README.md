@@ -248,7 +248,10 @@ Both commands atomically store an owner message of kind `feedback` (payload
 `{"text": "..."}`) in the project's single planner inbox and make that agent
 runnable. `plan` without a note stores "Request a planning pass." Repeated calls
 preserve every message and reuse the planner, including after it has stopped.
-New planners use `models.planner`, falling back to the first configured model.
+New planners use `models.planner`, falling back to the heaviest configured model
+under the local priority policy: `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`,
+`gpt-5.5`, then `gpt-5.6-luna`. Unknown names rank below these and retain
+configuration order on ties; set `models.planner` explicitly for other models.
 Neither command starts a session: execution belongs to the timer/scheduler.
 The scheduler can pick project planners without a task. For now their turn is a
 placeholder that records `YIELD` without a model session, then blocks the agent

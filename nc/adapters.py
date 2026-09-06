@@ -78,6 +78,13 @@ class CodexAdapter(Adapter):
         ]
         return _run(cmd, cwd, log_path, timeout_s)
 
+    def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
+                    timeout_s: int) -> SessionResult:
+        return _run([
+            "codex", "exec", "--model", model, "--sandbox", "workspace-write",
+            "--skip-git-repo-check", prompt,
+        ], cwd, log_path, timeout_s)
+
 
 class ClaudeAdapter(Adapter):
     name = "claude"
@@ -89,6 +96,16 @@ class ClaudeAdapter(Adapter):
             timeout_s: int) -> SessionResult:
         binary = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
         cmd = [binary, "-p", prompt, "--permission-mode", "bypassPermissions"]
+        if model:
+            cmd += ["--model", model]
+        return _run(cmd, cwd, log_path, timeout_s)
+
+    def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
+                    timeout_s: int) -> SessionResult:
+        binary = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
+        cmd = [binary, "-p", prompt, "--permission-mode", "dontAsk",
+               "--tools", "Read,Glob,Grep,Write", "--allowedTools",
+               "Read", "Glob", "Grep", f"Write(//{cwd.as_posix().lstrip('/')}/outcome.json)"]
         if model:
             cmd += ["--model", model]
         return _run(cmd, cwd, log_path, timeout_s)

@@ -111,8 +111,13 @@ class Scheduler:
             return "idle"
 
         if agent["role"] == "planner" and agent["task_id"] is None:
-            outcome = turn.run_planner_turn(self.state, self.cfg, agent)
-            self.consecutive_failures = 0
+            outcome = turn.run_planner_turn(
+                self.state, self.cfg, agent, self._adapter_for("planner"),
+            )
+            if outcome.kind in (protocol.NO_OUTCOME, protocol.FAIL):
+                self.consecutive_failures += 1
+            else:
+                self.consecutive_failures = 0
             log.info("%s (planner) -> %s: %s", agent["id"], outcome.kind, outcome.summary)
             return outcome.kind
 

@@ -53,3 +53,22 @@ def test_claude_command(tmp_path, monkeypatch, binary, model):
         cmd += ["--model", model]
     run.assert_called_once_with(cmd, tmp_path, log, 30)
     assert result is run.return_value
+
+
+@pytest.mark.parametrize("name", ["codex", "claude"])
+def test_planner_adapter_restricts_writes(tmp_path, monkeypatch, name):
+    from unittest.mock import Mock
+
+    from nc.adapters import get_adapter
+
+    run = Mock()
+    monkeypatch.setattr("nc.adapters._run", run)
+    get_adapter(name).run_planner("Plan", tmp_path, "model", tmp_path / "session.log", 30)
+    cmd = run.call_args.args[0]
+    if name == "codex":
+        assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
+    else:
+        assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
+        assert cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep,Write"
+        assert f"Write(//{tmp_path.as_posix().lstrip('/')}/outcome.json)" in cmd
+    assert run.call_args.args[1] == tmp_path

@@ -143,6 +143,8 @@ def cancel_task(state: State, task_id: str, reason: str) -> bool:
 def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
                  budget: int | None = None, reason: str | None = None) -> dict:
     """Put a task back in the queue, optionally discarding its branch and worktree."""
+    if budget is not None and budget < 1:
+        raise ValueError("turn budget must be greater than zero")
     with lifecycle_lock(state):
         task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
         if task is None:
@@ -166,7 +168,7 @@ def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
                              (task_id,))
             state.db.execute(
                 "UPDATE task SET status='queued', attempts=0, result=?, budget_turns=?, updated_at=?"
-                " WHERE id=?", (reason or "requeued by the owner", budget or task["budget_turns"],
+                " WHERE id=?", (reason or "requeued by the owner", budget if budget is not None else task["budget_turns"],
                                  time.time(), task_id),
             )
         return {"task_id": task_id, "fresh": fresh, "budget": budget}
@@ -264,8 +266,22 @@ def inbox(state: State, include_delivered: bool = False) -> list[dict]:
         item = dict(row)
         payload = json.loads(item["payload"])
         item["text"] = payload.get("question") or payload.get("reason") or json.dumps(payload)
+        item["answerable"] = answerable_question(state, item)
         rows.append(item)
     return rows
+
+
+def answerable_question(state: State, question) -> bool:
+    if question["kind"] != "ASK" or question["recipient"] != "owner" or question["delivered"]:
+        return False
+    agent = state.one("SELECT * FROM agent WHERE id=?", (question["sender"],))
+    if agent is None or agent["task_id"] != question["task_id"]:
+        return False
+    if question["task_id"]:
+        task = state.one("SELECT * FROM task WHERE id=?", (question["task_id"],))
+        if task is None or task["status"] in ("done", "cancelled") or task["merge_commit"]:
+            return False
+    return True
 
 
 def answer_message(state: State, message_id: int, text: str) -> dict:
@@ -282,6 +298,8 @@ def answer_message(state: State, message_id: int, text: str) -> dict:
             (question["task_id"], question["sender"]),
         ):
             raise ValueError("task is cancelled; use requeue explicitly to restore it")
+        if not answerable_question(state, question):
+            raise ValueError("message is not a currently answerable owner question")
         agent_id = question["sender"]
         now = time.time()
         from . import protocol

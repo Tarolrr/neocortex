@@ -353,3 +353,79 @@ def test_real_git_revert_failure_preserves_database(browser, tmp_path):
     assert list(state.db.iterdump()) == before
     assert arbiter.git(repo, "rev-parse", "HEAD") == head
     assert not state.db.in_transaction
+
+
+@pytest.mark.parametrize("budget", ["0", "-2"])
+def test_invalid_requeue_budget_has_no_effect(browser, monkeypatch, budget):
+    from nc import arbiter
+
+    _, state, tid, server, request = browser
+    _, headers, body = request(f"/t/{tid}")
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    calls = []
+    monkeypatch.setattr(arbiter, "remove_worktree", lambda *args: calls.append(args))
+    before = list(state.db.iterdump())
+    status, headers, _ = request(
+        f"/t/{tid}/requeue", "POST",
+        {"csrf_token": token, "budget": budget, "fresh": "on"},
+        {"Cookie": headers["Set-Cookie"].split(";")[0],
+         "Origin": f"http://127.0.0.1:{server.server_port}"},
+    )
+    assert status == 303
+    assert "greater than zero" in urllib.parse.unquote_plus(headers["Location"])
+    assert list(state.db.iterdump()) == before
+    assert calls == []
+
+
+@pytest.mark.parametrize("invalid", ["done", "delivered", "kind", "recipient"])
+def test_historical_or_nonquestion_answer_rejected(browser, invalid):
+    _, state, tid, server, request = browser
+    state.add_agent("questioner", "worker", "one", tid, "model")
+    mid = state.send("ASK", "questioner", "owner", {"question": "Continue?"}, tid)
+    if invalid == "done":
+        state.set_task(tid, status="done", merge_commit="accepted")
+    elif invalid == "delivered":
+        state.x("UPDATE message SET delivered=1 WHERE id=?", (mid,))
+    elif invalid == "kind":
+        state.x("UPDATE message SET kind='NOTICE' WHERE id=?", (mid,))
+    else:
+        state.x("UPDATE message SET recipient='someone' WHERE id=?", (mid,))
+    _, headers, body = request(f"/t/{tid}")
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    before = list(state.db.iterdump())
+    assert f'/messages/{mid}/answer' not in request("/inbox?all=1")[2]
+    status, headers, _ = request(
+        f"/messages/{mid}/answer", "POST", {"csrf_token": token, "text": "Go"},
+        {"Cookie": headers["Set-Cookie"].split(";")[0],
+         "Origin": f"http://127.0.0.1:{server.server_port}"},
+    )
+    assert status == 303
+    assert "not a currently answerable" in urllib.parse.unquote_plus(headers["Location"])
+    assert list(state.db.iterdump()) == before
+
+
+def test_conflicting_rollback_cleans_own_revert(browser, tmp_path):
+    from nc import arbiter, operations
+
+    _, state, tid, _, _ = browser
+    repo = tmp_path / "conflict"
+    repo.mkdir()
+    arbiter.git(repo, "init", "-b", "main")
+    arbiter.git(repo, "config", "user.name", "Test")
+    arbiter.git(repo, "config", "user.email", "test@example.test")
+    commits = []
+    for content in ("original", "accepted", "later"):
+        (repo / "f").write_text(content + "\n")
+        arbiter.git(repo, "add", "f")
+        arbiter.git(repo, "commit", "-m", content)
+        commits.append(arbiter.git(repo, "rev-parse", "HEAD"))
+    state.x("UPDATE project SET repo_path=? WHERE id='one'", (str(repo),))
+    state.set_task(tid, status="done", merge_commit=commits[1])
+    before = list(state.db.iterdump())
+    with pytest.raises(RuntimeError):
+        operations.rollback_task(state, tid)
+    assert list(state.db.iterdump()) == before
+    assert arbiter.git(repo, "status", "--porcelain") == ""
+    assert arbiter.git(repo, "rev-parse", "HEAD") == commits[2]
+    assert not (repo / ".git" / "REVERT_HEAD").exists()
+    assert (repo / "f").read_text() == "later\n"

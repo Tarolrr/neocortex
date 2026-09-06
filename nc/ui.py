@@ -251,7 +251,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 <div class="field"><label for="requeue_reason">Reason (optional)</label>
 <input id="requeue_reason" name="reason"></div>
 <div class="field"><label for="budget">New turn budget (optional)</label>
-<input id="budget" name="budget" type="number"></div>
+<input id="budget" name="budget" type="number" min="1"></div>
 <div class="field checkbox"><input id="fresh" name="fresh" type="checkbox" value="1">
 <label for="fresh">Start from a fresh branch (discard worktree and branch)</label></div>
 <button type="submit">Requeue</button>
@@ -376,19 +376,23 @@ def _feedback_page(project: dict, csrf: str, flash: str, error: str) -> str:
 
 # --- inbox ------------------------------------------------------------------
 
+def _answer_form(m: dict, csrf: str) -> str:
+    return f"""<details><summary>Answer</summary>
+<form method="post" action="/messages/{m['id']}/answer">
+{_csrf_field(csrf)}
+<div class="field"><label for="answer-{m['id']}">Answer</label>
+<textarea id="answer-{m['id']}" name="text" required rows="3"></textarea></div>
+<button type="submit">Send answer</button>
+</form></details>"""
+
+
 def _inbox_page(state: State, csrf: str, include_delivered: bool, flash: str, error: str) -> str:
     rows = operations.inbox(state, include_delivered)
     items = "".join(f"""
 <li>#{m['id']} [{_e(m['kind'])}] from {_e(m['sender'])}
 ({_e(m['task_id'] or '-')}, {_e(operations.age(m['created_at']))} ago)
 <p>{_e(m['text'])}</p>
-<details><summary>Answer</summary>
-<form method="post" action="/messages/{m['id']}/answer">
-{_csrf_field(csrf)}
-<div class="field"><label for="answer-{m['id']}">Answer</label>
-<textarea id="answer-{m['id']}" name="text" required rows="3"></textarea></div>
-<button type="submit">Send answer</button>
-</form></details></li>"""
+{_answer_form(m, csrf) if m["answerable"] else ""}</li>"""
         for m in rows) or "<li>(no pending messages)</li>"
     toggle_href = "/inbox" + ("" if include_delivered else "?all=1")
     toggle_label = "Hide answered messages" if include_delivered else "Show answered messages"

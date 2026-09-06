@@ -143,6 +143,13 @@ def mirror(repo: Path, remote: str | None, branch: str | None = None) -> str:
 
 def revert(repo: Path, commit: str) -> str:
     """Undo an accepted merge, keeping it in history."""
+    # Do not abort a pre-existing operation or disturb local changes.
+    for marker in ("REVERT_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "sequencer"):
+        path = Path(git(repo, "rev-parse", "--git-path", marker))
+        if (path if path.is_absolute() else repo / path).exists():
+            raise RuntimeError("repository has an operation in progress")
+    if git(repo, "status", "--porcelain"):
+        raise RuntimeError("repository must be clean before rollback")
     base = base_branch(repo)
     if git(repo, "rev-parse", "--abbrev-ref", "HEAD") != base:
         git(repo, "checkout", base)
@@ -150,7 +157,13 @@ def revert(repo: Path, commit: str) -> str:
     args = ["revert", "--no-edit", commit]
     if len(parents) > 2:                      # a merge commit: revert onto first parent
         args = ["revert", "--no-edit", "-m", "1", commit]
-    git(repo, *args)
+    try:
+        git(repo, *args)
+    except (RuntimeError, subprocess.TimeoutExpired):
+        marker = Path(git(repo, "rev-parse", "--git-path", "REVERT_HEAD"))
+        if (marker if marker.is_absolute() else repo / marker).exists():
+            git(repo, "revert", "--abort")
+        raise
     return git(repo, "rev-parse", "--short", "HEAD")
 
 

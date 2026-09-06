@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import arbiter, protocol
+from . import arbiter, operations, protocol
 from .config import Config
 from .scheduler import Scheduler
 from .state import State
@@ -21,13 +21,7 @@ def _open(args) -> tuple[Config, State]:
     return cfg, State(cfg.db_path)
 
 
-def _age(ts: float) -> str:
-    delta = int(time.time() - ts)
-    if delta < 3600:
-        return f"{delta // 60}m"
-    if delta < 86400:
-        return f"{delta // 3600}h"
-    return f"{delta // 86400}d"
+_age = operations.age
 
 
 def cmd_init(args) -> int:
@@ -53,12 +47,16 @@ def cmd_task(args) -> int:
     acceptance = args.accept or []
     if args.file:
         specs = json.loads(Path(args.file).read_text())
-        for spec in specs if isinstance(specs, list) else [specs]:
-            print(state.add_task_spec(spec))
+        for tid in operations.import_tasks(state, specs):
+            print(tid)
         return 0
-    tid = state.add_task(args.project, args.title, args.objective, acceptance,
-                         args.boundary or [], args.priority, args.budget,
-                         args.after or [])
+    try:
+        tid = operations.create_task(state, args.project, args.title, args.objective,
+                                     acceptance, args.boundary or [], args.priority,
+                                     args.budget, args.after or [])
+    except (ValueError, LookupError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(tid)
     return 0
 
@@ -66,8 +64,8 @@ def cmd_task(args) -> int:
 def cmd_cancel(args) -> int:
     _, state = _open(args)
     try:
-        changed = state.cancel_task(args.task_id, args.reason)
-    except ValueError as exc:
+        changed = operations.cancel_task(state, args.task_id, args.reason)
+    except (ValueError, LookupError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"{args.task_id} " + ("cancelled" if changed else "already cancelled"))
@@ -77,42 +75,27 @@ def cmd_cancel(args) -> int:
 def cmd_requeue(args) -> int:
     """Put a task back in the queue, optionally from a clean branch off the base."""
     cfg, state = _open(args)
-    task = state.one("SELECT * FROM task WHERE id=?", (args.task_id,))
-    if task is None:
-        print(f"unknown task: {args.task_id}", file=sys.stderr)
+    try:
+        result = operations.requeue_task(cfg, state, args.task_id, args.fresh,
+                                         args.budget, args.reason)
+    except (ValueError, LookupError) as exc:
+        print(str(exc), file=sys.stderr)
         return 1
-    if task["status"] == "done":
-        print(f"{args.task_id} is already accepted; use rollback instead", file=sys.stderr)
-        return 1
-    project = state.one("SELECT * FROM project WHERE id=?", (task["project_id"],))
-    repo = Path(project["repo_path"])
-    if args.fresh:
-        arbiter.remove_worktree(repo, cfg.work_dir / task["id"])
-        arbiter.git(repo, "worktree", "prune", check=False)
-        arbiter.git(repo, "branch", "-D", f"nc/{task['id']}", check=False)
-    # Agents keep their history but restart with a fresh turn budget.
-    state.x("UPDATE agent SET state='blocked', turns=0 WHERE task_id=?", (task["id"],))
-    state.x("UPDATE message SET delivered=1 WHERE task_id=? AND recipient='owner'",
-            (task["id"],))
-    fields = {"status": "queued", "attempts": 0,
-              "result": args.reason or "requeued by the owner"}
-    if args.budget:
-        fields["budget_turns"] = args.budget
-    state.set_task(task["id"], **fields)
-    print(f"{task['id']} queued again" + (" from a fresh branch" if args.fresh else "")
-          + (f", budget {args.budget} turns" if args.budget else ""))
+    print(f"{result['task_id']} queued again"
+          + (" from a fresh branch" if result["fresh"] else "")
+          + (f", budget {result['budget']} turns" if result["budget"] else ""))
     return 0
 
 
 def cmd_proposals(args) -> int:
     _, state = _open(args)
-    rows = state.q("SELECT * FROM proposal ORDER BY id")
+    rows = operations.proposals(state)
     for row in rows:
         print(f"{row['id']} {row['project_id']} {row['status']} "
-              f"tasks={len(json.loads(row['spec']))} "
+              f"tasks={len(row['spec'])} "
               f"source={row['source']} {row['rationale']}")
         print(f"  inspect: nc proposal {row['id']}")
-        for finding in json.loads(row["findings"]):
+        for finding in row["findings"]:
             print(f"  finding: {finding}")
     if not rows:
         print("(no proposals)")
@@ -121,29 +104,11 @@ def cmd_proposals(args) -> int:
 
 def cmd_proposal(args) -> int:
     _, state = _open(args)
-    row = state.one("SELECT * FROM proposal WHERE id=?", (args.proposal_id,))
-    if row is None:
-        print(f"unknown proposal: {args.proposal_id}", file=sys.stderr)
+    try:
+        detail = operations.proposal_detail(state, args.proposal_id)
+    except LookupError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
-    detail = dict(row)
-    detail["spec"] = json.loads(detail["spec"])
-    detail["findings"] = json.loads(detail["findings"])
-    review = state.one(
-        "SELECT status, findings, recommendation FROM plan_review"
-        " WHERE proposal_id=? AND spec=?", (row["id"], row["spec"]),
-    )
-    detail["revisions"] = [
-        {**dict(r), "feedback": json.loads(r["feedback"])}
-        for r in state.q(
-            "SELECT r.*, m.payload AS feedback FROM proposal_revision r"
-            " JOIN message m ON m.id=r.feedback_id"
-            " WHERE r.original_id=? OR r.replacement_id=? ORDER BY r.original_id",
-            (row["id"], row["id"]),
-        )
-    ]
-    detail["plan_review"] = dict(review) if review else None
-    if review:
-        detail["plan_review"]["findings"] = json.loads(review["findings"])
     print(json.dumps(detail, indent=2, ensure_ascii=False))
     return 0
 
@@ -152,16 +117,15 @@ def cmd_decide_proposal(args) -> int:
     _, state = _open(args)
     try:
         if args.cmd == "approve":
-            ids = state.approve_proposal(args.proposal_id, force=args.force)
-            row = state.one("SELECT findings FROM proposal WHERE id=?", (args.proposal_id,))
-            for finding in json.loads(row["findings"]):
+            result = operations.approve_proposal(state, args.proposal_id, force=args.force)
+            for finding in result["overridden_findings"]:
                 print(f"overriding finding: {finding}", file=sys.stderr)
-            for task_id in ids:
+            for task_id in result["task_ids"]:
                 print(task_id)
         else:
-            state.reject_proposal(args.proposal_id, args.reason)
+            operations.reject_proposal(state, args.proposal_id, args.reason)
             print(f"rejected proposal {args.proposal_id}")
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, LookupError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     return 0
@@ -169,15 +133,8 @@ def cmd_decide_proposal(args) -> int:
 
 def cmd_tasks(args) -> int:
     _, state = _open(args)
-    sql = "SELECT * FROM task WHERE 1=1"
-    params: tuple = ()
-    if args.project:
-        sql += " AND project_id=?"
-        params = (args.project,)
-    if not args.all:
-        sql += " AND status != 'cancelled'"
-    for row in state.q(sql + " ORDER BY priority, created_at", params):
-        unmet = state.unmet_dependencies(row["id"])
+    for row in operations.tasks(state, args.project, args.all):
+        unmet = row["unmet_dependencies"]
         waiting = f" waits-for={','.join(unmet)}" if unmet else ""
         print(f"{row['id']:<20} {row['status']:<12} att={row['attempts']} "
               f"{row['title'][:60]}{waiting}")
@@ -186,32 +143,29 @@ def cmd_tasks(args) -> int:
 
 def cmd_why(args) -> int:
     cfg, state = _open(args)
-    task = state.one("SELECT * FROM task WHERE id=?", (args.task_id,))
-    if task is None:
-        print(f"unknown task: {args.task_id}", file=sys.stderr)
+    try:
+        task = operations.task_detail(state, cfg, args.task_id)
+    except LookupError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
     print(f"{task['id']}: {task['title']}\nstatus: {task['status']}")
-    depends_on = json.loads(task["depends_on"] or "[]")
+    depends_on = task["depends_on"]
     if depends_on:
-        unmet = state.unmet_dependencies(task["id"])
+        unmet = task["unmet_dependencies"]
         print(f"depends on: {', '.join(depends_on)}"
               + (f" (waiting for {', '.join(unmet)})" if unmet else " (all accepted)"))
-    for dep in depends_on:
-        other = state.one("SELECT status FROM task WHERE id=?", (dep,))
-        if other is not None and other["status"] == "cancelled":
-            print(f"  {dep}: cancelled; dependency remains unmet (inspect with nc why {dep})")
+    for dep in task["cancelled_dependencies"]:
+        print(f"  {dep}: cancelled; dependency remains unmet (inspect with nc why {dep})")
     print(f"\nobjective:\n{task['objective']}")
     print("\nacceptance criteria:")
-    criteria = json.loads(task["acceptance"])
-    for criterion in criteria:
+    for criterion in task["acceptance"]:
         print(f"  - {criterion}")
-    if not criteria:
+    if not task["acceptance"]:
         print("  (none)")
 
     print("\nruns:")
-    runs = state.q("SELECT * FROM run WHERE task_id=? ORDER BY started_at, id", (task["id"],))
     now = time.time()
-    for run in runs:
+    for run in task["runs"]:
         end = run["ended_at"] if run["ended_at"] is not None else now
         duration = f"{end - run['started_at']:.1f}s"
         if run["ended_at"] is None:
@@ -219,25 +173,21 @@ def cmd_why(args) -> int:
         print(f"  #{run['id']} agent={run['agent_id']} role={run['role']} "
               f"outcome={run['outcome'] or 'running'} duration={duration} "
               f"log={run['log_path'] or '(none)'}")
-    if not runs:
+    if not task["runs"]:
         print("  (none)")
 
     print("\nmessages:")
-    messages = state.q("SELECT * FROM message WHERE task_id=? ORDER BY id", (task["id"],))
-    for message in messages:
+    for message in task["messages"]:
         print(f"  #{message['id']} [{message['kind']}] "
               f"{message['sender']} -> {message['recipient']}: {message['payload']}")
-    if not messages:
+    if not task["messages"]:
         print("  (none)")
 
-    check_path = cfg.home / "checks" / f"{task['id']}.txt"
-    print(f"\nacceptance check output ({check_path}):")
-    try:
-        output = check_path.read_text()
-    except FileNotFoundError:
+    print(f"\nacceptance check output ({task['check_path']}):")
+    if task["check_output"] is None:
         print("  (no stored check output)")
     else:
-        print(output, end="" if output.endswith("\n") else "\n")
+        print(task["check_output"], end="" if task["check_output"].endswith("\n") else "\n")
     return 0
 
 
@@ -312,12 +262,11 @@ def cmd_gc(args) -> int:
 
 def cmd_inbox(args) -> int:
     _, state = _open(args)
-    rows = state.inbox("owner", undelivered_only=not args.all)
+    rows = operations.inbox(state, args.all)
     for row in rows:
-        payload = json.loads(row["payload"])
-        text = payload.get("question") or payload.get("reason") or json.dumps(payload)
         print(f"#{row['id']} [{row['kind']}] from {row['sender']} "
-              f"({row['task_id'] or '-'}, {_age(row['created_at'])} ago)\n    {text}\n")
+              f"({row['task_id'] or '-'}, {operations.age(row['created_at'])} ago)"
+              f"\n    {row['text']}\n")
     if not rows:
         print("(no pending messages)")
     return 0
@@ -325,34 +274,15 @@ def cmd_inbox(args) -> int:
 
 def cmd_answer(args) -> int:
     _, state = _open(args)
-    with state.db:
-        state.db.execute("BEGIN IMMEDIATE")
-        question = state.one("SELECT * FROM message WHERE id=?", (args.message_id,))
-        if question is None:
-            print(f"no message #{args.message_id}", file=sys.stderr)
-            return 1
-        if state.one(
-            "SELECT 1 FROM task WHERE status='cancelled' AND"
-            " (id=? OR id=(SELECT task_id FROM agent WHERE id=?))",
-            (question["task_id"], question["sender"]),
-        ):
-            print("task is cancelled; use nc requeue explicitly to restore it", file=sys.stderr)
-            return 1
-        agent_id = question["sender"]
-        now = time.time()
-        state.db.execute(
-            "INSERT INTO message(kind,sender,recipient,payload,task_id,in_reply_to,created_at)"
-            " VALUES(?,'owner',?,?,?,?,?)",
-            (protocol.ANSWER, agent_id, json.dumps({"answer": args.text}),
-             question["task_id"], question["id"], now),
-        )
-        state.db.execute("UPDATE message SET delivered=1 WHERE id=?", (question["id"],))
-        state.db.execute("UPDATE agent SET state='runnable', updated_at=? WHERE id=?",
-                         (now, agent_id))
-        if question["task_id"]:
-            state.db.execute("UPDATE task SET status='in_progress', updated_at=? WHERE id=?",
-                             (now, question["task_id"]))
-    print(f"answered {agent_id}; it is runnable again")
+    try:
+        result = operations.answer_message(state, args.message_id, args.text)
+    except LookupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"answered {result['agent_id']}; it is runnable again")
     return 0
 
 
@@ -360,11 +290,11 @@ def cmd_feedback(args) -> int:
     cfg, state = _open(args)
     text = args.text if args.cmd == "feedback" else (args.note or "Request a planning pass.")
     try:
-        agent_id, message_id = state.planner_feedback(
-            args.project, text, cfg.model_for("planner"), getattr(args, "task", None),
+        agent_id, message_id = operations.submit_feedback(
+            state, cfg, args.project, text, getattr(args, "task", None),
             getattr(args, "proposal", None),
         )
-    except ValueError as exc:
+    except (ValueError, LookupError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"queued feedback #{message_id} for {agent_id}; planner is runnable")
@@ -437,19 +367,13 @@ def cmd_run(args) -> int:
 
 def cmd_rollback(args) -> int:
     _, state = _open(args)
-    task = state.one("SELECT * FROM task WHERE id=?", (args.task_id,))
-    if task is None or not task["merge_commit"]:
-        print(f"{args.task_id} has no recorded merge commit", file=sys.stderr)
+    try:
+        result = operations.rollback_task(state, args.task_id)
+    except LookupError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
-    project = state.one("SELECT * FROM project WHERE id=?", (task["project_id"],))
-    repo = Path(project["repo_path"])
-    commit = arbiter.revert(repo, task["merge_commit"])
-    error = arbiter.mirror(repo, project["mirror"])
-    state.set_task(args.task_id, status="blocked",
-                   result=f"reverted by the owner in {commit}")
-    state.incident("rollback", f"{args.task_id} reverted in {commit}")
-    print(f"reverted {task['merge_commit']} in {commit}"
-          + (f"; mirror push failed: {error}" if error else ""))
+    print(f"reverted {result['reverted_commit']} in {result['commit']}"
+          + (f"; mirror push failed: {result['mirror_error']}" if result["mirror_error"] else ""))
     return 0
 
 
@@ -513,11 +437,22 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_ui(args) -> int:
+    from .ui import serve
+    serve(Config.load(args.home), args.port)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="nc", description="Neocortex multi-agent runner")
     p.add_argument("--home", type=Path, default=None, help="state directory (default $NC_HOME)")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("ui", help="serve the local owner browser interface")
+    sp.add_argument("--home", type=Path, default=argparse.SUPPRESS)
+    sp.add_argument("--port", type=int, default=8765)
+    sp.set_defaults(func=cmd_ui)
 
     sub.add_parser("init").set_defaults(func=cmd_init)
 

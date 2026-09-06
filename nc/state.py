@@ -122,6 +122,17 @@ class State:
                 reason TEXT
             )
         """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS plan_review (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id INTEGER NOT NULL REFERENCES proposal(id),
+                spec TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                findings TEXT NOT NULL DEFAULT '[]',
+                recommendation TEXT NOT NULL DEFAULT '',
+                UNIQUE(proposal_id, spec)
+            )
+        """)
         for table, column, decl in (
             ("proposal", "findings", "TEXT NOT NULL DEFAULT '[]'"),
             ("project", "mirror", "TEXT"),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -202,4 +203,66 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
     state.mark_delivered(inbox_ids)
     state.set_agent(agent["id"], turns=agent["turns"] + 1,
                     memo=outcome.memo or agent["memo"])
+    return outcome
+
+
+def build_plan_critic_brief(state: State, proposal: sqlite3.Row,
+                            outcome_path: Path) -> str:
+    project = state.one("SELECT * FROM project WHERE id=?", (proposal["project_id"],))
+    repo = Path(project["repo_path"])
+    # Explicit field selection keeps planner rationale, memos and messages out.
+    tasks = [dict(row) for row in state.q(
+        "SELECT id, title, objective, acceptance, boundaries, depends_on, status"
+        " FROM task WHERE project_id=? ORDER BY id", (project["id"],),
+    )]
+    return roles.render(
+        roles.PLAN_CRITIC, repo=str(repo), head=arbiter.git(repo, "rev-parse", "HEAD"),
+        status=arbiter.git(repo, "status", "--short"), layout=arbiter.git(repo, "ls-files"),
+        spec=proposal["spec"], tasks=json.dumps(tasks), outcome_path=str(outcome_path),
+    )
+
+
+def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
+                         adapter: Adapter) -> protocol.Outcome:
+    # Claim before starting: even a crash or invalid output consumes this attempt.
+    claim = state.x(
+        "INSERT OR IGNORE INTO plan_review(proposal_id,spec) VALUES(?,?)",
+        (proposal["id"], proposal["spec"]),
+    )
+    if not claim.rowcount:
+        return protocol.Outcome(kind=protocol.DONE, summary="Already reviewed")
+    review_id = claim.lastrowid
+    agent_id = f"plan-critic-{review_id}"
+    model = cfg.model_for("plan_critic")
+    state.add_agent(agent_id, "plan_critic", proposal["project_id"], None, model)
+    run_dir = cfg.runs_dir / f"{agent_id}_{time.time_ns()}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "session.log"
+    run_id = state.start_run(agent_id, None, "plan_critic", model, str(log_path))
+    tokens = None
+    try:
+        outcome_path = run_dir / "outcome.json"
+        brief = build_plan_critic_brief(state, proposal, outcome_path)
+        (run_dir / "brief.md").write_text(brief)
+        # No unrestricted fallback: this role requires the restricted adapter path.
+        result = adapter.run_planner(brief, run_dir, model, log_path, cfg.turn_timeout_s)
+        tokens = result.tokens
+        outcome = protocol.read_outcome(outcome_path)
+        recommendation = outcome.raw.get("recommendation")
+        if outcome.kind != protocol.DONE or not isinstance(recommendation, str):
+            raise ValueError("plan critic requires DONE with a recommendation")
+        findings = outcome.raw.get("findings")
+        if not isinstance(findings, list) or any(not isinstance(f, str) for f in findings):
+            raise ValueError("plan critic requires a list of findings")
+        state.x(
+            "UPDATE plan_review SET status='done', findings=?, recommendation=? WHERE id=?",
+            (json.dumps(findings), recommendation, review_id),
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Plan review %s failed", review_id)
+        outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Plan review unavailable: {exc}")
+        state.x("UPDATE plan_review SET status='failed', recommendation=? WHERE id=?",
+                (outcome.summary, review_id))
+    state.end_run(run_id, outcome.kind, outcome.summary, tokens)
+    state.set_agent(agent_id, state="done", turns=1)
     return outcome

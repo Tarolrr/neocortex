@@ -107,6 +107,18 @@ class Scheduler:
     # --- one turn ---------------------------------------------------------
     def step(self) -> str:
         agent = self.pick()
+        if agent is None or agent["role"] == "planner":
+            proposal = self.state.one(
+                "SELECT p.* FROM proposal p WHERE p.status='pending'"
+                " AND NOT EXISTS (SELECT 1 FROM plan_review r"
+                " WHERE r.proposal_id=p.id AND r.spec=p.spec) ORDER BY p.id LIMIT 1"
+            )
+            if proposal:
+                outcome = turn.run_plan_critic_turn(
+                    self.state, self.cfg, proposal, self._adapter_for("plan_critic"),
+                )
+                # Advisory failures must not trip the workers' circuit breaker.
+                return outcome.kind
         if agent is None:
             return "idle"
 

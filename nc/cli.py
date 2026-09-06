@@ -115,6 +115,13 @@ def cmd_proposal(args) -> int:
     detail = dict(row)
     detail["spec"] = json.loads(detail["spec"])
     detail["findings"] = json.loads(detail["findings"])
+    review = state.one(
+        "SELECT status, findings, recommendation FROM plan_review"
+        " WHERE proposal_id=? AND spec=?", (row["id"], row["spec"]),
+    )
+    detail["plan_review"] = dict(review) if review else None
+    if review:
+        detail["plan_review"]["findings"] = json.loads(review["findings"])
     print(json.dumps(detail, indent=2, ensure_ascii=False))
     return 0
 

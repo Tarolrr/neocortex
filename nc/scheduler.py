@@ -82,10 +82,17 @@ class Scheduler:
             " WHERE a.state='runnable' ORDER BY t.priority, t.created_at LIMIT 1"
         )
 
+    def next_ready_task(self) -> sqlite3.Row | None:
+        """A task is ready once every task it depends on has been accepted."""
+        for task in self.state.q(
+            "SELECT * FROM task WHERE status='queued' ORDER BY priority, created_at"
+        ):
+            if not self.state.unmet_dependencies(task["id"]):
+                return task
+        return None
+
     def spawn_for_queued_task(self) -> str | None:
-        task = self.state.one(
-            "SELECT * FROM task WHERE status='queued' ORDER BY priority, created_at LIMIT 1"
-        )
+        task = self.next_ready_task()
         if not task:
             return None
         agent_id = f"worker-{task['id']}"
@@ -180,7 +187,10 @@ class Scheduler:
             self._rework(agent, task, [r.render() for r in failed])
             return
 
-        critic_id = f"critic-{task['id']}-{task['attempts'] + 1}"
+        reviews = self.state.one(
+            "SELECT COUNT(*) AS c FROM agent WHERE task_id=? AND role='critic'", (task["id"],)
+        )["c"]
+        critic_id = f"critic-{task['id']}-{reviews + 1}"
         self.state.add_agent(critic_id, "critic", project["id"], task["id"],
                              self.cfg.model_for("critic"))
         self.state.set_agent(agent["id"], state="blocked")

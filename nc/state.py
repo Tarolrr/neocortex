@@ -123,6 +123,7 @@ class State:
         for table, column, decl in (
             ("project", "mirror", "TEXT"),
             ("task", "merge_commit", "TEXT"),
+            ("task", "depends_on", "TEXT NOT NULL DEFAULT '[]'"),
         ):
             known = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             if column not in known:
@@ -167,23 +168,38 @@ class State:
 
     def add_task(self, project_id: str, title: str, objective: str,
                  acceptance: list[str], boundaries: list[str] | None = None,
-                 priority: int = 100, budget_turns: int = 6) -> str:
+                 priority: int = 100, budget_turns: int = 6,
+                 depends_on: list[str] | None = None) -> str:
         with self.db:
             return self._add_task(project_id, title, objective, acceptance, boundaries,
-                                  priority, budget_turns)
+                                  priority, budget_turns, depends_on)
 
     def _add_task(self, project_id: str, title: str, objective: str,
                   acceptance: list[str], boundaries: list[str] | None = None,
-                  priority: int = 100, budget_turns: int = 6) -> str:
+                  priority: int = 100, budget_turns: int = 6,
+                  depends_on: list[str] | None = None) -> str:
         tid = self._next_task_id(project_id)
         now = time.time()
         self.db.execute(
             "INSERT INTO task(id,project_id,title,objective,acceptance,boundaries,status,priority,"
-            "budget_turns,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued',?,?,?,?)",
+            "budget_turns,depends_on,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued',?,?,?,?,?)",
             (tid, project_id, title, objective, json.dumps(acceptance),
-             json.dumps(boundaries or []), priority, budget_turns, now, now),
+             json.dumps(boundaries or []), priority, budget_turns,
+             json.dumps(depends_on or []), now, now),
         )
         return tid
+
+    def unmet_dependencies(self, task_id: str) -> list[str]:
+        """Dependencies that are not accepted yet; a missing one never becomes met."""
+        row = self.one("SELECT depends_on FROM task WHERE id=?", (task_id,))
+        if row is None:
+            return []
+        unmet = []
+        for dep in json.loads(row["depends_on"] or "[]"):
+            other = self.one("SELECT status FROM task WHERE id=?", (dep,))
+            if other is None or other["status"] != "done":
+                unmet.append(dep)
+        return unmet
 
     def add_task_spec(self, spec: dict) -> str:
         """Use the same task fields for file imports and proposal approvals."""
@@ -193,7 +209,8 @@ class State:
     def _add_task_spec(self, spec: dict) -> str:
         return self._add_task(spec["project"], spec["title"], spec["objective"],
                               spec["acceptance"], spec.get("boundaries"),
-                              spec.get("priority", 100), spec.get("budget_turns", 6))
+                              spec.get("priority", 100), spec.get("budget_turns", 6),
+                              spec.get("depends_on"))
 
     # --- proposals -------------------------------------------------------
     def add_proposal(self, project_id: str, source: str, rationale: str,

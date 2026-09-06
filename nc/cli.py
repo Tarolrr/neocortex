@@ -57,8 +57,35 @@ def cmd_task(args) -> int:
             print(state.add_task_spec(spec))
         return 0
     tid = state.add_task(args.project, args.title, args.objective, acceptance,
-                         args.boundary or [], args.priority, args.budget)
+                         args.boundary or [], args.priority, args.budget,
+                         args.after or [])
     print(tid)
+    return 0
+
+
+def cmd_requeue(args) -> int:
+    """Put a task back in the queue, optionally from a clean branch off the base."""
+    cfg, state = _open(args)
+    task = state.one("SELECT * FROM task WHERE id=?", (args.task_id,))
+    if task is None:
+        print(f"unknown task: {args.task_id}", file=sys.stderr)
+        return 1
+    if task["status"] == "done":
+        print(f"{args.task_id} is already accepted; use rollback instead", file=sys.stderr)
+        return 1
+    project = state.one("SELECT * FROM project WHERE id=?", (task["project_id"],))
+    repo = Path(project["repo_path"])
+    if args.fresh:
+        arbiter.remove_worktree(repo, cfg.work_dir / task["id"])
+        arbiter.git(repo, "worktree", "prune", check=False)
+        arbiter.git(repo, "branch", "-D", f"nc/{task['id']}", check=False)
+    # Agents keep their history but restart with a fresh turn budget.
+    state.x("UPDATE agent SET state='blocked', turns=0 WHERE task_id=?", (task["id"],))
+    state.x("UPDATE message SET delivered=1 WHERE task_id=? AND recipient='owner'",
+            (task["id"],))
+    state.set_task(task["id"], status="queued", attempts=0,
+                   result=args.reason or "requeued by the owner")
+    print(f"{task['id']} queued again" + (" from a fresh branch" if args.fresh else ""))
     return 0
 
 
@@ -108,8 +135,10 @@ def cmd_tasks(args) -> int:
         sql += " WHERE project_id=?"
         params = (args.project,)
     for row in state.q(sql + " ORDER BY priority, created_at", params):
+        unmet = state.unmet_dependencies(row["id"])
+        waiting = f" waits-for={','.join(unmet)}" if unmet else ""
         print(f"{row['id']:<20} {row['status']:<12} att={row['attempts']} "
-              f"{row['title'][:60]}")
+              f"{row['title'][:60]}{waiting}")
     return 0
 
 
@@ -120,6 +149,11 @@ def cmd_why(args) -> int:
         print(f"unknown task: {args.task_id}", file=sys.stderr)
         return 1
     print(f"{task['id']}: {task['title']}\nstatus: {task['status']}")
+    depends_on = json.loads(task["depends_on"] or "[]")
+    if depends_on:
+        unmet = state.unmet_dependencies(task["id"])
+        print(f"depends on: {', '.join(depends_on)}"
+              + (f" (waiting for {', '.join(unmet)})" if unmet else " (all accepted)"))
     print("\nacceptance criteria:")
     criteria = json.loads(task["acceptance"])
     for criterion in criteria:
@@ -386,7 +420,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--boundary", action="append")
     sp.add_argument("--priority", type=int, default=100)
     sp.add_argument("--budget", type=int, default=6)
+    sp.add_argument("--after", action="append",
+                    help="task id that must be accepted first; repeatable")
     sp.set_defaults(func=cmd_task)
+
+    sp = sub.add_parser("requeue", help="put a blocked or failed task back in the queue")
+    sp.add_argument("task_id")
+    sp.add_argument("--fresh", action="store_true",
+                    help="discard its branch and worktree and start from the base branch")
+    sp.add_argument("--reason")
+    sp.set_defaults(func=cmd_requeue)
 
     sub.add_parser("proposals", help="list proposals and their decisions").set_defaults(
         func=cmd_proposals,

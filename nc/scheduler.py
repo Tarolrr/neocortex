@@ -16,6 +16,7 @@ from pathlib import Path
 from . import arbiter, protocol, turn
 from .adapters import Adapter, get_adapter
 from .config import Config
+from .lifecycle import LifecycleBusy, lifecycle_lock
 from .state import State
 
 log = logging.getLogger("nc.scheduler")
@@ -144,6 +145,13 @@ class Scheduler:
 
     # --- one turn ---------------------------------------------------------
     def step(self) -> str:
+        try:
+            with lifecycle_lock(self.state):
+                return self._step_locked()
+        except LifecycleBusy:
+            return "idle"
+
+    def _step_locked(self) -> str:
         agent = self.pick()
         if agent is None or agent["role"] == "planner":
             proposal = self.state.one(

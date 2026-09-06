@@ -68,7 +68,7 @@ def ensure_worktree(repo: Path, work_root: Path, task_id: str) -> tuple[Path, st
 
 def remove_worktree(repo: Path, path: Path) -> None:
     if path.exists():
-        git(repo, "worktree", "remove", "--force", str(path), check=False)
+        git(repo, "worktree", "remove", "--force", str(path))
 
 
 def has_commits(repo: Path, worktree: Path, branch: str) -> bool:

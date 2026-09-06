@@ -743,6 +743,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._end(_error_page(HTTPStatus.NOT_FOUND, str(exc)))
         except sqlite3.OperationalError as exc:
             self._contention(exc)
+        except RuntimeError as exc:
+            self.send_response(HTTPStatus.CONFLICT)
+            self._end(_error_page(HTTPStatus.CONFLICT, str(exc)))
         except ValueError as exc:
             self.send_response(HTTPStatus.BAD_REQUEST)
             self._end(_error_page(HTTPStatus.BAD_REQUEST, str(exc)))

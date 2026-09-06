@@ -19,10 +19,10 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any
 
 from . import arbiter
 from .config import Config
+from .lifecycle import lifecycle_lock
 from .state import State
 
 
@@ -136,46 +136,57 @@ def task_detail(state: State, cfg: Config, task_id: str) -> dict:
 
 
 def cancel_task(state: State, task_id: str, reason: str) -> bool:
-    return state.cancel_task(task_id, reason)
+    with lifecycle_lock(state):
+        return state.cancel_task(task_id, reason)
 
 
 def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
                  budget: int | None = None, reason: str | None = None) -> dict:
     """Put a task back in the queue, optionally discarding its branch and worktree."""
-    task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
-    if task is None:
-        raise LookupError(f"unknown task: {task_id}")
-    if task["status"] == "done":
-        raise ValueError(f"{task_id} is already accepted; use rollback instead")
-    project = get_project(state, task["project_id"])
-    repo = Path(project["repo_path"])
-    if fresh:
-        arbiter.remove_worktree(repo, cfg.work_dir / task["id"])
-        arbiter.git(repo, "worktree", "prune", check=False)
-        arbiter.git(repo, "branch", "-D", f"nc/{task['id']}", check=False)
-    # Agents keep their history but restart with a fresh turn budget.
-    state.x("UPDATE agent SET state='blocked', turns=0 WHERE task_id=?", (task["id"],))
-    state.x("UPDATE message SET delivered=1 WHERE task_id=? AND recipient='owner'", (task["id"],))
-    fields: dict[str, Any] = {"status": "queued", "attempts": 0,
-                              "result": reason or "requeued by the owner"}
-    if budget:
-        fields["budget_turns"] = budget
-    state.set_task(task["id"], **fields)
-    return {"task_id": task_id, "fresh": fresh, "budget": budget}
+    with lifecycle_lock(state):
+        task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+        if task is None:
+            raise LookupError(f"unknown task: {task_id}")
+        if task["status"] == "done":
+            raise ValueError(f"{task_id} is already accepted; use rollback instead")
+        if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
+            raise ValueError("An active run must finish before changing task lifecycle")
+        project = get_project(state, task["project_id"])
+        repo = Path(project["repo_path"])
+        if fresh:
+            arbiter.remove_worktree(repo, cfg.work_dir / task["id"])
+            arbiter.git(repo, "worktree", "prune")
+            branch = f"nc/{task['id']}"
+            if arbiter.git(repo, "branch", "--list", branch):
+                arbiter.git(repo, "branch", "-D", branch)
+        with state.db:
+            state.db.execute("BEGIN IMMEDIATE")
+            state.db.execute("UPDATE agent SET state='blocked', turns=0 WHERE task_id=?", (task_id,))
+            state.db.execute("UPDATE message SET delivered=1 WHERE task_id=? AND recipient='owner'",
+                             (task_id,))
+            state.db.execute(
+                "UPDATE task SET status='queued', attempts=0, result=?, budget_turns=?, updated_at=?"
+                " WHERE id=?", (reason or "requeued by the owner", budget or task["budget_turns"],
+                                 time.time(), task_id),
+            )
+        return {"task_id": task_id, "fresh": fresh, "budget": budget}
 
 
 def rollback_task(state: State, task_id: str) -> dict:
-    task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
-    if task is None or not task["merge_commit"]:
-        raise LookupError(f"{task_id} has no recorded merge commit")
-    project = get_project(state, task["project_id"])
-    repo = Path(project["repo_path"])
-    commit = arbiter.revert(repo, task["merge_commit"])
-    mirror_error = arbiter.mirror(repo, project["mirror"])
-    state.set_task(task_id, status="blocked", result=f"reverted by the owner in {commit}")
-    state.incident("rollback", f"{task_id} reverted in {commit}")
-    return {"task_id": task_id, "reverted_commit": task["merge_commit"], "commit": commit,
-            "mirror_error": mirror_error}
+    with lifecycle_lock(state):
+        task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+        if task is None or not task["merge_commit"]:
+            raise LookupError(f"{task_id} has no recorded merge commit")
+        if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
+            raise ValueError("An active run must finish before changing task lifecycle")
+        project = get_project(state, task["project_id"])
+        repo = Path(project["repo_path"])
+        commit = arbiter.revert(repo, task["merge_commit"])
+        mirror_error = arbiter.mirror(repo, project["mirror"])
+        state.set_task(task_id, status="blocked", result=f"reverted by the owner in {commit}")
+        state.incident("rollback", f"{task_id} reverted in {commit}")
+        return {"task_id": task_id, "reverted_commit": task["merge_commit"], "commit": commit,
+                "mirror_error": mirror_error}
 
 
 # --- proposals ----------------------------------------------------------

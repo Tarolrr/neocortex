@@ -139,3 +139,66 @@ def test_import_valid_batch(browser):
     assert status == 303, body
     assert [r["title"] for r in state.q("SELECT title FROM task ORDER BY id")][-2:] == [
         "first", "second"]
+
+
+def test_lifecycle_busy_rejects_mutations_without_writes(browser):
+    from nc import operations
+    from nc.lifecycle import LifecycleBusy, lifecycle_lock
+    from nc.scheduler import Scheduler
+
+    cfg, state, tid, server, request = browser
+    _, headers, body = request(f"/t/{tid}")
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    before = list(state.db.iterdump())
+    with lifecycle_lock(state):
+        for operation in (
+            lambda: operations.cancel_task(state, tid, "cancel"),
+            lambda: operations.requeue_task(cfg, state, tid, fresh=True),
+            lambda: operations.rollback_task(state, tid),
+        ):
+            with pytest.raises(LifecycleBusy):
+                operation()
+        assert Scheduler(cfg, state).step() == "idle"
+        status, response_headers, body = request(f"/t/{tid}/cancel", "POST",
+                                  {"csrf_token": token, "reason": "cancel"},
+                                  {"Cookie": headers["Set-Cookie"].split(";")[0],
+                                   "Origin": f"http://127.0.0.1:{server.server_port}"})
+        assert status == 303
+        assert "retry after" in request(response_headers["Location"])[2]
+    assert list(state.db.iterdump()) == before
+
+
+def test_fresh_cleanup_failure_preserves_database(browser, monkeypatch):
+    from nc import arbiter, operations
+
+    cfg, state, tid, _, _ = browser
+    before = list(state.db.iterdump())
+
+    def fail(*args):
+        raise RuntimeError("worktree removal failed")
+
+    monkeypatch.setattr(arbiter, "remove_worktree", fail)
+    with pytest.raises(RuntimeError, match="worktree removal failed"):
+        operations.requeue_task(cfg, state, tid, fresh=True)
+    assert list(state.db.iterdump()) == before
+
+
+def test_scheduler_lock_covers_selection_and_outcome(browser, monkeypatch):
+    from nc import operations
+    from nc.lifecycle import LifecycleBusy
+    from nc.scheduler import Scheduler
+
+    cfg, state, tid, _, _ = browser
+    scheduler = Scheduler(cfg, state)
+
+    def step():
+        # No run record exists yet (or it has already ended): still protected.
+        assert not state.one("SELECT 1 FROM run WHERE ended_at IS NULL")
+        with pytest.raises(LifecycleBusy):
+            operations.requeue_task(cfg, state, tid)
+        return "idle"
+
+    monkeypatch.setattr(scheduler, "_step_locked", step)
+    assert scheduler.step() == "idle"
+    operations.requeue_task(cfg, state, tid, budget=10)
+    assert state.one("SELECT budget_turns FROM task WHERE id=?", (tid,))[0] == 10

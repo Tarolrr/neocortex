@@ -47,3 +47,10 @@ and fresh/requeue/rollback correctness belong to **ui-tasks in this batch**.
 They are not covered by the scheduler-administration deferral. See the repository
 [follow-up record](follow-ups.md) for deferred scope; that record must not be used
 to defer failures of current acceptance criteria.
+
+Task lifecycle changes take a nonblocking home-local lock shared with scheduler
+turns. A turn owns this lock from selection through worktree preparation and
+outcome integration; cancel, requeue and rollback report a retry message while
+it is busy. This deliberately serializes lifecycle changes across projects on
+this single-worker host without holding a SQLite transaction during agent work.
+Fresh requeue checks Git cleanup before resetting task and agent state.

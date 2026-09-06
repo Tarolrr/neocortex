@@ -196,6 +196,7 @@ preserve every message and reuse the planner, including after it has stopped.
 New planners use `models.planner`, falling back to the first configured model.
 Neither command starts a session: execution belongs to the timer/scheduler.
 The scheduler can pick project planners without a task. For now their turn is a
-placeholder that records `YIELD` without a model session and leaves them runnable;
-the planning prompt and proposal handling are separate features. Feedback remains
+placeholder that records `YIELD` without a model session, then blocks the agent
+until another `feedback` or `plan` request wakes it. This prevents repeated turns
+on the same note. The planning prompt and proposal handling are separate features. Feedback remains
 pending through placeholder turns and stays visible in `status` until delivered.

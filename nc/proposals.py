@@ -3,7 +3,7 @@
 import re
 
 # Recognize path-only scope fences, including 'Do not modify src/foo.py'.
-_PATH = re.compile(r"(?:[\w.@~-]+[/\\])+[\w.*@/\\~-]*|\b[\w-]+\.[a-zA-Z0-9]+\b")
+_PATH = re.compile(r"[/\\]*(?:[\w.@~-]+[/\\])+[\w.*@/\\~-]*|\b[\w-]+\.[a-zA-Z0-9]+\b")
 _FENCE = re.compile(
     r"^(?:(?:do not|don't|never)\s+(?:change|modify|edit|touch|delete|remove)\s+"
     r"|(?:only|files?|directories|directory|scope)\s*:?\s*)?"

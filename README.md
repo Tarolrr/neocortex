@@ -246,5 +246,7 @@ runnable. `plan` without a note stores "Request a planning pass." Repeated calls
 preserve every message and reuse the planner, including after it has stopped.
 New planners use `models.planner`, falling back to the first configured model.
 Neither command starts a session: execution belongs to the timer/scheduler.
-Planner turn execution is a separate feature; these commands provide its durable
-inputs. Feedback stays visible in `status` until marked delivered.
+The scheduler can pick project planners without a task. For now their turn is a
+placeholder that records `YIELD` without a model session and leaves them runnable;
+the planning prompt and proposal handling are separate features. Feedback remains
+pending through placeholder turns and stays visible in `status` until delivered.

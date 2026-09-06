@@ -138,6 +138,8 @@ class State:
             ("project", "mirror", "TEXT"),
             ("project", "planner_last_ran_at", "REAL"),
             ("project", "planner_skip_reason", "TEXT"),
+            ("incident", "resolved_at", "REAL"),
+            ("incident", "resolution_note", "TEXT"),
             ("task", "merge_commit", "TEXT"),
             ("task", "depends_on", "TEXT NOT NULL DEFAULT '[]'"),
         ):
@@ -446,3 +448,22 @@ class State:
 
     def open_incidents(self) -> list[sqlite3.Row]:
         return self.q("SELECT * FROM incident WHERE resolved=0 ORDER BY id")
+
+    def resolve_incident(self, incident_id: int, reason: str) -> bool:
+        """Acknowledge one incident, preserving its first resolution and detail."""
+        with self.db:
+            row = self.one("SELECT resolved FROM incident WHERE id=?", (incident_id,))
+            if row is None:
+                raise ValueError(f"unknown incident: {incident_id}")
+            if row["resolved"]:
+                return False
+            return bool(self.db.execute(
+                "UPDATE incident SET resolved=1, resolved_at=?, resolution_note=?"
+                " WHERE id=? AND resolved=0", (time.time(), reason, incident_id),
+            ).rowcount)
+
+    def resolve_open_incidents(self, reason: str) -> None:
+        self.x(
+            "UPDATE incident SET resolved=1, resolved_at=?, resolution_note=? WHERE resolved=0",
+            (time.time(), reason),
+        )

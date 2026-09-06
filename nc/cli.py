@@ -361,8 +361,29 @@ def cmd_feedback(args) -> int:
 
 def cmd_incidents(args) -> int:
     _, state = _open(args)
-    for row in state.open_incidents():
+    rows = state.q("SELECT * FROM incident ORDER BY id") if args.all else state.open_incidents()
+    for row in rows:
         print(f"#{row['id']} [{row['kind']}] {_age(row['created_at'])} ago: {row['detail']}")
+        if row["resolved"]:
+            timestamp = (
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(row["resolved_at"]))
+                if row["resolved_at"] is not None else "unknown"
+            )
+            print(f"  resolved at {timestamp}: {row['resolution_note'] or '(no recorded note)'}")
+    return 0
+
+
+def cmd_resolve(args) -> int:
+    if not args.reason.strip():
+        print("resolution reason must not be empty", file=sys.stderr)
+        return 1
+    _, state = _open(args)
+    try:
+        changed = state.resolve_incident(args.incident_id, args.reason)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"incident #{args.incident_id}: {'resolved' if changed else 'already resolved'}")
     return 0
 
 
@@ -433,7 +454,7 @@ def cmd_resume(args) -> int:
     if stop.exists():
         print(f"removing {stop}: {stop.read_text().strip()}")
         stop.unlink()
-    state.x("UPDATE incident SET resolved=1 WHERE resolved=0")
+    state.resolve_open_incidents("Closed by nc resume")
     if args.retry:
         for row in state.q("SELECT * FROM task WHERE status='blocked'"):
             # Selection may be stale: serialize the guarded transition and
@@ -574,7 +595,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--note")
     sp.set_defaults(func=cmd_feedback)
 
-    sub.add_parser("incidents").set_defaults(func=cmd_incidents)
+    sp = sub.add_parser("incidents", help="list open incidents")
+    sp.add_argument("--all", action="store_true", help="include closed incidents and resolution details")
+    sp.set_defaults(func=cmd_incidents)
+
+    sp = sub.add_parser("resolve", help="acknowledge only the selected incident; leave STOP unchanged",
+                        description="Close one incident without asserting repository repair or "
+                        "changing STOP, tasks, or agents.")
+    sp.add_argument("incident_id", type=int)
+    sp.add_argument("--reason", required=True, help="owner resolution note")
+    sp.set_defaults(func=cmd_resolve)
 
     sp = sub.add_parser("rollback", help="revert an accepted task")
     sp.add_argument("task_id")
@@ -584,7 +614,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("reason", nargs="?")
     sp.set_defaults(func=cmd_stop)
 
-    sp = sub.add_parser("resume", help="clear STOP and open incidents")
+    sp = sub.add_parser("resume", help="clear STOP and close all open incidents")
     sp.add_argument("--retry", action="store_true", help="also requeue blocked tasks")
     sp.set_defaults(func=cmd_resume)
 

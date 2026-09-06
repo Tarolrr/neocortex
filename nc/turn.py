@@ -104,8 +104,10 @@ def build_planner_brief(state: State, agent: sqlite3.Row,
         "SELECT * FROM task WHERE project_id=? AND status='done'"
         " ORDER BY updated_at DESC LIMIT 10", (project["id"],),
     )]
+    revision = state.pending_revision(agent["id"])
     return roles.render(
         roles.PLANNER, project_id=project["id"], repo=str(repo), layout=layout,
+        revision=json.dumps(dict(revision) if revision else None, ensure_ascii=False),
         feedback=json.dumps([dict(m) for m in messages], ensure_ascii=False),
         tasks=json.dumps(tasks, ensure_ascii=False),
         accepted=json.dumps(accepted, ensure_ascii=False),
@@ -147,6 +149,7 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
     run_dir.mkdir(parents=True, exist_ok=True)
     outcome_path = run_dir / "outcome.json"
     log_path = run_dir / "session.log"
+    revision = state.pending_revision(agent["id"])
     brief, inbox_ids = build_planner_brief(state, agent, outcome_path)
     (run_dir / "brief.md").write_text(brief)
     model = cfg.model_for("planner")
@@ -154,12 +157,21 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
     state.x("UPDATE project SET planner_last_ran_at=?, planner_skip_reason=NULL WHERE id=?",
             (time.time(), agent["project_id"]))
     run_session = getattr(adapter, "run_planner", adapter.run)
-    result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
-    outcome = protocol.read_outcome(outcome_path)
+    tokens = None
+    try:
+        result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
+        tokens = result.tokens
+        if result.exit_code != 0 or result.timed_out:
+            raise ValueError(f"session exited {result.exit_code}; timed_out={result.timed_out}")
+        outcome = protocol.read_outcome(outcome_path)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Planner session failed")
+        outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Planner session failure: {exc}")
     try:
         if outcome.kind == protocol.DONE:
             specs = _planner_specs(outcome, agent["project_id"])
-            state.add_proposal(agent["project_id"], agent["id"], outcome.summary, specs)
+            state.add_proposal(agent["project_id"], agent["id"], outcome.summary, specs,
+                               revision["original_id"] if revision else None)
         elif outcome.kind == protocol.ASK:
             if outcome.to != "owner" or not outcome.question.strip():
                 raise ValueError("planner ASK requires a question addressed to owner")
@@ -171,13 +183,14 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
         outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Planner protocol failure: {exc}")
     if outcome.kind in (protocol.DONE, protocol.ASK):
         state.mark_delivered(inbox_ids)
-    state.end_run(run_id, outcome.kind, outcome.summary, result.tokens)
+    state.end_run(run_id, outcome.kind, outcome.summary, tokens)
     # Do not erase a wake arriving while this session was running.
     state.x(
         "UPDATE agent SET turns=turns+1, memo=?,"
         " state=CASE WHEN updated_at=? THEN ? ELSE state END WHERE id=?",
         (outcome.memo or agent["memo"], agent["updated_at"],
-         "done" if outcome.kind == protocol.DONE else "blocked", agent["id"]),
+         ("runnable" if state.pending_revision(agent["id"]) else "done")
+         if outcome.kind == protocol.DONE else "blocked", agent["id"]),
     )
     return outcome
 

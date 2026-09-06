@@ -112,3 +112,30 @@ def test_concurrent_feedback_reuses_planner(project):
     assert len(set(ids)) == 1
     assert len(state.q("SELECT * FROM agent WHERE role='planner'")) == 1
     assert len(state.inbox(ids[0])) == 4
+
+
+@pytest.mark.parametrize('target', ['missing', 'mismatch', 'approved', 'rejected', 'superseded'])
+def test_invalid_proposal_feedback_is_atomic(project, target, capsys):
+    cfg, state = project
+    pid = state.add_proposal('demo', 'planner', '', [])
+    extra = []
+    if target == 'missing':
+        pid += 100
+    elif target == 'mismatch':
+        extra = ['--project', 'other']
+    else:
+        state.x('UPDATE proposal SET status=? WHERE id=?', (target, pid))
+    before = list(state.db.iterdump())
+    assert invoke(cfg, 'feedback', '--proposal', str(pid), 'Revise', *extra) == 1
+    assert list(state.db.iterdump()) == before
+    assert capsys.readouterr().err
+
+
+def test_proposal_selector_conflict(project):
+    cfg, state = project
+    before = list(state.db.iterdump())
+    with pytest.raises(SystemExit):
+        invoke(cfg, 'feedback', '--proposal', '1', '--task', 'task', 'Revise')
+    with pytest.raises(ValueError, match='mutually exclusive'):
+        state.planner_feedback(None, 'Revise', 'model', 'task', 1)
+    assert list(state.db.iterdump()) == before

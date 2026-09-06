@@ -67,20 +67,20 @@ class Scheduler:
 
     # --- scheduling -------------------------------------------------------
     def pick(self) -> sqlite3.Row | None:
-        """Critics first (they unblock finished work), then workers by task priority."""
-        row = self.state.one(
-            "SELECT a.* FROM agent a JOIN task t ON t.id = a.task_id"
+        """Critics first, then workers by task priority, then project planners."""
+        query = (
+            "SELECT a.* FROM agent a LEFT JOIN task t ON t.id = a.task_id"
             " WHERE a.state='runnable'"
-            " ORDER BY CASE a.role WHEN 'critic' THEN 0 ELSE 1 END, t.priority, t.created_at"
+            " AND (t.id IS NOT NULL OR (a.role='planner' AND a.task_id IS NULL))"
+            " ORDER BY CASE a.role WHEN 'critic' THEN 0 WHEN 'planner' THEN 2 ELSE 1 END,"
+            " t.priority, t.created_at, a.updated_at, a.id"
             " LIMIT 1"
         )
-        if row:
+        row = self.state.one(query)
+        if row and row["role"] != "planner":
             return row
         self.spawn_for_queued_task()
-        return self.state.one(
-            "SELECT a.* FROM agent a JOIN task t ON t.id = a.task_id"
-            " WHERE a.state='runnable' ORDER BY t.priority, t.created_at LIMIT 1"
-        )
+        return self.state.one(query)
 
     def spawn_for_queued_task(self) -> str | None:
         task = self.state.one(
@@ -104,6 +104,12 @@ class Scheduler:
         agent = self.pick()
         if agent is None:
             return "idle"
+
+        if agent["role"] == "planner" and agent["task_id"] is None:
+            outcome = turn.run_planner_turn(self.state, self.cfg, agent)
+            self.consecutive_failures = 0
+            log.info("%s (planner) -> %s: %s", agent["id"], outcome.kind, outcome.summary)
+            return outcome.kind
 
         task = self.state.one("SELECT * FROM task WHERE id=?", (agent["task_id"],))
         project = self.state.one("SELECT * FROM project WHERE id=?", (agent["project_id"],))

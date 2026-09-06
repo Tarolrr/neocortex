@@ -407,3 +407,58 @@ def test_preflight_uses_worker_adapter(setup, monkeypatch):
     monkeypatch.setattr("nc.scheduler.get_adapter", lookup)
     assert Scheduler(cfg, state).preflight() == (False, "adapter claude is not installed")
     lookup.assert_called_once_with("claude")
+
+
+def test_feedback_and_plan_are_picked_up_on_next_scheduler_tick(setup, monkeypatch, capsys):
+    cfg, state, _repo = setup
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("planner placeholder must not start a session or create a worktree")
+
+    monkeypatch.setattr("nc.scheduler.get_adapter", unexpected)
+    monkeypatch.setattr("nc.scheduler.arbiter.ensure_worktree", unexpected)
+    monkeypatch.setattr("nc.turn.run_turn", unexpected)
+    assert cli.main([
+        "--home", str(cfg.home), "feedback", "Keep it simple", "--project", "neocortex",
+    ]) == 0
+    assert cli.main([
+        "--home", str(cfg.home), "plan", "neocortex", "--note", "Review tests",
+    ]) == 0
+    agents = state.q("SELECT * FROM agent")
+    assert len(agents) == 1
+    planner = agents[0]
+    assert (planner["role"], planner["state"], planner["task_id"]) == (
+        "planner", "runnable", None,
+    )
+    assert state.q("SELECT * FROM run") == []
+    scheduler = Scheduler(cfg, state)
+    assert scheduler.pick()["id"] == planner["id"]
+    # Exercise the timer's run loop, bypassing only its external model probe.
+    monkeypatch.setattr(scheduler, "preflight", lambda: (True, "test"))
+    monkeypatch.setattr("nc.scheduler.time.sleep", lambda _: None)
+    scheduler.run(max_turns=1)
+    run = state.one("SELECT * FROM run")
+    assert (run["agent_id"], run["task_id"], run["outcome"]) == (
+        planner["id"], None, protocol.YIELD,
+    )
+    assert run["ended_at"] is not None
+    assert state.one("SELECT * FROM agent")["turns"] == 1
+    assert state.one("SELECT * FROM agent")["state"] == "runnable"
+    assert state.q("SELECT * FROM task") == []
+    assert [json.loads(m["payload"])["text"] for m in state.inbox(planner["id"])] == [
+        "Keep it simple", "Review tests",
+    ]
+    capsys.readouterr()
+    assert cli.main(["--home", str(cfg.home), "status"]) == 0
+    output = capsys.readouterr().out
+    assert "pending feedback:" in output
+    assert "Keep it simple" in output and "Review tests" in output
+
+
+def test_placeholder_planner_does_not_starve_queued_work(setup):
+    cfg, state, _repo = setup
+    state.planner_feedback("neocortex", "Review tests", cfg.model_for("planner"))
+    tid = state.add_task("neocortex", "work", "obj", [])
+    scheduler = sched(cfg, state, [emit({"outcome": "YIELD"})])
+    assert scheduler.step() == protocol.YIELD
+    assert state.one("SELECT * FROM run")["agent_id"] == f"worker-{tid}"

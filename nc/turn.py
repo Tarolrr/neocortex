@@ -71,6 +71,29 @@ def build_brief(state: State, cfg: Config, agent: sqlite3.Row, cwd: Path, branch
     return brief, inbox_ids
 
 
+def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row) -> protocol.Outcome:
+    """Placeholder until planning is implemented; keep all feedback pending."""
+    outcome = protocol.Outcome(
+        kind=protocol.YIELD, summary="Planner turn is not implemented; feedback remains pending.",
+    )
+    run_dir = cfg.runs_dir / f"{agent['id']}_{time.time_ns()}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "session.log"
+    log_path.write_text(outcome.summary + "\n")
+    (run_dir / "outcome.json").write_text(json.dumps({
+        "outcome": outcome.kind, "summary": outcome.summary,
+    }))
+    run_id = state.start_run(agent["id"], None, "planner", agent["model"], str(log_path))
+    state.end_run(run_id, outcome.kind, outcome.summary)
+    # Preserve any owner wake received since this agent was picked.
+    state.x(
+        "UPDATE agent SET turns=turns+1,"
+        " state=CASE WHEN updated_at=? THEN 'blocked' ELSE state END WHERE id=?",
+        (agent["updated_at"], agent["id"]),
+    )
+    return outcome
+
+
 def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
              cwd: Path, branch: str, checks: str = "") -> protocol.Outcome:
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())

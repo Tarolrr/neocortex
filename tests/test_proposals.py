@@ -35,9 +35,15 @@ def test_proposal_gate_and_file_import_parity(tmp_path, capsys):
     assert state.q('SELECT * FROM task') == []
     argv = ['--home', str(cfg.home)]
     assert main([*argv, 'proposals']) == 0
-    assert 'pending' in capsys.readouterr().out
-    assert main([*argv, 'proposal', str(pid)]) == 0
-    assert json.loads(capsys.readouterr().out)['spec'] == tasks
+    listing = capsys.readouterr().out
+    assert f'{pid} demo pending tasks=2' in listing
+    hint = next(line.strip() for line in listing.splitlines() if 'inspect:' in line)
+    assert hint == f'inspect: nc proposal {pid}'
+    assert main([*argv, *hint.removeprefix('inspect: nc ').split()]) == 0
+    detail = json.loads(capsys.readouterr().out)
+    assert detail['spec'] == tasks
+    assert detail['plan_review'] is None
+    assert state.q('SELECT * FROM task') == []
     assert main([*argv, 'approve', str(pid)]) == 0
     approved = state.q('SELECT * FROM task ORDER BY id')
     assert len(approved) == 2
@@ -59,6 +65,49 @@ def test_proposal_gate_and_file_import_parity(tmp_path, capsys):
         for key in dict(proposal_task):
             if key not in ('id', 'created_at', 'updated_at'):
                 assert proposal_task[key] == file_task[key]
+
+
+def test_pending_proposal_full_preview_with_review(tmp_path, capsys):
+    cfg, state = setup_state(tmp_path)
+    tasks = [
+        {'project': 'demo', 'id': 'foundation',
+         'title': 'Preserve the complete foundation title',
+         'objective': 'Build the foundation.\nPreserve this second objective line.',
+         'acceptance': ['$ pytest -q tests/test_foundation.py', 'Foundation passes review'],
+         'boundaries': ['Existing foundation behavior must remain compatible'],
+         'depends_on': []},
+        {'project': 'demo', 'id': 'integration',
+         'title': 'Preserve the complete integration title',
+         'objective': 'Integrate the foundation.\nInclude the complete integration details.',
+         'acceptance': ['Integration passes owner review'],
+         'boundaries': ['Existing integration data must remain intact'],
+         'depends_on': ['foundation']},
+    ]
+    pid = state.add_proposal('demo', 'planner', 'Complete preview rationale', tasks)
+    before = dict(state.one('SELECT * FROM proposal WHERE id=?', (pid,)))
+    review = {'status': 'done', 'findings': ['Add an integration machine check'],
+              'recommendation': 'Revise acceptance before approval'}
+    state.x(
+        'INSERT INTO plan_review(proposal_id,spec,status,findings,recommendation) '
+        'VALUES(?,?,?,?,?)',
+        (pid, before['spec'], review['status'], json.dumps(review['findings']),
+         review['recommendation']),
+    )
+    assert state.q('SELECT * FROM task') == []
+    assert main(['--home', str(cfg.home), 'proposal', str(pid)]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ''
+    detail = json.loads(captured.out)
+    assert detail['spec'] == tasks
+    assert detail['status'] == 'pending'
+    assert detail['rationale'] == 'Complete preview rationale'
+    assert detail['findings'] == [
+        "task integration: no machine-checkable acceptance criterion starting with '$'",
+    ]
+    assert detail['plan_review'] == review
+    assert dict(state.one('SELECT * FROM proposal WHERE id=?', (pid,))) == before
+    assert state.q('SELECT * FROM task') == []
+    assert state.q('SELECT * FROM task_seq') == []
 
 
 def test_rejection_persists_reason_and_never_queues(tmp_path):

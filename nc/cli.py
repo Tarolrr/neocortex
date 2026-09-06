@@ -109,7 +109,9 @@ def cmd_proposals(args) -> int:
     rows = state.q("SELECT * FROM proposal ORDER BY id")
     for row in rows:
         print(f"{row['id']} {row['project_id']} {row['status']} "
+              f"tasks={len(json.loads(row['spec']))} "
               f"source={row['source']} {row['rationale']}")
+        print(f"  inspect: nc proposal {row['id']}")
         for finding in json.loads(row["findings"]):
             print(f"  finding: {finding}")
     if not rows:
@@ -540,10 +542,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="new turn budget for the task, for work that needs more room")
     sp.set_defaults(func=cmd_requeue)
 
-    sub.add_parser("proposals", help="list proposals and their decisions").set_defaults(
+    sub.add_parser(
+        "proposals", help="list proposals, task counts and inspection commands",
+        description="List proposals and task counts. Preview with nc proposal ID before nc approve ID.",
+    ).set_defaults(
         func=cmd_proposals,
     )
-    sp = sub.add_parser("proposal", help="show the full proposed tasks")
+    sp = sub.add_parser(
+        "proposal", help="preview full task specs as JSON before approval",
+        description="Read-only full proposal JSON: titles, objectives, acceptance, boundaries, "
+        "dependencies, findings and advisory plan review. Run nc proposals, then nc proposal ID "
+        "to preview before nc approve ID. Spec IDs are proposal-local dependency references; "
+        "only owner approval creates queued tasks with task IDs for nc why.",
+    )
     sp.add_argument("proposal_id", type=int)
     sp.set_defaults(func=cmd_proposal)
     for command in ("approve", "reject"):
@@ -565,7 +576,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--project")
     sp.set_defaults(func=cmd_tasks)
 
-    sp = sub.add_parser("why", help="show a task's status and review evidence")
+    sp = sub.add_parser(
+        "why", help="show a task's status and review evidence",
+        description="Inspect an existing task by its task ID after task creation. "
+        "For pending proposal specs and proposal-local IDs, use nc proposal ID before approval.",
+    )
     sp.add_argument("task_id")
     sp.set_defaults(func=cmd_why)
 

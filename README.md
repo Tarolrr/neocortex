@@ -207,11 +207,18 @@ ruff check .
 Proposals hold suggested tasks outside the queue until the owner decides:
 
 ```bash
-nc proposals                 # list all proposals and their status
-nc proposal 1                # full rationale, task specs and decision details
+nc proposals                 # list status, task counts and inspection commands
+nc proposal 1                # preview full JSON before deciding
 nc approve 1                 # atomically queue every proposed task
 nc reject 2 "Outside scope"   # retain the reason without creating tasks
 ```
+
+Before approving, use the `nc proposal ID` inspection hint printed by `nc proposals`.
+The JSON already contains every full task title, objective, acceptance criterion,
+boundary, and dependency in `spec`, plus rationale, findings, advisory
+`plan_review`, and decision details. Inspection is read-only: pending specs are
+visible even when no task rows exist. Only owner approval creates queued tasks
+from a proposal.
 
 Producers use `State.add_proposal(project_id, source, rationale, spec)` with a
 JSON-serializable list of task specs. Each spec uses the `nc task --file` fields:
@@ -252,6 +259,12 @@ A proposed task may declare an optional unique `id` for other tasks in the same
 proposal to reference through `depends_on`. These local IDs must not collide with
 existing task IDs. Approval resolves local references to the newly allocated task
 IDs, including forward references. Other dependencies must name existing tasks.
+For example, a spec ID `first` is a proposal-local reference, while approval
+allocates a queued task ID such as `demo-T001`. The numeric ID in `nc proposal 1`
+identifies the whole proposal. `nc why demo-T001` applies after task creation
+because it looks up a task row and its execution/review evidence; it cannot
+inspect a proposal-local ID. Use `nc proposal 1` to inspect those specs before
+approval, then use the task IDs printed by `nc approve 1` with `nc why`.
 
 ## Owner feedback and planning requests
 

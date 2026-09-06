@@ -704,3 +704,94 @@ def test_planner_brief_includes_state(setup):
                   "Waiting for accepted dependencies"):
         assert value in brief
     assert ids == [mid]
+
+
+@pytest.mark.parametrize('verdict', ['pass', 'reject', 'rework'])
+@pytest.mark.parametrize('override', [None, 'custom-critic'])
+def test_plan_critic_advisory_review(setup, monkeypatch, capsys, verdict, override):
+    cfg, state, repo = setup
+    cfg.models['planner'] = 'planner-model'
+    if override:
+        cfg.models['plan_critic'] = override
+    state.planner_feedback('neocortex', 'private planner feedback', 'planner-model')
+    proposed = [planner_spec(id='first'), planner_spec(depends_on=['first'])]
+    adapter = ScriptedAdapter([
+        emit({'outcome': 'DONE', 'summary': 'SECRET rationale', 'memo': 'SECRET memo',
+              'proposal': proposed}),
+        emit({'outcome': 'DONE', 'verdict': verdict, 'proposal': [],
+              'findings': ['first assumes a missing table'],
+              'recommendation': 'Ask the owner about the table'}),
+    ])
+    adapter.run_planner = adapter.run
+    scheduler = Scheduler(cfg, state)
+    monkeypatch.setattr(scheduler, '_adapter_for', lambda role: adapter)
+    monkeypatch.setattr('nc.scheduler.arbiter.ensure_worktree',
+                        lambda *args: pytest.fail('plan critic took a worktree'))
+    assert scheduler.step() == protocol.DONE
+    assert len(adapter.calls) == 1
+    assert scheduler.step() == protocol.DONE
+    assert adapter.calls[1] == (override or 'planner-model', adapter.calls[1][1])
+    assert adapter.calls[1][1].parent == cfg.runs_dir
+    brief = adapter.briefs[1]
+    assert 'SECRET' not in brief and 'private planner feedback' not in brief
+    assert json.dumps(proposed) in brief
+    assert str(repo) in brief and 'README.md' in brief
+    assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo).decode().strip() in brief
+    assert not cfg.work_dir.exists()
+    proposal = state.one('SELECT * FROM proposal')
+    assert proposal['status'] == 'pending' and proposal['decided_at'] is None
+    assert json.loads(proposal['spec']) == proposed
+    assert not state.q('SELECT * FROM task')
+    assert scheduler.step() == 'idle'
+    # Claim survives a scheduler restart.
+    assert Scheduler(cfg, state).step() == 'idle'
+    args = ['--home', str(cfg.home)]
+    assert cli.main([*args, 'proposal', str(proposal['id'])]) == 0
+    review = json.loads(capsys.readouterr().out)['plan_review']
+    assert review == {'status': 'done', 'findings': ['first assumes a missing table'],
+                      'recommendation': 'Ask the owner about the table'}
+    assert cli.main([*args, 'approve', str(proposal['id'])]) == 0
+    assert len(state.q('SELECT * FROM task')) == 2
+
+
+@pytest.mark.parametrize('role', ['worker', 'critic', 'queued'])
+def test_plan_critic_yields_to_task_work(setup, monkeypatch, role):
+    cfg, state, _repo = setup
+    state.add_proposal('neocortex', 'planner', 'rationale', [planner_spec()])
+    tid = state.add_task('neocortex', 'Task', 'Objective', ['$ true'])
+    if role != 'queued':
+        state.set_task(tid, status='in_progress')
+        state.add_agent('active', role, 'neocortex', tid, cfg.model_for(role))
+    scheduler = sched(cfg, state, [emit({'outcome': 'YIELD'})])
+    monkeypatch.setattr('nc.turn.run_plan_critic_turn',
+                        lambda *args: pytest.fail('plan critic delayed task work'))
+    assert scheduler.step() == protocol.YIELD
+    assert not state.q('SELECT * FROM plan_review')
+
+
+def test_plan_critic_failed_attempt_and_changed_proposal(setup):
+    cfg, state, _repo = setup
+    pid = state.add_proposal('neocortex', 'planner', 'rationale', [planner_spec()])
+    scheduler = sched(cfg, state, [emit({'outcome': 'ASK', 'question': 'URL?'}),
+                                  emit({'outcome': 'DONE', 'findings': [],
+                                        'recommendation': 'No defects found'})])
+    scheduler.adapter.run_planner = scheduler.adapter.run
+    assert scheduler.step() == protocol.FAIL
+    assert scheduler.step() == 'idle'
+    assert state.one('SELECT status FROM proposal')['status'] == 'pending'
+    assert not state.q('SELECT * FROM task')
+    assert scheduler.consecutive_failures == 0
+    state.x('UPDATE proposal SET spec=? WHERE id=?',
+            (json.dumps([planner_spec(title='Changed plan')]), pid))
+    assert scheduler.step() == protocol.DONE
+    assert scheduler.step() == 'idle'
+    assert len(state.q('SELECT * FROM plan_review')) == 2
+
+
+def test_plan_critic_requires_restricted_adapter(setup):
+    cfg, state, _repo = setup
+    state.add_proposal('neocortex', 'planner', 'rationale', [planner_spec()])
+    scheduler = sched(cfg, state, [])
+    assert scheduler.step() == protocol.FAIL
+    assert scheduler.adapter.calls == []
+    assert scheduler.step() == 'idle'

@@ -213,6 +213,18 @@ repeated approval or rejection exits with status 1 and creates nothing. Failed
 batch approval leaves the proposal pending and rolls back every task in the batch.
 Existing state databases gain the proposal table automatically on opening.
 
+Pending proposals receive one advisory plan critic session when no worker or
+change critic is runnable and no queued task is ready. The session inspects the
+current repository and proposed tasks without the planner's rationale, feedback,
+or memo. It uses `models.plan_critic`, falling back to the planner model, and the
+restricted planner adapter path in a run directory, without taking a worktree.
+`nc proposal ID` includes `plan_review` with findings, a recommendation and review
+status (or null before review). These findings do not gate approval or modify the
+proposal. Only the owner's `nc approve` creates tasks from it. Failed sessions
+are recorded without retrying or tripping the task circuit breaker. A changed
+proposal spec can receive another review; unchanged specs are never run twice.
+
+
 Proposals store deterministic `findings` at creation and refresh them before
 approval. Both `nc proposal` and `nc proposals` show the findings. Unknown
 dependencies, cycles, missing acceptance commands starting with `$`, path-only

@@ -25,6 +25,14 @@ class CheckResult:
         return f"[{status}] {self.command}\n{self.output.strip()[-1500:]}"
 
 
+class MergeConflict(RuntimeError):
+    def __init__(self, branch: str, files: list[str]):
+        self.files = files
+        super().__init__(
+            f"{branch} conflicts with the base branch in: {', '.join(files)}"
+        )
+
+
 def git(repo: Path, *args: str, check: bool = True) -> str:
     proc = subprocess.run(
         ["git", *args], cwd=repo, capture_output=True, text=True, timeout=300,
@@ -98,11 +106,23 @@ def run_checks(cwd: Path, commands: list[str], timeout_s: int = 900) -> list[Che
 
 def integrate(repo: Path, branch: str, task_id: str) -> str:
     """Fast-forward-or-merge the accepted branch into the project's base branch."""
+    if (repo / ".git" / "MERGE_HEAD").exists():
+        git(repo, "merge", "--abort", check=False)
     base = base_branch(repo)
     current = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
     if current != base:
         git(repo, "checkout", base)
-    git(repo, "merge", "--no-ff", "-m", f"{task_id}: accepted by arbiter", branch)
+    proc = subprocess.run(
+        ["git", "merge", "--no-ff", "-m", f"{task_id}: accepted by arbiter", branch],
+        cwd=repo, capture_output=True, text=True, check=False, timeout=300,
+    )
+    if proc.returncode != 0:
+        files = git(repo, "diff", "--name-only", "--diff-filter=U").splitlines()
+        git(repo, "merge", "--abort", check=False)
+        if files:
+            raise MergeConflict(branch, files)
+        raise RuntimeError(f"git merge --no-ff -m {task_id}: accepted by arbiter "
+                           f"{branch} failed: {proc.stderr.strip()}")
     return git(repo, "rev-parse", "--short", "HEAD")
 
 

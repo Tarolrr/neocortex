@@ -453,6 +453,36 @@ def test_projects_are_isolated_and_priority_wins(setup, tmp_path):
     assert scheduler.adapter.calls[0][1].name == urgent
 
 
+def test_ask_timeout_does_not_escalate_concurrently_cancelled_task(setup, monkeypatch):
+    cfg, state, _repo = setup
+    tid = state.add_task("neocortex", "question", "obj", [])
+    scheduler = sched(cfg, state, [])
+    agent = scheduler.spawn_for_queued_task()
+    state.set_task(tid, status="blocked")
+    state.set_agent(agent, state="blocked")
+    state.x("UPDATE agent SET updated_at=0 WHERE id=?", (agent,))
+    state.send(protocol.QUESTION, agent, "owner", {"question": "filename?"}, tid)
+    original_q = state.q
+    other = State(cfg.db_path)
+    cancelled = []
+
+    def cancel_after_selection(sql, params=()):
+        rows = original_q(sql, params)
+        if sql.startswith("SELECT a.* FROM agent a WHERE a.state='blocked'"):
+            assert rows
+            cancelled.append(other.cancel_task(tid, "concurrent cancellation"))
+        return rows
+
+    monkeypatch.setattr(state, "q", cancel_after_selection)
+    try:
+        scheduler._escalate_unanswered_questions()
+        assert cancelled == [True]
+        assert not state.q("SELECT * FROM incident WHERE kind='ask_timeout'")
+        assert state.one("SELECT status FROM task WHERE id=?", (tid,))["status"] == "cancelled"
+    finally:
+        other.db.close()
+
+
 @pytest.mark.parametrize("agent_count", [1, 2])
 def test_ask_timeout_is_reported_once_per_agent_across_run_cycles(setup, monkeypatch, agent_count):
     cfg, state, _repo = setup

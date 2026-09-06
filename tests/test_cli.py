@@ -234,6 +234,31 @@ def test_costs_totals(tmp_path, capsys, monkeypatch):
     assert "critic runs=2 tokens=50 unknown_runs=1 wall=35.0s" in output
 
 
+def test_resume_retry_does_not_revive_concurrently_cancelled_task(gc_project, monkeypatch, capsys):
+    cfg, state, _repo = gc_project
+    task = state.add_task("demo", "Superseded", "objective", [])
+    state.set_task(task, status="blocked", attempts=3)
+    agent = state.add_agent(f"worker-{task}", "worker", "demo", task, "m")
+    state.set_agent(agent, state="blocked")
+    original_q = State.q
+    snapshots = {}
+
+    def cancel_after_selection(connection, sql, params=()):
+        rows = original_q(connection, sql, params)
+        if sql == "SELECT * FROM task WHERE status='blocked'":
+            assert connection is not state
+            state.cancel_task(task, "concurrent cancellation")
+            snapshots["task"] = dict(state.one("SELECT * FROM task WHERE id=?", (task,)))
+            snapshots["agent"] = dict(state.one("SELECT * FROM agent WHERE id=?", (agent,)))
+        return rows
+
+    monkeypatch.setattr(State, "q", cancel_after_selection)
+    assert main(["--home", str(cfg.home), "resume", "--retry"]) == 0
+    assert dict(state.one("SELECT * FROM task WHERE id=?", (task,))) == snapshots["task"]
+    assert dict(state.one("SELECT * FROM agent WHERE id=?", (agent,))) == snapshots["agent"]
+    assert "unblocked" not in capsys.readouterr().out
+
+
 def test_cancel_history_and_restoration(gc_project, capsys):
     from nc.scheduler import Scheduler
 

@@ -350,10 +350,23 @@ class Scheduler:
             detail = f"{agent['id']}: blocked on an unanswered question (task {agent['task_id']})"
             # Keep deduplication in the database across scheduler restarts and
             # incident resolution: the timeout is reported once per agent.
-            if not self.state.one(
-                "SELECT 1 FROM incident WHERE kind='ask_timeout' AND detail=?", (detail,),
-            ):
-                self.state.incident("ask_timeout", detail)
+            # Recheck eligibility in the insert itself: cancellation may have
+            # committed since the candidate query above.
+            inserted = self.state.x(
+                "INSERT INTO incident(kind,detail,created_at)"
+                " SELECT 'ask_timeout', ?, ? FROM agent a"
+                " WHERE a.id=? AND a.state='blocked' AND a.updated_at < ?"
+                " AND NOT EXISTS (SELECT 1 FROM task t WHERE t.id=a.task_id"
+                " AND t.status='cancelled')"
+                " AND EXISTS (SELECT 1 FROM message q WHERE q.sender=a.id AND q.kind=?"
+                " AND NOT EXISTS (SELECT 1 FROM message r"
+                " WHERE r.in_reply_to=q.id AND r.kind=?))"
+                " AND NOT EXISTS (SELECT 1 FROM incident"
+                " WHERE kind='ask_timeout' AND detail=?)",
+                (detail, time.time(), agent["id"], time.time() - self.cfg.ask_timeout_s,
+                 protocol.QUESTION, protocol.ANSWER, detail),
+            ).rowcount
+            if inserted:
                 log.warning("%s", detail)
 
     def run(self, max_turns: int = 0) -> None:

@@ -276,3 +276,23 @@ gates clear, the existing trigger can run without another owner request.
 Projects record `planner_last_ran_at` and `planner_skip_reason` for inspection.
 A completed planning turn records a proposal for owner approval or asks the owner
 a question; it does not automatically schedule another planning turn.
+
+Use cancellation to remove superseded copies from the active task list without
+losing their history:
+
+```sh
+nc cancel demo-T003 --reason "Superseded by demo-T007"
+nc tasks                 # excludes cancelled tasks
+nc tasks --all           # includes cancelled tasks
+nc why demo-T003          # original evidence and owner cancellation reason
+nc requeue demo-T003 --reason "Restore this task"
+```
+
+Only queued, blocked, and failed tasks can be cancelled; tasks with active runs
+cannot be cancelled. Repeating cancellation is harmless and keeps the original
+reason. Cancellation retires associated agents without deleting tasks, messages,
+runs, dependencies, branches, or worktrees, or changing accepted work and merge
+history. Cancelled tasks do not run or escalate unanswered questions, and neither
+`nc answer` nor `nc resume --retry` restores them. Only explicit `nc requeue`
+restores eligibility. A cancelled prerequisite remains unmet; use `nc why` on
+the dependent task to inspect that condition.

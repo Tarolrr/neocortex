@@ -69,6 +69,7 @@ class Scheduler:
         query = (
             "SELECT a.* FROM agent a JOIN task t ON t.id = a.task_id"
             " WHERE a.state='runnable' AND a.role IN ('worker','critic')"
+            " AND t.status != 'cancelled'"
             " ORDER BY CASE a.role WHEN 'critic' THEN 0 ELSE 1 END,"
             " t.priority, t.created_at, a.updated_at, a.id LIMIT 1"
         )
@@ -119,17 +120,25 @@ class Scheduler:
         return None
 
     def spawn_for_queued_task(self) -> str | None:
-        task = self.next_ready_task()
-        if not task:
-            return None
-        agent_id = f"worker-{task['id']}"
-        existing = self.state.one("SELECT * FROM agent WHERE id=?", (agent_id,))
-        if existing is None:
-            self.state.add_agent(agent_id, "worker", task["project_id"], task["id"],
-                                 self.cfg.model_for("worker"))
-        else:
-            self.state.set_agent(agent_id, state="runnable")
-        self.state.set_task(task["id"], status="in_progress")
+        # Serialize queue selection and activation against owner cancellation.
+        with self.state.db:
+            self.state.db.execute("BEGIN IMMEDIATE")
+            task = self.next_ready_task()
+            if not task:
+                return None
+            agent_id = f"worker-{task['id']}"
+            now = time.time()
+            self.state.db.execute(
+                "INSERT INTO agent(id,role,project_id,task_id,state,model,created_at,updated_at)"
+                " VALUES(?,'worker',?,?,'runnable',?,?,?)"
+                " ON CONFLICT(id) DO UPDATE SET state='runnable', updated_at=excluded.updated_at",
+                (agent_id, task["project_id"], task["id"],
+                 self.cfg.model_for("worker"), now, now),
+            )
+            self.state.db.execute(
+                "UPDATE task SET status='in_progress', updated_at=? WHERE id=?",
+                (now, task["id"]),
+            )
         log.info("spawned %s for %s", agent_id, task["id"])
         return agent_id
 
@@ -331,6 +340,8 @@ class Scheduler:
     def _escalate_unanswered_questions(self) -> None:
         agents = self.state.q(
             "SELECT a.* FROM agent a WHERE a.state='blocked' AND a.updated_at < ?"
+            " AND NOT EXISTS (SELECT 1 FROM task t WHERE t.id=a.task_id"
+            " AND t.status='cancelled')"
             " AND EXISTS (SELECT 1 FROM message q WHERE q.sender=a.id AND q.kind=?"
             " AND NOT EXISTS (SELECT 1 FROM message r WHERE r.in_reply_to=q.id AND r.kind=?))",
             (time.time() - self.cfg.ask_timeout_s, protocol.QUESTION, protocol.ANSWER),

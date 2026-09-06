@@ -205,6 +205,37 @@ class State:
         )
         return tid
 
+    def cancel_task(self, task_id: str, reason: str) -> bool:
+        """Atomically retire a task and its agents, retaining existing evidence."""
+        if not reason.strip():
+            raise ValueError("a cancellation reason is required")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            task = self.one("SELECT status FROM task WHERE id=?", (task_id,))
+            if task is None:
+                raise ValueError(f"unknown task: {task_id}")
+            if self.one(
+                "SELECT 1 FROM run WHERE ended_at IS NULL AND"
+                " (task_id=? OR agent_id IN (SELECT id FROM agent WHERE task_id=?))",
+                (task_id, task_id),
+            ):
+                raise ValueError(f"{task_id} has an active run")
+            if task["status"] == "cancelled":
+                return False
+            if task["status"] not in ("queued", "blocked", "failed"):
+                raise ValueError(f"cannot cancel {task_id} in status {task['status']}")
+            now = time.time()
+            self.db.execute("UPDATE task SET status='cancelled', updated_at=? WHERE id=?",
+                            (now, task_id))
+            self.db.execute("UPDATE agent SET state='done', updated_at=? WHERE task_id=?",
+                            (now, task_id))
+            self.db.execute(
+                "INSERT INTO message(kind,sender,recipient,task_id,payload,created_at)"
+                " VALUES('cancellation','owner','owner',?,?,?)",
+                (task_id, json.dumps({"reason": reason}, ensure_ascii=False), now),
+            )
+        return True
+
     def unmet_dependencies(self, task_id: str) -> list[str]:
         """Dependencies that are not accepted yet; a missing one never becomes met."""
         row = self.one("SELECT depends_on FROM task WHERE id=?", (task_id,))
@@ -385,12 +416,20 @@ class State:
     # --- runs / incidents -------------------------------------------------
     def start_run(self, agent_id: str, task_id: str | None, role: str, model: str,
                   log_path: str) -> int:
-        cur = self.x(
-            "INSERT INTO run(agent_id,task_id,role,model,log_path,started_at)"
-            " VALUES(?,?,?,?,?,?)",
-            (agent_id, task_id, role, model, log_path, time.time()),
-        )
-        return int(cur.lastrowid)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if self.one(
+                "SELECT 1 FROM task WHERE status='cancelled' AND"
+                " (id=? OR id=(SELECT task_id FROM agent WHERE id=?))",
+                (task_id, agent_id),
+            ):
+                raise ValueError("cannot start a run for a cancelled task")
+            cur = self.db.execute(
+                "INSERT INTO run(agent_id,task_id,role,model,log_path,started_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (agent_id, task_id, role, model, log_path, time.time()),
+            )
+            return int(cur.lastrowid)
 
     def end_run(self, run_id: int, outcome: str, detail: str = "", tokens: int | None = None) -> None:
         self.x(

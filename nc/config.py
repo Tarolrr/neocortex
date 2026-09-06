@@ -24,6 +24,7 @@ class Config:
     turn_timeout_s: int = 900
     preflight_timeout_s: int = 120
     max_consecutive_failures: int = 3
+    max_attempts: int = 3
     min_free_mb: int = 120
     max_turns_per_cycle: int = 0          # 0 = unlimited, bounded by budget/tasks
     ask_timeout_s: int = 24 * 3600

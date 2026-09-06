@@ -20,8 +20,6 @@ from .state import State
 
 log = logging.getLogger("nc.scheduler")
 
-MAX_ATTEMPTS = 3
-
 
 class Scheduler:
     def __init__(self, cfg: Config, state: State):
@@ -161,7 +159,7 @@ class Scheduler:
     def _on_fail(self, agent, task, project, cwd, branch, outcome) -> None:
         attempts = task["attempts"] + 1
         self.state.set_task(task["id"], attempts=attempts)
-        if attempts >= MAX_ATTEMPTS:
+        if attempts >= self.cfg.max_attempts:
             self._block(task, agent, f"failed {attempts} times: {outcome.summary}")
         else:
             self.state.set_agent(agent["id"], state="runnable")
@@ -228,7 +226,7 @@ class Scheduler:
                         {"verdict": "rework", "summary": "acceptance not met",
                          "findings": findings}, task_id=task["id"])
         self.state.set_task(task["id"], status="in_progress", attempts=attempts)
-        if attempts >= MAX_ATTEMPTS:
+        if attempts >= self.cfg.max_attempts:
             self._block(task, agent, f"{attempts} rework cycles without acceptance")
             return
         self.state.set_agent(worker_id, state="runnable")

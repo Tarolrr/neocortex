@@ -75,10 +75,13 @@ exit.  It is still evidence rather than a promise about a process that has
 deliberately escaped its group; a missing or uninspectable adapter identity is
 shown as uncertain.
 
-For a known interrupted row, submit `nc recover-runs RUN_ID --reason "..."`.
+For known interrupted rows, submit `nc recover-runs RUN_ID [RUN_ID ...] --reason "..."`.
 This records `INTERRUPTED`, timestamps and the owner reason without requeueing,
 changing a budget, deleting a worktree or replaying an outcome.  The browser has
-the same per-run form at **Unfinished runs**.  Live ownership is refused.
+the same selected-runs form at **Unfinished runs** (with an individual-row
+shortcut).  Every submitted selection is validated as one atomic operation:
+one live, unknown, stale or ambiguous row rejects the whole selection.  Live
+ownership is refused.
 
 Legacy rows, and rows made before adapter process-group recording, have
 insufficient ownership evidence. Before adding

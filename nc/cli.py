@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -98,11 +99,15 @@ def cmd_runs(args) -> int:
 
 
 def cmd_recover_runs(args) -> int:
-    _, state = _open(args)
     try:
+        # Recovery is an explicit owner action, so a contended submission must
+        # fail promptly rather than appearing to hang behind a scheduler turn.
+        cfg = Config.load(args.home)
+        cfg.home.mkdir(parents=True, exist_ok=True)
+        state = State(cfg.db_path, timeout=1)
         rows = operations.recover_runs(state, args.run_ids, args.reason,
                                       args.acknowledge_quiescence)
-    except (ValueError, LookupError) as exc:
+    except (ValueError, LookupError, sqlite3.OperationalError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print("recovered interrupted run IDs: " + ", ".join(str(r["id"]) for r in rows))

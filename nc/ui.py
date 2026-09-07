@@ -294,14 +294,19 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 
 def _runs_page(rows: list[dict], csrf: str, flash: str, error: str) -> str:
     entries = "".join(
-        f'<li>#{r["id"]} agent={_e(r["agent_id"])} task={_e(r["task_or_role"])} '
+        f'<li><label><input type="checkbox" name="run_id_{r["id"]}" value="1"> '
+        f'#{r["id"]} agent={_e(r["agent_id"])} task={_e(r["task_or_role"])} '
         f'role={_e(r["role"])} started={_e(r["started_at"])} '
         f'ownership: {_e(r["ownership"])} '
-        f'<a href="/runs/{r["id"]}">recover</a></li>' for r in rows
+        f'<a href="/runs/{r["id"]}">recover individually</a></label></li>' for r in rows
     ) or "<li>(none)</li>"
     body = f"""{_flash('ok', flash)}{_flash('error', error)}
 <h2>Unfinished run records</h2><p>An unfinished record is not proof of a live process. Verify scheduler and adapter descendants before recovering uncertain legacy ownership; inactive systemd alone is insufficient.</p>
-<ul>{entries}</ul>"""
+<form method="post" action="/runs/recover">{_csrf_field(csrf)}
+<ul>{entries}</ul>
+<div class="field"><label for="reason">Recovery reason</label><input id="reason" name="reason" required></div>
+<div class="field checkbox"><input id="quiescent" name="acknowledge_quiescence" value="1" type="checkbox"><label for="quiescent">I verified scheduler and adapter processes are quiescent</label></div>
+<button type="submit">Record interruption for selected runs</button></form>"""
     return _page("Unfinished runs", "runs", body)
 
 
@@ -624,6 +629,42 @@ def _post_recover_run(h: Handler, state, params, query, form):
         h.redirect(f"/runs/{run_id}", error=str(exc))
         return
     h.redirect("/runs", ok=f"recovered run ID: {run_id}")
+
+
+def _selected_run_ids(form: dict[str, str]) -> list[int]:
+    """Read the selected rows from the list form without weakening its validation.
+
+    Named checkboxes retain every selected ID despite the deliberately simple
+    one-value form parser.  ``run_ids`` is also accepted as a comma-separated
+    value for scripted browser submissions; it makes duplicate/stale requests
+    reach the same shared operation and validation as the CLI.
+    """
+    selected = []
+    for name, value in form.items():
+        match = re.fullmatch(r"run_id_([1-9][0-9]*)", name)
+        if match and value == "1":
+            selected.append(int(match.group(1)))
+    supplied = form.get("run_ids", "")
+    if supplied:
+        try:
+            selected.extend(int(value) for value in supplied.split(","))
+        except ValueError as exc:
+            raise ValueError("run IDs must be comma-separated positive integers") from exc
+    return selected
+
+
+@route("POST", r"^/runs/recover$")
+def _post_recover_selected_runs(h: Handler, state, params, query, form):
+    try:
+        rows = operations.recover_runs(
+            state, _selected_run_ids(form), form.get("reason", ""),
+            form.get("acknowledge_quiescence") == "1",
+        )
+    except (ValueError, LookupError) as exc:
+        h.redirect("/runs", error=str(exc))
+        return
+    h.redirect("/runs", ok="recovered interrupted run IDs: " +
+               ", ".join(str(row["id"]) for row in rows))
 
 
 @route("POST", r"^/t/(?P<task_id>[^/]+)/cancel$")

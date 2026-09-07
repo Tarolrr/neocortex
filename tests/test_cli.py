@@ -163,6 +163,32 @@ def test_recover_runs_cli_rejects_unknown_finished_and_duplicate_ids(tmp_path, c
     assert "distinct" in capsys.readouterr().err
 
 
+def test_recover_runs_cli_contention_and_stale_submission_preserve_state(tmp_path, capsys):
+    cfg = Config(home=tmp_path / "home")
+    cfg.home.mkdir()
+    state = State(cfg.db_path)
+    state.add_project("demo", "Demo", str(tmp_path), None)
+    task = state.add_task("demo", "Blocked", "objective", [])
+    state.add_agent("worker", "worker", "demo", task, "model")
+    run = state.start_run("worker", task, "worker", "model", "log")
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?", (run,))
+    args = ["--home", str(cfg.home), "recover-runs", str(run), "--reason", "checked",
+            "--acknowledge-quiescence"]
+    before = list(state.db.iterdump())
+    state.db.execute("BEGIN IMMEDIATE")
+    try:
+        assert main(args) == 1
+    finally:
+        state.db.rollback()
+    assert list(state.db.iterdump()) == before
+    assert "locked" in capsys.readouterr().err.lower()
+    assert main(args) == 0
+    before_stale = list(state.db.iterdump())
+    assert main(args) == 1
+    assert "already finished" in capsys.readouterr().err
+    assert list(state.db.iterdump()) == before_stale
+
+
 def test_why_evidence(tmp_path, capsys):
     state = State(Config.load(tmp_path).db_path)
     state.add_project("demo", "Demo", str(tmp_path), None)

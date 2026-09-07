@@ -530,3 +530,60 @@ def test_detail_preserves_multiline_content(browser):
     for content in ("first\nsecond", "check\nagain", "stay\ninside", "result\ncontinued"):
         assert f"<pre>{content}</pre>" in body
     assert "(no stored check output)" in body
+
+
+@pytest.mark.parametrize("directory_link", [False, True])
+def test_evidence_symlinks_are_not_read(browser, tmp_path, directory_link):
+    cfg, _state, tid, _, request = browser
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / f"{tid}.txt").write_text("secret external evidence")
+    checks = cfg.home / "checks"
+    if directory_link:
+        checks.symlink_to(external, target_is_directory=True)
+    else:
+        checks.mkdir(exist_ok=True)
+        (checks / f"{tid}.txt").symlink_to(external / f"{tid}.txt")
+    status, _, body = request(f"/t/{tid}")
+    assert status == 200
+    assert "secret external evidence" not in body
+    assert "no stored check output" in body
+
+
+@pytest.mark.parametrize("payload,expected", [
+    (('{"project":"one","title":"Uploaded","objective":"line 1\\nline 2",'
+     '"acceptance":["check"],"boundaries":["scope"],"priority":7,'
+     '"budget_turns":9,"depends_on":[]}' ), 303),
+    ('{"project":"one","title":"bad","objective":"x","acceptance":[],"budget_turns":0}', 400),
+    ('/etc/passwd', 400),
+])
+def test_uploaded_json_content(browser, payload, expected):
+    _, state, _, server, request = browser
+    _, headers, page = request('/p/one/tasks/import')
+    token = re.search(r'name="csrf_token" value="([^"]+)"', page)[1]
+    before = list(state.db.iterdump())
+    boundary = 'nc-upload-boundary'
+    body = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="csrf_token"\r\n\r\n{token}\r\n'
+        f'--{boundary}\r\nContent-Disposition: form-data; name="upload"; '
+        f'filename="/etc/passwd"\r\nContent-Type: application/json\r\n\r\n{payload}\r\n'
+        f'--{boundary}--\r\n'
+    ).encode()
+    conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=3)
+    conn.request('POST', '/p/one/tasks/import', body, {
+        'Content-Type': f'multipart/form-data; boundary={boundary}',
+        'Cookie': headers['Set-Cookie'].split(';')[0],
+        'Origin': f'http://127.0.0.1:{server.server_port}',
+    })
+    response = conn.getresponse()
+    assert response.status == expected, response.read().decode()
+    response.read()
+    conn.close()
+    if expected == 400:
+        assert list(state.db.iterdump()) == before
+    else:
+        task = state.one("SELECT * FROM task WHERE title='Uploaded'")
+        assert task['objective'] == 'line 1\nline 2'
+        assert task['budget_turns'] == 9
+        assert task['priority'] == 7
+        assert task['boundaries'] == '["scope"]'

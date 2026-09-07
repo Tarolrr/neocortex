@@ -30,6 +30,8 @@ import sqlite3
 import subprocess
 import urllib.parse
 from collections.abc import Callable
+from email import policy
+from email.parser import BytesParser
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -200,10 +202,12 @@ def _task_import_page(project: dict, csrf: str, error: str, raw: str) -> str:
 <h2>Import task JSON into {_e(project["title"])}</h2>
 <p>Paste one task spec object, or a JSON list of task specs (the same shape as
 <code>nc task --file</code>).</p>
-<form method="post" action="/p/{_segment(project["id"])}/tasks/import">
+<form method="post" enctype="multipart/form-data" action="/p/{_segment(project["id"])}/tasks/import">
 {_csrf_field(csrf)}
 <div class="field"><label for="spec">Task spec JSON</label>
-<textarea id="spec" name="spec" required rows="12">{_e(raw)}</textarea></div>
+<textarea id="spec" name="spec" rows="12">{_e(raw)}</textarea></div>
+<div class="field"><label for="upload">Or upload UTF-8 JSON (1 MiB form limit)</label>
+<input id="upload" name="upload" type="file" accept=".json,application/json"></div>
 <button type="submit">Import</button>
 </form>"""
     return _page("Import tasks", "projects", body)
@@ -510,6 +514,13 @@ def _view_task_import(h: Handler, state, params, query):
 def _post_task_import(h: Handler, state, params, query, form):
     project = _require_project(state, params["project"])
     raw = form.get("spec", "")
+    uploaded = form.get("upload", "")
+    if raw.strip() and uploaded.strip():
+        h.send_html(HTTPStatus.BAD_REQUEST, _task_import_page(
+            project, h.csrf_token, "Choose pasted JSON or an upload, not both", raw,
+        ))
+        return
+    raw = uploaded or raw
     try:
         specs = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -856,12 +867,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ValueError("transfer encoding is unsupported")
         if len(self.headers.get_all("Content-Length", [])) != 1:
             raise ValueError("one Content-Length header is required")
-        if self.headers.get_content_type() != "application/x-www-form-urlencoded":
-            raise ValueError("expected a URL-encoded form")
+        content_type = self.headers.get_content_type()
+        if content_type not in ("application/x-www-form-urlencoded", "multipart/form-data"):
+            raise ValueError("expected a URL-encoded or multipart form")
         length = int(self.headers.get("Content-Length") or 0)
         if not 0 <= length <= 1024 * 1024:
             raise ValueError("form exceeds the 1 MiB limit")
         raw = self.rfile.read(length) if length else b""
+        if content_type == "multipart/form-data":
+            message = BytesParser(policy=policy.default).parsebytes(
+                ("Content-Type: " + self.headers["Content-Type"] + "\r\n\r\n").encode()
+                + raw,
+            )
+            if not message.is_multipart() or message.defects:
+                raise ValueError("invalid multipart form")
+            form = {}
+            for part in message.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                if not name or name in form or part.is_multipart() or part.defects:
+                    raise ValueError("invalid or duplicate multipart field")
+                # Filenames are untrusted metadata, never filesystem paths.
+                form[name] = (part.get_payload(decode=True) or b"").decode("utf-8")
+            return form
         parsed = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
         return {k: v[-1] for k, v in parsed.items()}
 

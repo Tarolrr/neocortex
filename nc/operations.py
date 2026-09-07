@@ -17,6 +17,8 @@ Nothing here shells out or re-parses `nc` output; it calls `State` methods and
 from __future__ import annotations
 
 import json
+import os
+import stat
 import time
 from pathlib import Path
 
@@ -127,10 +129,21 @@ def task_detail(state: State, cfg: Config, task_id: str) -> dict:
         "SELECT * FROM message WHERE task_id=? ORDER BY id", (task_id,),
     )]
     check_path = cfg.home / "checks" / f"{task_id}.txt"
-    try:
-        detail["check_output"] = check_path.read_text()
-    except FileNotFoundError:
-        detail["check_output"] = None
+    detail["check_output"] = None
+    # Pin the directory and reject symlinks: evidence is never a browser path.
+    if Path(task_id).name == task_id and task_id not in (".", ".."):
+        try:
+            directory = os.open(cfg.home / "checks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                fd = os.open(f"{task_id}.txt", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=directory)
+                with os.fdopen(fd) as evidence:
+                    if stat.S_ISREG(os.fstat(evidence.fileno()).st_mode):
+                        detail["check_output"] = evidence.read()
+            finally:
+                os.close(directory)
+        except (OSError, UnicodeError):
+            pass  # Missing or unsafe evidence is displayed as absent.
     detail["check_path"] = str(check_path)
     return detail
 

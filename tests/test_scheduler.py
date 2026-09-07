@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from nc import cli, protocol
+from nc import cli, protocol, turn
 from nc.adapters import SessionResult
 from nc.config import Config
 from nc.scheduler import Scheduler
@@ -981,6 +981,44 @@ def test_revision_survives_retry(setup, failure):
     assert 'Retain revision feedback' in scheduler.adapter.briefs[1]
     assert state.pending_revision(aid) is None
     assert len(state.q('SELECT * FROM proposal')) == 2
+
+
+@pytest.mark.parametrize("role", ["worker", "critic"])
+def test_session_exception_finalizes_worker_and_critic_without_consuming_feedback(setup, role):
+    cfg, state, repo = setup
+    task = state.add_task("neocortex", "exception", "objective", [])
+    state.set_task(task, status="in_review" if role == "critic" else "in_progress")
+    agent = state.add_agent(f"{role}-exception", role, "neocortex", task, "model")
+    state.send("feedback", "owner", agent, {"text": "retain me"}, task)
+    adapter = ScriptedAdapter([lambda _cwd, _outcome: (_ for _ in ()).throw(RuntimeError("adapter exploded"))])
+    outcome = turn.run_turn(state, cfg, adapter, state.one("SELECT * FROM agent WHERE id=?", (agent,)),
+                            repo, "main")
+    run = state.one("SELECT * FROM run WHERE agent_id=?", (agent,))
+    assert outcome.kind == protocol.FAIL
+    assert run["outcome"] == protocol.FAIL and "adapter exploded" in run["detail"]
+    assert json.loads(state.inbox(agent)[0]["payload"]) == {"text": "retain me"}
+
+
+def test_session_exception_finalizes_planner_and_plan_critic_with_context(setup):
+    cfg, state, _repo = setup
+    original = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+    planner, _message = state.planner_feedback(None, "retain revision feedback", "model",
+                                                proposal_id=original)
+    adapter = ScriptedAdapter([lambda _cwd, _outcome: (_ for _ in ()).throw(RuntimeError("planner exploded"))])
+    agent = state.one("SELECT * FROM agent WHERE id=?", (planner,))
+    outcome = turn.run_planner_turn(state, cfg, agent, adapter)
+    run = state.one("SELECT * FROM run WHERE agent_id=? ORDER BY id DESC", (planner,))
+    assert outcome.kind == protocol.FAIL and run["outcome"] == protocol.FAIL
+    assert "planner exploded" in run["detail"]
+    assert state.pending_revision(planner) is not None
+
+    proposal = state.add_proposal("neocortex", planner, "", [planner_spec()])
+    adapter.run_planner = adapter.run
+    adapter.script = [lambda _cwd, _outcome: (_ for _ in ()).throw(RuntimeError("critic exploded"))]
+    outcome = turn.run_plan_critic_turn(state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter)
+    run = state.one("SELECT * FROM run WHERE role='plan_critic' ORDER BY id DESC")
+    assert outcome.kind == protocol.FAIL and run["outcome"] == protocol.FAIL
+    assert "critic exploded" in run["detail"]
 
 
 @pytest.mark.parametrize('role', ['worker', 'critic', 'capacity'])

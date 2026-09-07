@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -81,6 +82,35 @@ def cmd_requeue(args) -> int:
     print(f"{result['task_id']} queued again"
           + (" from a fresh branch" if result["fresh"] else "")
           + (f", budget {result['budget']} turns" if result["budget"] else ""))
+    return 0
+
+
+def cmd_runs(args) -> int:
+    _, state = _open(args)
+    rows = operations.unfinished_runs(state)
+    if not rows:
+        print("no unfinished run records")
+        return 0
+    for row in rows:
+        print(f"#{row['id']} agent={row['agent_id']} task={row['task_or_role']} "
+              f"role={row['role']} started_at={row['started_at']:.6f} "
+              f"ownership={row['ownership']}")
+    return 0
+
+
+def cmd_recover_runs(args) -> int:
+    try:
+        # Recovery is an explicit owner action, so a contended submission must
+        # fail promptly rather than appearing to hang behind a scheduler turn.
+        cfg = Config.load(args.home)
+        cfg.home.mkdir(parents=True, exist_ok=True)
+        state = State(cfg.db_path, timeout=1)
+        rows = operations.recover_runs(state, args.run_ids, args.reason,
+                                      args.acknowledge_quiescence)
+    except (ValueError, LookupError, sqlite3.OperationalError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print("recovered interrupted run IDs: " + ", ".join(str(r["id"]) for r in rows))
     return 0
 
 
@@ -486,6 +516,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--budget", type=int,
                     help="new turn budget for the task, for work that needs more room")
     sp.set_defaults(func=cmd_requeue)
+
+    sub.add_parser("runs", help="inspect unfinished runs and ownership evidence").set_defaults(func=cmd_runs)
+    sp = sub.add_parser("recover-runs", help="explicitly record selected interrupted runs as recovered")
+    sp.add_argument("run_ids", nargs="+", type=int)
+    sp.add_argument("--reason", required=True)
+    sp.add_argument("--acknowledge-quiescence", action="store_true",
+                    help="required for legacy/otherwise uncertain ownership after verifying scheduler and adapter processes")
+    sp.set_defaults(func=cmd_recover_runs)
 
     sub.add_parser(
         "proposals", help="list proposals, task counts and inspection commands",

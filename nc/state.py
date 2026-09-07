@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from collections.abc import Iterable
@@ -171,6 +172,24 @@ class State:
             ("incident", "resolution_note", "TEXT"),
             ("task", "merge_commit", "TEXT"),
             ("task", "depends_on", "TEXT NOT NULL DEFAULT '[]'"),
+            # These are deliberately additive.  A NULL owner is a legacy,
+            # uncertain record, never evidence that a session is dead.
+            ("run", "owner_pid", "INTEGER"),
+            ("run", "owner_start", "TEXT"),
+            # 0 means this row predates ownership recording.  It is the only
+            # case in which an operator can attest quiescence; a newer row
+            # with incomplete evidence is an ambiguous interrupted launch.
+            ("run", "ownership_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("run", "adapter_pid", "INTEGER"),
+            ("run", "adapter_start", "TEXT"),
+            ("run", "adapter_pgid", "INTEGER"),
+            # Version 2 records a dedicated cgroup created before adapter exec.
+            # Unlike a process group, it continues to contain a child that
+            # calls setsid()/setpgid() after the scheduler has died.
+            ("run", "adapter_cgroup", "TEXT"),
+            ("run", "interrupted_at", "REAL"),
+            ("run", "recovered_at", "REAL"),
+            ("run", "recovery_reason", "TEXT"),
         ):
             known = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             if column not in known:
@@ -504,11 +523,48 @@ class State:
             ):
                 raise ValueError("cannot start a run for a cancelled task")
             cur = self.db.execute(
-                "INSERT INTO run(agent_id,task_id,role,model,log_path,started_at)"
-                " VALUES(?,?,?,?,?,?)",
-                (agent_id, task_id, role, model, log_path, time.time()),
+                "INSERT INTO run(agent_id,task_id,role,model,log_path,started_at,owner_pid,owner_start,ownership_version)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (agent_id, task_id, role, model, log_path, time.time(), os.getpid(),
+                 self._process_start(os.getpid()), 2),
             )
             return int(cur.lastrowid)
+
+    @staticmethod
+    def _process_start(pid: int) -> str | None:
+        """Linux PID start ticks prevent PID reuse from looking like ownership."""
+        try:
+            # Field 22 is starttime. comm may contain spaces, hence rsplit.
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+        except (FileNotFoundError, IndexError, OSError):
+            return None
+
+    @staticmethod
+    def _process_pgrp(pid: int) -> int | None:
+        try:
+            # stat field 5 (pgrp); comm may contain spaces.
+            return int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[2])
+        except (FileNotFoundError, IndexError, OSError, ValueError):
+            return None
+
+    def record_adapter_owner(self, run_id: int, pid: int) -> None:
+        """Persist adapter session identity before waiting for untrusted work."""
+        self.x("UPDATE run SET adapter_pid=?, adapter_start=?, adapter_pgid=?, adapter_cgroup=? "
+               "WHERE id=? AND ended_at IS NULL",
+               (pid, self._process_start(pid), self._process_pgrp(pid),
+                self._adapter_cgroup(pid), run_id))
+
+    @staticmethod
+    def _adapter_cgroup(pid: int) -> str | None:
+        """Return only cgroups created by the adapter launcher for this run."""
+        try:
+            for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines():
+                if line.startswith("0::"):
+                    path = line[3:]
+                    return path if Path(path).name.startswith("neocortex-run-") else None
+        except (FileNotFoundError, OSError):
+            pass
+        return None
 
     def end_run(self, run_id: int, outcome: str, detail: str = "", tokens: int | None = None) -> None:
         self.x(

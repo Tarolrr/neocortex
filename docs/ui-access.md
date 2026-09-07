@@ -34,6 +34,7 @@ sessions. Feedback queues planner work for the scheduler to handle later.
 | Cancel | `cancel` | Task → Cancel | ui-tasks |
 | Requeue, fresh branch, budget | `requeue --fresh --budget` | Task → Requeue | ui-tasks |
 | Rollback | `rollback` | Accepted task → Roll back | ui-tasks |
+| Inspect/recover interrupted runs | `runs`, `recover-runs ID --reason ...` | Unfinished runs | T028 |
 | Feedback/plan, proposal revision | `feedback`, `plan` | Project → Feedback / plan, proposal feedback | phase one |
 | Questions/answers | `inbox`, `answer` | Inbox → Answer | phase one |
 | Proposal list/detail | `proposals`, `proposal` | Project → Proposals | phase one |
@@ -59,6 +60,43 @@ Fresh requeue and rollback reserve the SQLite write before touching Git, so
 contention leaves the repository untouched. Rollback records its task transition
 and incident together, and only accepted tasks can be rolled back. Answers share
 the lifecycle lock to avoid racing scheduler outcome integration.
+
+# Interrupted-run walkthrough
+
+`nc runs` is read-only and lists every unfinished run record, including runs
+from other projects and taskless planner/plan-critic roles.  `ended_at IS NULL`
+means only that the record was not finalized; its ownership field is the process
+evidence and must not be read as a liveness claim.  Inspect the recorded agent,
+task-or-role, start time and log before taking action.
+
+Newer records retain a dedicated cgroup created before adapter code executes.
+This lets inspection refuse recovery when an adapter child survives a scheduler
+exit, including a child that calls `setsid()` or changes process group. A
+missing or uninspectable cgroup identity is shown as uncertain and cannot be
+overridden for a new row.
+
+For known interrupted rows, submit `nc recover-runs RUN_ID [RUN_ID ...] --reason "..."`.
+This records `INTERRUPTED`, timestamps and the owner reason without requeueing,
+changing a budget, deleting a worktree or replaying an outcome.  The browser has
+the same selected-runs form at **Unfinished runs** (with an individual-row
+shortcut).  Every submitted selection is validated as one atomic operation:
+one live, unknown, stale or ambiguous row rejects the whole selection.  Live
+ownership is refused.
+
+Legacy rows, and rows made before adapter process-group recording, have
+insufficient ownership evidence. Before adding
+`--acknowledge-quiescence`, document verification of scheduler processes and
+all adapter descendants (for example with `ps`/`pgrep` scoped to this home and
+run log); an inactive systemd unit alone is not sufficient. The acknowledgement
+is intentionally explicit because it is not proof supplied by the database.
+
+Once all actual blockers are recovered, requeue is a separate explicit action.
+For an exhausted task such as T024, use an owner reason and a larger budget, for
+example `nc requeue neocortex-T024 --budget 8 --reason "continue after reviewed interruption"`.
+Recovery itself never does this. UI deployment templates and the deployment
+runbook remain queued in T027 behind T026/T024; this document only describes the
+current loopback UI and SSH forwarding access, and makes no claim about host
+settings already installed.
 
 To check packaging in a disposable environment, build and install a wheel, then
 run that environment's Python with `-I scripts/check_installed_ui.py`. The check

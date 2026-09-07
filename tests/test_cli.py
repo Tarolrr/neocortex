@@ -126,6 +126,69 @@ def test_health_counts(tmp_path, capsys):
     ]
 
 
+def test_runs_inspect_and_recover_selected_legacy_record(tmp_path, capsys):
+    cfg = Config(home=tmp_path / "home")
+    cfg.home.mkdir()
+    state = State(cfg.db_path)
+    state.add_project("demo", "Demo", str(tmp_path), None)
+    task = state.add_task("demo", "Blocked", "objective", [])
+    state.add_agent("worker", "worker", "demo", task, "model")
+    run = state.start_run("worker", task, "worker", "model", "log")
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?", (run,))
+    state.db.close()
+
+    assert main(["--home", str(cfg.home), "runs"]) == 0
+    assert f"#{run} agent=worker" in capsys.readouterr().out
+    assert main(["--home", str(cfg.home), "recover-runs", str(run),
+                 "--reason", "verified scheduler and adapters", "--acknowledge-quiescence"]) == 0
+    assert f"recovered interrupted run IDs: {run}" in capsys.readouterr().out
+
+
+def test_recover_runs_cli_rejects_unknown_finished_and_duplicate_ids(tmp_path, capsys):
+    cfg = Config(home=tmp_path / "home")
+    cfg.home.mkdir()
+    state = State(cfg.db_path)
+    state.add_project("demo", "Demo", str(tmp_path), None)
+    task = state.add_task("demo", "Blocked", "objective", [])
+    state.add_agent("worker", "worker", "demo", task, "model")
+    run = state.start_run("worker", task, "worker", "model", "log")
+    state.end_run(run, "FAIL", "session exception")
+    state.db.close()
+    args = ["--home", str(cfg.home), "recover-runs"]
+    assert main(args + ["99999", "--reason", "x"]) == 1
+    assert "unknown run IDs" in capsys.readouterr().err
+    assert main(args + [str(run), "--reason", "x"]) == 1
+    assert "already finished" in capsys.readouterr().err
+    assert main(args + [str(run), str(run), "--reason", "x"]) == 1
+    assert "distinct" in capsys.readouterr().err
+
+
+def test_recover_runs_cli_contention_and_stale_submission_preserve_state(tmp_path, capsys):
+    cfg = Config(home=tmp_path / "home")
+    cfg.home.mkdir()
+    state = State(cfg.db_path)
+    state.add_project("demo", "Demo", str(tmp_path), None)
+    task = state.add_task("demo", "Blocked", "objective", [])
+    state.add_agent("worker", "worker", "demo", task, "model")
+    run = state.start_run("worker", task, "worker", "model", "log")
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?", (run,))
+    args = ["--home", str(cfg.home), "recover-runs", str(run), "--reason", "checked",
+            "--acknowledge-quiescence"]
+    before = list(state.db.iterdump())
+    state.db.execute("BEGIN IMMEDIATE")
+    try:
+        assert main(args) == 1
+    finally:
+        state.db.rollback()
+    assert list(state.db.iterdump()) == before
+    assert "locked" in capsys.readouterr().err.lower()
+    assert main(args) == 0
+    before_stale = list(state.db.iterdump())
+    assert main(args) == 1
+    assert "already finished" in capsys.readouterr().err
+    assert list(state.db.iterdump()) == before_stale
+
+
 def test_why_evidence(tmp_path, capsys):
     state = State(Config.load(tmp_path).db_path)
     state.add_project("demo", "Demo", str(tmp_path), None)

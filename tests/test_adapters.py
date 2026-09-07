@@ -1,9 +1,10 @@
+import os
+import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from nc.adapters import _run, parse_tokens
+from nc.adapters import _run, adapter_ownership, parse_tokens
 
 
 def test_real_codex_usage(tmp_path, monkeypatch):
@@ -11,12 +12,35 @@ def test_real_codex_usage(tmp_path, monkeypatch):
     sample = (Path(__file__).parent / "fixtures" / "codex-usage.log").read_text()
     assert parse_tokens(sample) == 26457
 
-    def run(cmd, **kwargs):
-        kwargs["stdout"].write(sample)
-        return SimpleNamespace(returncode=0)
+    class Proc:
+        pid = 123
 
-    monkeypatch.setattr("nc.adapters.subprocess.run", run)
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(cmd, **kwargs):
+        kwargs["stdout"].write(sample)
+        return Proc()
+
+    monkeypatch.setattr("nc.adapters.subprocess.Popen", popen)
     assert _run(["codex", "exec"], tmp_path, tmp_path / "session.log", 10).tokens == 26457
+
+
+def test_registration_failure_kills_and_reaps_untracked_adapter(tmp_path):
+    """A DB failure after Popen must not leave a live, unrecorded session."""
+    pid = None
+
+    def reject(new_pid):
+        nonlocal pid
+        pid = new_pid
+        raise RuntimeError("simulated ownership recording failure")
+
+    with adapter_ownership(reject), pytest.raises(RuntimeError, match="recording"):
+        _run([sys.executable, "-c", "import time; time.sleep(30)"], tmp_path,
+             tmp_path / "session.log", 30)
+    assert pid is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 @pytest.mark.parametrize(("text", "expected"), [

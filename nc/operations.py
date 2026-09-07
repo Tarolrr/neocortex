@@ -258,6 +258,59 @@ def submit_feedback(state: State, cfg: Config, project: str | None, text: str,
     return state.planner_feedback(project, text, cfg.model_for("planner"), task, proposal)
 
 
+def request_plan(state: State, cfg: Config, project: str, note: str | None = None) -> tuple[str, int]:
+    """Queue an explicit planning request without running a planner session."""
+    return state.planner_feedback(project, note or "Request a planning pass.",
+                                  cfg.model_for("planner"), plan_request=True)
+
+
+def feedback_history(state: State, project_id: str) -> list[dict]:
+    """Full owner-feedback history for a project, including consumed messages.
+
+    ``delivered`` only records that the planner consumed the message.  It is
+    deliberately not inferred from proposal or task state: a planner may ask a
+    question, propose work, or decide no implementation is appropriate.
+    """
+    get_project(state, project_id)
+    rows = state.q(
+        "SELECT m.* FROM message m JOIN agent a ON a.id=m.recipient"
+        " WHERE m.kind=? AND a.project_id=? ORDER BY m.id",
+        (protocol.FEEDBACK, project_id),
+    )
+    history = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = json.loads(item["payload"])
+        revision = state.one("SELECT original_id, replacement_id FROM proposal_revision"
+                             " WHERE feedback_id=?", (item["id"],))
+        if revision:
+            item["target"] = {"kind": "proposal", "id": revision["original_id"],
+                              "replacement_id": revision["replacement_id"]}
+        elif item["task_id"]:
+            item["target"] = {"kind": "task", "id": item["task_id"]}
+        else:
+            item["target"] = {"kind": "project", "id": project_id}
+        history.append(item)
+    return history
+
+
+def project_owner_questions(state: State, project_id: str,
+                            include_delivered: bool = True) -> list[dict]:
+    """Questions to the owner from this project's workers and taskless planner."""
+    get_project(state, project_id)
+    sql = ("SELECT m.* FROM message m JOIN agent a ON a.id=m.sender"
+           " WHERE m.kind=? AND m.recipient='owner' AND a.project_id=?")
+    if not include_delivered:
+        sql += " AND m.delivered=0"
+    result = []
+    for row in state.q(sql + " ORDER BY m.id", (protocol.QUESTION, project_id)):
+        item = dict(row)
+        item["text"] = json.loads(item["payload"]).get("question", "")
+        item["answerable"] = answerable_question(state, item)
+        result.append(item)
+    return result
+
+
 # --- inbox / answers -------------------------------------------------------
 
 def inbox(state: State, include_delivered: bool = False) -> list[dict]:
@@ -304,6 +357,12 @@ def answer_message(state: State, message_id: int, text: str) -> dict:
             raise ValueError("message is not a currently answerable owner question")
         agent_id = question["sender"]
         now = time.time()
+        # Claim the question before inserting its answer.  The predicate makes
+        # duplicate submits fail even if a caller holds a stale question row.
+        if not state.db.execute(
+            "UPDATE message SET delivered=1 WHERE id=? AND delivered=0", (question["id"],),
+        ).rowcount:
+            raise ValueError("message is not a currently answerable owner question")
         from . import protocol
         state.db.execute(
             "INSERT INTO message(kind,sender,recipient,payload,task_id,in_reply_to,created_at)"
@@ -311,7 +370,6 @@ def answer_message(state: State, message_id: int, text: str) -> dict:
             (protocol.ANSWER, agent_id, json.dumps({"answer": text}),
              question["task_id"], question["id"], now),
         )
-        state.db.execute("UPDATE message SET delivered=1 WHERE id=?", (question["id"],))
         state.db.execute("UPDATE agent SET state='runnable', updated_at=? WHERE id=?",
                          (now, agent_id))
         if question["task_id"]:

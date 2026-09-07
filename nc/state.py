@@ -225,6 +225,8 @@ class State:
                   acceptance: list[str], boundaries: list[str] | None = None,
                   priority: int = 100, budget_turns: int = 6,
                   depends_on: list[str] | None = None) -> str:
+        self._validate_task_fields(project_id, title, objective, acceptance,
+                                   boundaries, priority, budget_turns, depends_on)
         tid = self._next_task_id(project_id)
         now = time.time()
         self.db.execute(
@@ -235,6 +237,27 @@ class State:
              json.dumps(depends_on or []), now, now),
         )
         return tid
+
+    def _validate_task_fields(self, project_id: str, title: str, objective: str,
+                              acceptance: list[str], boundaries: list[str] | None,
+                              priority: int, budget_turns: int,
+                              depends_on: list[str] | None) -> None:
+        """Reject malformed task input before allocating an id or writing state."""
+        if not isinstance(project_id, str) or self.one("SELECT 1 FROM project WHERE id=?",
+                                                       (project_id,)) is None:
+            raise ValueError(f"unknown project: {project_id}")
+        for name, value in (("title", title), ("objective", objective)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} is required and must be text")
+        for name, value in (("acceptance", acceptance),
+                            ("boundaries", [] if boundaries is None else boundaries),
+                            ("depends_on", [] if depends_on is None else depends_on)):
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise ValueError(f"{name} must be a list of strings")
+        if type(priority) is not int:
+            raise ValueError("priority must be an integer")
+        if type(budget_turns) is not int or budget_turns < 1:
+            raise ValueError("budget_turns must be an integer greater than zero")
 
     def cancel_task(self, task_id: str, reason: str) -> bool:
         """Atomically retire a task and its agents, retaining existing evidence."""

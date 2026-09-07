@@ -16,6 +16,7 @@ Nothing here shells out or re-parses `nc` output; it calls `State` methods and
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -153,8 +154,56 @@ def cancel_task(state: State, task_id: str, reason: str) -> bool:
         return state.cancel_task(task_id, reason)
 
 
+
+def _discard_preview(cfg: Config, state: State, task) -> dict:
+    """Fingerprint the task revision, branch and all discarded worktree content."""
+    repo = Path(get_project(state, task["project_id"])["repo_path"])
+    branch = f"nc/{task['id']}"
+    commit = arbiter.git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
+                         check=False)
+    worktree = cfg.work_dir / task["id"]
+    digest = hashlib.sha256()
+    files = 0
+
+    def scan(path):
+        nonlocal files
+        info = path.lstat()
+        digest.update(json.dumps([str(path.relative_to(worktree)), info.st_mode]).encode())
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode())
+        elif path.is_dir():
+            for child in sorted(path.iterdir()):
+                scan(child)
+        elif path.is_file():
+            files += 1
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            raise ValueError("Cannot confirm special files in worktree")
+    if worktree.exists() or worktree.is_symlink():
+        scan(worktree)
+    snapshot = {"task_id": task["id"], "status": task["status"],
+                "updated_at": task["updated_at"], "budget": task["budget_turns"],
+                "branch": branch, "commit": commit or None, "worktree": str(worktree),
+                "files": files, "content": digest.hexdigest()}
+    snapshot["token"] = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
+    return snapshot
+
+
+def discard_preview(cfg: Config, state: State, task_id: str) -> dict:
+    with lifecycle_lock(state):
+        task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+        if task is None:
+            raise LookupError(f"unknown task: {task_id}")
+        repo = Path(get_project(state, task["project_id"])["repo_path"])
+        with repository_lock(repo):
+            return _discard_preview(cfg, state, task)
+
+
 def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
-                 budget: int | None = None, reason: str | None = None) -> dict:
+                 budget: int | None = None, reason: str | None = None,
+                 expected_discard: str | None = None) -> dict:
     """Put a task back in the queue, optionally discarding its branch and worktree."""
     if budget is not None and budget < 1:
         raise ValueError("turn budget must be greater than zero")
@@ -169,6 +218,10 @@ def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
         project = get_project(state, task["project_id"])
         repo = Path(project["repo_path"])
         with repository_lock(repo):
+            if fresh and (not expected_discard or
+                          expected_discard != _discard_preview(cfg, state, task)["token"]):
+                raise ValueError("Confirm the current discarded work before fresh requeue; "
+                                 "reload the task or use --preview-discard and retry")
             with state.db:
                 state.db.execute("BEGIN IMMEDIATE")
                 if fresh:

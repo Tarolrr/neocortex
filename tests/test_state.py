@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from nc import protocol
 from nc.state import State
 
@@ -35,6 +37,24 @@ def test_task_fields_roundtrip(tmp_path):
     state.set_task(tid, status="in_review", attempts=1)
     row = state.one("SELECT * FROM task WHERE id=?", (tid,))
     assert (row["status"], row["attempts"]) == ("in_review", 1)
+
+
+@pytest.mark.parametrize("kwargs, message", [
+    ({"title": " "}, "title"),
+    ({"objective": None}, "objective"),
+    ({"acceptance": "not a list"}, "acceptance"),
+    ({"boundaries": "not a list"}, "boundaries"),
+    ({"depends_on": [1]}, "depends_on"),
+    ({"priority": True}, "priority"),
+    ({"budget_turns": 0}, "budget_turns"),
+])
+def test_add_task_rejects_invalid_fields_before_allocating_an_id(tmp_path, kwargs, message):
+    state = make_state(tmp_path)
+    fields = {"title": "title", "objective": "objective", "acceptance": []}
+    fields.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        state.add_task("neocortex", **fields)
+    assert state.one("SELECT id FROM task") is None
 
 
 def test_inbox_delivers_once(tmp_path):

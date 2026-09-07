@@ -73,8 +73,11 @@ def cmd_requeue(args) -> int:
     """Put a task back in the queue, optionally from a clean branch off the base."""
     cfg, state = _open(args)
     try:
+        if args.preview_discard:
+            print(json.dumps(operations.discard_preview(cfg, state, args.task_id), indent=2))
+            return 0
         result = operations.requeue_task(cfg, state, args.task_id, args.fresh,
-                                         args.budget, args.reason)
+                                         args.budget, args.reason, args.confirm_discard)
     except (ValueError, LookupError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -477,6 +480,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("requeue", help="put a blocked or failed task back in the queue")
     sp.add_argument("task_id")
+    sp.add_argument("--preview-discard", action="store_true", help="show exact fresh discard target")
+    sp.add_argument("--confirm-discard", help="token from --preview-discard")
     sp.add_argument("--fresh", action="store_true",
                     help="discard its branch and worktree and start from the base branch")
     sp.add_argument("--reason")

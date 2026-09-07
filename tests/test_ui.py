@@ -213,8 +213,9 @@ def test_fresh_cleanup_failure_preserves_database(browser, monkeypatch):
         raise RuntimeError("worktree removal failed")
 
     monkeypatch.setattr(arbiter, "remove_worktree", fail)
+    token = operations.discard_preview(cfg, state, tid)["token"]
     with pytest.raises(RuntimeError, match="worktree removal failed"):
-        operations.requeue_task(cfg, state, tid, fresh=True)
+        operations.requeue_task(cfg, state, tid, fresh=True, expected_discard=token)
     assert list(state.db.iterdump()) == before
 
 
@@ -252,12 +253,13 @@ def test_database_contention_precedes_repository_changes(browser, monkeypatch, a
     monkeypatch.setattr(arbiter, "remove_worktree", lambda *args: calls.append(args))
     monkeypatch.setattr(arbiter, "revert", lambda *args: calls.append(args))
     other = State(cfg.db_path, initialize=False, timeout=0.01)
+    discard = operations.discard_preview(cfg, other, tid)["token"] if action == "fresh" else None
     before = list(state.db.iterdump())
     state.db.execute("BEGIN IMMEDIATE")
     try:
         with pytest.raises(sqlite3.OperationalError, match="locked"):
             if action == "fresh":
-                operations.requeue_task(cfg, other, tid, fresh=True)
+                operations.requeue_task(cfg, other, tid, fresh=True, expected_discard=discard)
             else:
                 operations.rollback_task(other, tid)
     finally:
@@ -587,3 +589,41 @@ def test_uploaded_json_content(browser, payload, expected):
         assert task['budget_turns'] == 9
         assert task['priority'] == 7
         assert task['boundaries'] == '["scope"]'
+
+
+def test_fresh_discard_confirmation_tracks_uncommitted_content(browser):
+    from nc import operations
+
+    cfg, state, tid, _, _ = browser
+    worktree = cfg.work_dir / tid
+    worktree.mkdir(parents=True)
+    content = worktree / "untracked.txt"
+    content.write_text("first")
+    preview = operations.discard_preview(cfg, state, tid)
+    content.write_text("second")
+    before = list(state.db.iterdump())
+    with pytest.raises(ValueError, match="Confirm the current discarded work"):
+        operations.requeue_task(cfg, state, tid, fresh=True,
+                                expected_discard=preview["token"])
+    assert content.read_text() == "second"
+    assert list(state.db.iterdump()) == before
+    current = operations.discard_preview(cfg, state, tid)
+    assert current["token"] != preview["token"]
+    with pytest.raises(ValueError, match="Confirm the current discarded work"):
+        operations.requeue_task(cfg, state, tid, fresh=True)
+    assert list(state.db.iterdump()) == before
+
+
+def test_fresh_discard_confirmation_tracks_task_budget(browser):
+    from nc import operations
+
+    cfg, state, tid, _, _ = browser
+    preview = operations.discard_preview(cfg, state, tid)
+    operations.requeue_task(cfg, state, tid, budget=20)
+    before = list(state.db.iterdump())
+    with pytest.raises(ValueError, match="Confirm the current discarded work"):
+        operations.requeue_task(cfg, state, tid, fresh=True,
+                                expected_discard=preview["token"])
+    assert list(state.db.iterdump()) == before
+    current = operations.discard_preview(cfg, state, tid)
+    operations.requeue_task(cfg, state, tid, fresh=True, expected_discard=current["token"])

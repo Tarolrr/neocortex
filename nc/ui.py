@@ -253,6 +253,12 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 <button type="submit">Cancel task</button>
 </form></details>""")
     if task["status"] != "done":
+        try:
+            preview = operations.discard_preview(cfg, state, task["id"])
+            discard = (f'<pre>{_e(json.dumps(preview, indent=2))}</pre>'
+                       f'<input type="hidden" name="expected_discard" value="{preview["token"]}">')
+        except ValueError as exc:
+            discard = f"<p>{_e(str(exc))}</p>"
         actions.append(f"""
 <details><summary>Requeue this task</summary>
 <form method="post" action="/t/{_segment(task["id"])}/requeue">
@@ -262,7 +268,8 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 <div class="field"><label for="budget">New turn budget (optional)</label>
 <input id="budget" name="budget" type="number" min="1"></div>
 <div class="field checkbox"><input id="fresh" name="fresh" type="checkbox" value="1">
-<label for="fresh">Start from a fresh branch (discard worktree and branch)</label></div>
+<label for="fresh">Confirm discarding the branch and worktree shown below</label></div>
+{discard}
 <button type="submit">Requeue</button>
 </form></details>""")
     if task["status"] == "done" and task["merge_commit"]:
@@ -569,7 +576,8 @@ def _post_requeue(h: Handler, state, params, query, form):
         return
     try:
         result = operations.requeue_task(h.cfg, state, task_id, form.get("fresh") == "1",
-                                         budget_value, form.get("reason") or None)
+                                         budget_value, form.get("reason") or None,
+                                         form.get("expected_discard"))
     except (ValueError, LookupError) as exc:
         h.redirect(f"/t/{_segment(task_id)}", error=str(exc))
         return

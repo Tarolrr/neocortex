@@ -256,7 +256,10 @@ def test_requeue_restarts_a_blocked_task_from_the_base_branch(setup):
     scheduler.step()
     state.set_task(tid, status="blocked")
 
-    assert cli.main(["--home", str(cfg.home), "requeue", tid, "--fresh"]) == 0
+    from nc import operations
+    token = operations.discard_preview(cfg, state, tid)["token"]
+    assert cli.main(["--home", str(cfg.home), "requeue", tid, "--fresh",
+                     "--confirm-discard", token]) == 0
     task = state.one("SELECT * FROM task WHERE id=?", (tid,))
     assert task["status"] == "queued" and task["attempts"] == 0
     assert all(agent["turns"] == 0 and agent["state"] == "blocked"
@@ -1050,7 +1053,10 @@ def test_owner_answers_scheduler_question(setup, role, channel, capsys):
                                     {"question": "Old question"}, tid)
             operations.rollback_task(
                 state, tid, state.one("SELECT merge_commit FROM task WHERE id=?", (tid,))[0])
-            operations.requeue_task(cfg, state, tid, fresh=role == "fresh")
+            discard = (operations.discard_preview(cfg, state, tid)["token"]
+                       if role == "fresh" else None)
+            operations.requeue_task(cfg, state, tid, fresh=role == "fresh",
+                                    expected_discard=discard)
             assert state.one("SELECT merge_commit FROM task WHERE id=?", (tid,))[0]
             with pytest.raises(ValueError, match="not a currently answerable"):
                 operations.answer_message(state, historical, "Obsolete")

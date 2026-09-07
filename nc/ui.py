@@ -52,6 +52,11 @@ def _e(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
+def _segment(value: str) -> str:
+    """Encode an identifier as one URL path segment, including reserved slashes."""
+    return urllib.parse.quote(value, safe="")
+
+
 # TODO(FU-001, FU-002): scheduler/incident administration remains CLI-only;
 # see docs/follow-ups.md before adding navigation and mutation routes.
 def _nav(active: str) -> str:
@@ -115,7 +120,7 @@ def _project_list_page(state: State) -> str:
         body = "<p>No projects are registered yet. Run <code>nc project</code> from the CLI.</p>"
     else:
         items = "".join(
-            f'<li><a href="/p/{_e(row["id"])}/tasks">{_e(row["title"])}</a> '
+            f'<li><a href="/p/{_segment(row["id"])}/tasks">{_e(row["title"])}</a> '
             f'<span class="muted">({_e(row["id"])})</span></li>'
             for row in rows
         )
@@ -131,7 +136,7 @@ def _task_row(row: dict) -> str:
         deps = ", ".join(_e(d) for d in row["unmet_dependencies"])
         waiting = f'<br><span class="muted">waits for {deps}</span>'
     return (
-        f'<tr><td><a href="/t/{_e(row["id"])}">{_e(row["id"])}</a></td>'
+        f'<tr><td><a href="/t/{_segment(row["id"])}">{_e(row["id"])}</a></td>'
         f'<td>{_e(row["status"])}</td><td>{row["attempts"]}</td>'
         f'<td>{_e(row["title"])}{waiting}</td></tr>'
     )
@@ -140,16 +145,16 @@ def _task_row(row: dict) -> str:
 def _task_list_page(state: State, project: dict, include_cancelled: bool, flash: str, error: str) -> str:
     rows = operations.tasks(state, project["id"], include_cancelled)
     table = "".join(_task_row(r) for r in rows) or '<tr><td colspan="4">(no tasks)</td></tr>'
-    toggle_href = f'/p/{_e(project["id"])}/tasks' + ("" if include_cancelled else "?all=1")
+    toggle_href = f'/p/{_segment(project["id"])}/tasks' + ("" if include_cancelled else "?all=1")
     toggle_label = "Hide cancelled tasks" if include_cancelled else "Show cancelled tasks"
     body = f"""
 {_flash('ok', flash)}{_flash('error', error)}
 <h2>{_e(project["title"])} tasks</h2>
 <p>
-<a href="/p/{_e(project["id"])}/tasks/new">New task</a> ·
-<a href="/p/{_e(project["id"])}/tasks/import">Import JSON</a> ·
-<a href="/p/{_e(project["id"])}/proposals">Proposals</a> ·
-<a href="/p/{_e(project["id"])}/feedback">Feedback / plan</a> ·
+<a href="/p/{_segment(project["id"])}/tasks/new">New task</a> ·
+<a href="/p/{_segment(project["id"])}/tasks/import">Import JSON</a> ·
+<a href="/p/{_segment(project["id"])}/proposals">Proposals</a> ·
+<a href="/p/{_segment(project["id"])}/feedback">Feedback / plan</a> ·
 <a href="{toggle_href}">{toggle_label}</a>
 </p>
 <table>
@@ -168,7 +173,7 @@ def _task_new_page(project: dict, csrf: str, error: str, values: dict) -> str:
     body = f"""
 {_flash('error', error)}
 <h2>New task in {_e(project["title"])}</h2>
-<form method="post" action="/p/{_e(project["id"])}/tasks/new">
+<form method="post" action="/p/{_segment(project["id"])}/tasks/new">
 {_csrf_field(csrf)}
 <div class="field"><label for="title">Title</label>
 <input id="title" name="title" required value="{v('title')}"></div>
@@ -195,7 +200,7 @@ def _task_import_page(project: dict, csrf: str, error: str, raw: str) -> str:
 <h2>Import task JSON into {_e(project["title"])}</h2>
 <p>Paste one task spec object, or a JSON list of task specs (the same shape as
 <code>nc task --file</code>).</p>
-<form method="post" action="/p/{_e(project["id"])}/tasks/import">
+<form method="post" action="/p/{_segment(project["id"])}/tasks/import">
 {_csrf_field(csrf)}
 <div class="field"><label for="spec">Task spec JSON</label>
 <textarea id="spec" name="spec" required rows="12">{_e(raw)}</textarea></div>
@@ -217,7 +222,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
         depends = f"<p>Depends on: {_e(', '.join(task['depends_on']))}{status}</p>"
     for dep in task["cancelled_dependencies"]:
         depends += (f'<p role="alert">{_e(dep)}: cancelled; dependency remains unmet '
-                    f'(<a href="/t/{_e(dep)}">inspect</a>)</p>')
+                    f'(<a href="/t/{_segment(dep)}">inspect</a>)</p>')
 
     criteria = "".join(f"<li>{_e(c)}</li>" for c in task["acceptance"]) or "<li>(none)</li>"
     runs = "".join(
@@ -237,7 +242,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
     if task["status"] not in ("done", "cancelled"):
         actions.append(f"""
 <details><summary>Cancel this task</summary>
-<form method="post" action="/t/{_e(task["id"])}/cancel">
+<form method="post" action="/t/{_segment(task["id"])}/cancel">
 {_csrf_field(csrf)}
 <div class="field"><label for="cancel_reason">Reason</label>
 <input id="cancel_reason" name="reason" required></div>
@@ -246,7 +251,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
     if task["status"] != "done":
         actions.append(f"""
 <details><summary>Requeue this task</summary>
-<form method="post" action="/t/{_e(task["id"])}/requeue">
+<form method="post" action="/t/{_segment(task["id"])}/requeue">
 {_csrf_field(csrf)}
 <div class="field"><label for="requeue_reason">Reason (optional)</label>
 <input id="requeue_reason" name="reason"></div>
@@ -259,7 +264,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
     if task["status"] == "done" and task["merge_commit"]:
         actions.append(f"""
 <details><summary>Roll back this accepted task</summary>
-<form method="post" action="/t/{_e(task["id"])}/rollback">
+<form method="post" action="/t/{_segment(task["id"])}/rollback">
 {_csrf_field(csrf)}
 <p>Reverts merge commit <code>{_e(task["merge_commit"])}</code> and opens an incident.</p>
 <button type="submit">Roll back</button>
@@ -269,7 +274,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 {_flash('ok', flash)}{_flash('error', error)}
 <h2>{_e(task["id"])}: {_e(task["title"])}</h2>
 <p>status: <strong>{_e(task["status"])}</strong> ·
-<a href="/p/{_e(task["project_id"])}/tasks">back to tasks</a></p>
+<a href="/p/{_segment(task["project_id"])}/tasks">back to tasks</a></p>
 {depends}
 <h3>Objective</h3>
 <pre>{_e(task["objective"])}</pre>
@@ -300,7 +305,7 @@ def _proposal_list_page(state: State, project: dict, flash: str, error: str) -> 
     body = f"""
 {_flash('ok', flash)}{_flash('error', error)}
 <h2>{_e(project["title"])} proposals</h2>
-<p><a href="/p/{_e(project["id"])}/tasks">back to tasks</a></p>
+<p><a href="/p/{_segment(project["id"])}/tasks">back to tasks</a></p>
 <ul class="list">{items}</ul>"""
     return _page("Proposals", "projects", body)
 
@@ -340,7 +345,7 @@ def _proposal_detail_page(state: State, detail: dict, csrf: str, error: str, fla
     body = f"""
 {_flash('ok', flash)}{_flash('error', error)}
 <h2>Proposal #{detail['id']} ({_e(detail['status'])})</h2>
-<p><a href="/p/{_e(detail['project_id'])}/proposals">back to proposals</a></p>
+<p><a href="/p/{_segment(detail['project_id'])}/proposals">back to proposals</a></p>
 <p>{_e(detail['rationale'])}</p>
 <h3>Findings</h3>
 <ul>{findings or '<li>(none)</li>'}</ul>
@@ -360,8 +365,8 @@ def _feedback_page(project: dict, csrf: str, flash: str, error: str) -> str:
     body = f"""
 {_flash('ok', flash)}{_flash('error', error)}
 <h2>Feedback / plan for {_e(project["title"])}</h2>
-<p><a href="/p/{_e(project["id"])}/tasks">back to tasks</a></p>
-<form method="post" action="/p/{_e(project["id"])}/feedback">
+<p><a href="/p/{_segment(project["id"])}/tasks">back to tasks</a></p>
+<form method="post" action="/p/{_segment(project["id"])}/feedback">
 {_csrf_field(csrf)}
 <div class="field"><label for="text">Message to the project planner</label>
 <textarea id="text" name="text" required rows="5"></textarea></div>
@@ -445,7 +450,7 @@ def _require_project(state: State, project_id: str) -> dict:
     return operations.get_project(state, project_id)
 
 
-@route("GET", r"^/p/(?P<project>[\w.-]+)/tasks$")
+@route("GET", r"^/p/(?P<project>[^/]+)/tasks$")
 def _view_tasks(h: Handler, state, params, query):
     project = _require_project(state, params["project"])
     include_cancelled = query.get("all") == "1"
@@ -454,13 +459,13 @@ def _view_tasks(h: Handler, state, params, query):
     ))
 
 
-@route("GET", r"^/p/(?P<project>[\w.-]+)/tasks/new$")
+@route("GET", r"^/p/(?P<project>[^/]+)/tasks/new$")
 def _view_task_new(h: Handler, state, params, query):
     project = _require_project(state, params["project"])
     h.send_html(HTTPStatus.OK, _task_new_page(project, h.csrf_token, "", {}))
 
 
-@route("POST", r"^/p/(?P<project>[\w.-]+)/tasks/new$")
+@route("POST", r"^/p/(?P<project>[^/]+)/tasks/new$")
 def _post_task_new(h: Handler, state, params, query, form):
     project = _require_project(state, params["project"])
     acceptance = _lines(form.get("acceptance", ""))
@@ -487,16 +492,16 @@ def _post_task_new(h: Handler, state, params, query, form):
             project, h.csrf_token, str(exc), form,
         ))
         return
-    h.redirect(f"/t/{urllib.parse.quote(tid)}")
+    h.redirect(f"/t/{_segment(tid)}")
 
 
-@route("GET", r"^/p/(?P<project>[\w.-]+)/tasks/import$")
+@route("GET", r"^/p/(?P<project>[^/]+)/tasks/import$")
 def _view_task_import(h: Handler, state, params, query):
     project = _require_project(state, params["project"])
     h.send_html(HTTPStatus.OK, _task_import_page(project, h.csrf_token, "", ""))
 
 
-@route("POST", r"^/p/(?P<project>[\w.-]+)/tasks/import$")
+@route("POST", r"^/p/(?P<project>[^/]+)/tasks/import$")
 def _post_task_import(h: Handler, state, params, query, form):
     project = _require_project(state, params["project"])
     raw = form.get("spec", "")
@@ -514,11 +519,11 @@ def _post_task_import(h: Handler, state, params, query, form):
             project, h.csrf_token, f"invalid task spec: {exc}", raw,
         ))
         return
-    h.redirect(f"/p/{urllib.parse.quote(project['id'])}/tasks",
+    h.redirect(f"/p/{_segment(project['id'])}/tasks",
               ok=f"imported {len(ids)} task(s): {', '.join(ids)}")
 
 
-@route("GET", r"^/t/(?P<task_id>[\w.-]+)$")
+@route("GET", r"^/t/(?P<task_id>[^/]+)$")
 def _view_task(h: Handler, state, params, query):
     task = operations.task_detail(state, h.cfg, params["task_id"])
     h.send_html(HTTPStatus.OK, _task_detail_page(
@@ -526,51 +531,51 @@ def _view_task(h: Handler, state, params, query):
     ))
 
 
-@route("POST", r"^/t/(?P<task_id>[\w.-]+)/cancel$")
+@route("POST", r"^/t/(?P<task_id>[^/]+)/cancel$")
 def _post_cancel(h: Handler, state, params, query, form):
     task_id = params["task_id"]
     try:
         operations.cancel_task(state, task_id, form.get("reason", ""))
     except (ValueError, LookupError) as exc:
-        h.redirect(f"/t/{urllib.parse.quote(task_id)}", error=str(exc))
+        h.redirect(f"/t/{_segment(task_id)}", error=str(exc))
         return
-    h.redirect(f"/t/{urllib.parse.quote(task_id)}", ok="task cancelled")
+    h.redirect(f"/t/{_segment(task_id)}", ok="task cancelled")
 
 
-@route("POST", r"^/t/(?P<task_id>[\w.-]+)/requeue$")
+@route("POST", r"^/t/(?P<task_id>[^/]+)/requeue$")
 def _post_requeue(h: Handler, state, params, query, form):
     task_id = params["task_id"]
     budget = form.get("budget") or ""
     try:
         budget_value = int(budget) if budget.strip() else None
     except ValueError:
-        h.redirect(f"/t/{urllib.parse.quote(task_id)}", error="turn budget must be a number")
+        h.redirect(f"/t/{_segment(task_id)}", error="turn budget must be a number")
         return
     try:
         result = operations.requeue_task(h.cfg, state, task_id, form.get("fresh") == "1",
                                          budget_value, form.get("reason") or None)
     except (ValueError, LookupError) as exc:
-        h.redirect(f"/t/{urllib.parse.quote(task_id)}", error=str(exc))
+        h.redirect(f"/t/{_segment(task_id)}", error=str(exc))
         return
     ok = "queued again" + (" from a fresh branch" if result["fresh"] else "")
-    h.redirect(f"/t/{urllib.parse.quote(task_id)}", ok=ok)
+    h.redirect(f"/t/{_segment(task_id)}", ok=ok)
 
 
-@route("POST", r"^/t/(?P<task_id>[\w.-]+)/rollback$")
+@route("POST", r"^/t/(?P<task_id>[^/]+)/rollback$")
 def _post_rollback(h: Handler, state, params, query, form):
     task_id = params["task_id"]
     try:
         result = operations.rollback_task(state, task_id)
     except LookupError as exc:
-        h.redirect(f"/t/{urllib.parse.quote(task_id)}", error=str(exc))
+        h.redirect(f"/t/{_segment(task_id)}", error=str(exc))
         return
     ok = f"reverted {result['reverted_commit']} in {result['commit']}"
     if result["mirror_error"]:
         ok += f"; mirror push failed: {result['mirror_error']}"
-    h.redirect(f"/t/{urllib.parse.quote(task_id)}", ok=ok)
+    h.redirect(f"/t/{_segment(task_id)}", ok=ok)
 
 
-@route("GET", r"^/p/(?P<project>[\w.-]+)/proposals$")
+@route("GET", r"^/p/(?P<project>[^/]+)/proposals$")
 def _view_proposals(h: Handler, state, params, query):
     project = _require_project(state, params["project"])
     h.send_html(HTTPStatus.OK, _proposal_list_page(
@@ -608,7 +613,7 @@ def _post_reject(h: Handler, state, params, query, form):
     h.redirect(f"/proposals/{proposal_id}", ok="rejected")
 
 
-@route("GET", r"^/p/(?P<project>[\w.-]+)/feedback$")
+@route("GET", r"^/p/(?P<project>[^/]+)/feedback$")
 def _view_feedback(h: Handler, state, params, query):
     project = _require_project(state, params["project"])
     h.send_html(HTTPStatus.OK, _feedback_page(
@@ -616,7 +621,7 @@ def _view_feedback(h: Handler, state, params, query):
     ))
 
 
-@route("POST", r"^/p/(?P<project>[\w.-]+)/feedback$")
+@route("POST", r"^/p/(?P<project>[^/]+)/feedback$")
 def _post_feedback(h: Handler, state, params, query, form):
     project = _require_project(state, params["project"])
     task = (form.get("task") or "").strip() or None
@@ -624,7 +629,7 @@ def _post_feedback(h: Handler, state, params, query, form):
     try:
         proposal = int(proposal_raw) if proposal_raw else None
     except ValueError:
-        h.redirect(f"/p/{urllib.parse.quote(project['id'])}/feedback",
+        h.redirect(f"/p/{_segment(project['id'])}/feedback",
                   error="proposal id must be a number")
         return
     try:
@@ -632,9 +637,9 @@ def _post_feedback(h: Handler, state, params, query, form):
             state, h.cfg, project["id"], form.get("text", ""), task, proposal,
         )
     except (ValueError, LookupError) as exc:
-        h.redirect(f"/p/{urllib.parse.quote(project['id'])}/feedback", error=str(exc))
+        h.redirect(f"/p/{_segment(project['id'])}/feedback", error=str(exc))
         return
-    h.redirect(f"/p/{urllib.parse.quote(project['id'])}/feedback",
+    h.redirect(f"/p/{_segment(project['id'])}/feedback",
               ok=f"queued feedback #{message_id} for {agent_id}")
 
 
@@ -681,7 +686,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         self.session_is_new = False
         parsed = urllib.parse.urlsplit(self.path)
-        path = urllib.parse.unquote(parsed.path)
+        # Match encoded segments before decoding identifiers that may contain '/'.
+        path = parsed.path
 
         if not self._valid_host():
             self.send_response(HTTPStatus.BAD_REQUEST)
@@ -741,7 +747,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         try:
-            args = (self, state, match.groupdict(), query)
+            params = {key: urllib.parse.unquote(value) for key, value in match.groupdict().items()}
+            args = (self, state, params, query)
             if method == "POST":
                 args = (*args, form)
             view(*args)

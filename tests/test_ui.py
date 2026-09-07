@@ -462,3 +462,39 @@ def test_conflicting_rollback_cleans_own_revert(browser, tmp_path):
     assert arbiter.git(repo, "rev-parse", "HEAD") == commits[2]
     assert not (repo / ".git" / "REVERT_HEAD").exists()
     assert (repo / "f").read_text() == "later\n"
+
+
+@pytest.mark.parametrize("project_id", ["demo+tools", "demo?#&\"<tools>", "demo/tools%2F café"])
+def test_identifier_urls_round_trip(browser, project_id):
+    cfg, state, _, server, request = browser
+    state.add_project(project_id, "Special project", str(cfg.home), None)
+    tid = state.add_task(project_id, "Special task", "objective", [])
+    project_path = "/p/" + urllib.parse.quote(project_id, safe="")
+    task_path = "/t/" + urllib.parse.quote(tid, safe="")
+    before = list(state.db.iterdump())
+    assert f'href="{project_path}/tasks"' in request("/projects")[2]
+    for suffix in ("tasks", "tasks/new", "tasks/import", "feedback", "proposals"):
+        status, _, body = request(f"{project_path}/{suffix}")
+        assert status == 200, body
+        if suffix in ("tasks/new", "tasks/import", "feedback"):
+            assert f'action="{project_path}/{suffix}"' in body
+    assert f'href="{task_path}"' in request(project_path + "/tasks")[2]
+    status, headers, body = request(task_path)
+    assert status == 200, body
+    assert f'href="{project_path}/tasks"' in body
+    assert f'action="{task_path}/cancel"' in body
+    assert list(state.db.iterdump()) == before
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    valid = {"Cookie": headers["Set-Cookie"].split(";")[0],
+             "Origin": f"http://127.0.0.1:{server.server_port}"}
+    status, headers, _ = request(task_path + "/cancel", "POST",
+        {"csrf_token": token, "reason": "owner cancelled"}, valid)
+    assert status == 303
+    assert headers["Location"].split("?")[0] == task_path
+    assert request(headers["Location"])[0] == 200
+    assert state.one("SELECT status FROM task WHERE id=?", (tid,))["status"] == "cancelled"
+    status, headers, body = request(project_path + "/tasks/new", "POST",
+        {"csrf_token": token, "title": "Created in UI", "objective": "objective"}, valid)
+    assert status == 303, body
+    assert headers["Location"] == "/t/" + urllib.parse.quote(project_id + "-T002", safe="")
+    assert request(headers["Location"])[0] == 200

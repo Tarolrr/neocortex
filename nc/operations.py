@@ -279,7 +279,9 @@ def answerable_question(state: State, question) -> bool:
         return False
     if question["task_id"]:
         task = state.one("SELECT * FROM task WHERE id=?", (question["task_id"],))
-        if task is None or task["status"] in ("done", "cancelled") or task["merge_commit"]:
+        # merge_commit survives rollback as history; status tracks current acceptance.
+        # Requeue retires old owner messages before starting the next lifecycle.
+        if task is None or task["status"] in ("done", "cancelled"):
             return False
     return True
 

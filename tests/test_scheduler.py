@@ -1023,7 +1023,7 @@ def test_revision_rejects_done_from_failed_session(setup, timed_out):
     assert not state.q('SELECT * FROM task')
 
 
-@pytest.mark.parametrize("role", ["worker", "planner"])
+@pytest.mark.parametrize("role", ["worker", "planner", "requeued", "fresh"])
 @pytest.mark.parametrize("channel", ["cli", "http"])
 def test_owner_answers_scheduler_question(setup, role, channel, capsys):
     import http.client
@@ -1033,9 +1033,25 @@ def test_owner_answers_scheduler_question(setup, role, channel, capsys):
     from nc.ui import make_server
 
     cfg, state, _repo = setup
-    if role == "worker":
+    if role != "planner":
         tid = state.add_task("neocortex", "question", "ask owner", [])
         agent_id = f"worker-{tid}"
+        if role in ("requeued", "fresh"):
+            from nc import operations
+
+            accepted = sched(cfg, state, [
+                commit_and_emit("marker.txt", "accepted\n", {"outcome": "DONE", "summary": "done"}),
+                emit({"outcome": "DONE", "verdict": "pass", "summary": "accepted"}),
+            ])
+            assert accepted.step() == protocol.DONE
+            assert accepted.step() == protocol.DONE
+            historical = state.send(protocol.QUESTION, agent_id, "owner",
+                                    {"question": "Old question"}, tid)
+            operations.rollback_task(state, tid)
+            operations.requeue_task(cfg, state, tid, fresh=role == "fresh")
+            assert state.one("SELECT merge_commit FROM task WHERE id=?", (tid,))[0]
+            with pytest.raises(ValueError, match="not a currently answerable"):
+                operations.answer_message(state, historical, "Obsolete")
     else:
         tid = None
         agent_id = "planner-neocortex"

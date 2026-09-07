@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from collections.abc import Iterable
@@ -171,6 +172,13 @@ class State:
             ("incident", "resolution_note", "TEXT"),
             ("task", "merge_commit", "TEXT"),
             ("task", "depends_on", "TEXT NOT NULL DEFAULT '[]'"),
+            # These are deliberately additive.  A NULL owner is a legacy,
+            # uncertain record, never evidence that a session is dead.
+            ("run", "owner_pid", "INTEGER"),
+            ("run", "owner_start", "TEXT"),
+            ("run", "interrupted_at", "REAL"),
+            ("run", "recovered_at", "REAL"),
+            ("run", "recovery_reason", "TEXT"),
         ):
             known = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             if column not in known:
@@ -504,11 +512,21 @@ class State:
             ):
                 raise ValueError("cannot start a run for a cancelled task")
             cur = self.db.execute(
-                "INSERT INTO run(agent_id,task_id,role,model,log_path,started_at)"
-                " VALUES(?,?,?,?,?,?)",
-                (agent_id, task_id, role, model, log_path, time.time()),
+                "INSERT INTO run(agent_id,task_id,role,model,log_path,started_at,owner_pid,owner_start)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (agent_id, task_id, role, model, log_path, time.time(), os.getpid(),
+                 self._process_start(os.getpid())),
             )
             return int(cur.lastrowid)
+
+    @staticmethod
+    def _process_start(pid: int) -> str | None:
+        """Linux PID start ticks prevent PID reuse from looking like ownership."""
+        try:
+            # Field 22 is starttime. comm may contain spaces, hence rsplit.
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+        except (FileNotFoundError, IndexError, OSError):
+            return None
 
     def end_run(self, run_id: int, outcome: str, detail: str = "", tokens: int | None = None) -> None:
         self.x(

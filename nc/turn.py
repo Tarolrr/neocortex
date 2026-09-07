@@ -208,14 +208,22 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
 
     model = agent["model"]
     run_id = state.start_run(agent["id"], agent["task_id"], agent["role"], model, str(log_path))
-    result = adapter.run(brief, cwd, model, log_path, cfg.turn_timeout_s)
-    outcome = protocol.read_outcome(outcome_path)
-
-    if outcome.kind == protocol.NO_OUTCOME and result.timed_out:
-        outcome.summary = f"turn timed out after {cfg.turn_timeout_s}s without an outcome file"
-
-    state.end_run(run_id, outcome.kind, outcome.summary, result.tokens)
-    state.mark_delivered(inbox_ids)
+    tokens = None
+    try:
+        result = adapter.run(brief, cwd, model, log_path, cfg.turn_timeout_s)
+        tokens = result.tokens
+        outcome = protocol.read_outcome(outcome_path)
+        if outcome.kind == protocol.NO_OUTCOME and result.timed_out:
+            outcome.summary = f"turn timed out after {cfg.turn_timeout_s}s without an outcome file"
+    except Exception as exc:
+        logging.getLogger(__name__).exception("%s session failed", agent["role"])
+        outcome = protocol.Outcome(kind=protocol.FAIL,
+                                   summary=f"{agent['role']} session failure: {exc}")
+    # Session exceptions are evidence too.  Do not deliver inbox messages: a
+    # retry must retain feedback/questions that were never successfully used.
+    state.end_run(run_id, outcome.kind, outcome.summary, tokens)
+    if outcome.kind != protocol.FAIL:
+        state.mark_delivered(inbox_ids)
     state.set_agent(agent["id"], turns=agent["turns"] + 1,
                     memo=outcome.memo or agent["memo"])
     return outcome

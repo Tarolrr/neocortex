@@ -17,6 +17,7 @@ Nothing here shells out or re-parses `nc` output; it calls `State` methods and
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -34,6 +35,96 @@ def age(ts: float) -> str:
     if delta < 86400:
         return f"{delta // 3600}h"
     return f"{delta // 86400}d"
+
+
+def _owner_status(row: dict) -> str:
+    """Return evidence, not a guess based on task/service state."""
+    pid, started = row.get("owner_pid"), row.get("owner_start")
+    if pid is None or not started:
+        return "uncertain (legacy ownership evidence is absent)"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "owner process is gone"
+    except PermissionError:
+        return "uncertain (owner process cannot be inspected)"
+    current = State._process_start(int(pid))
+    if current is None:
+        return "uncertain (owner process identity cannot be inspected)"
+    if current == started:
+        return "live owner process"
+    return "owner PID was reused; recorded owner is gone"
+
+
+def unfinished_runs(state: State) -> list[dict]:
+    """Read-only cross-project inspection of records that block owner actions."""
+    rows = state.q(
+        "SELECT r.*, a.project_id, a.task_id AS agent_task_id FROM run r "
+        "JOIN agent a ON a.id=r.agent_id WHERE r.ended_at IS NULL ORDER BY r.id"
+    )
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["ownership"] = _owner_status(item)
+        item["task_or_role"] = item["task_id"] or f"taskless {item['role']}"
+        result.append(item)
+    return result
+
+
+def recover_runs(state: State, run_ids: list[int], reason: str,
+                 acknowledge_quiescence: bool = False) -> list[dict]:
+    """Explicitly close selected interrupted records, without replaying an outcome.
+
+    The lifecycle lock excludes scheduler registration and final outcome writes.
+    All selection checks happen again under one immediate transaction, so a
+    duplicate/stale form cannot partially recover a mixed selection.
+    """
+    if not run_ids:
+        raise ValueError("at least one run ID is required")
+    if len(set(run_ids)) != len(run_ids) or any(type(i) is not int or i < 1 for i in run_ids):
+        raise ValueError("run IDs must be distinct positive integers")
+    if not reason or not reason.strip():
+        raise ValueError("a recovery reason is required")
+    with lifecycle_lock(state), state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        marks = ",".join("?" for _ in run_ids)
+        rows = [dict(r) for r in state.q(
+            f"SELECT * FROM run WHERE id IN ({marks}) ORDER BY id", run_ids)]
+        found = {r["id"] for r in rows}
+        missing = sorted(set(run_ids) - found)
+        if missing:
+            raise LookupError("unknown run IDs: " + ", ".join(map(str, missing)))
+        finished = [r["id"] for r in rows if r["ended_at"] is not None]
+        if finished:
+            raise ValueError("runs are already finished: " + ", ".join(map(str, finished)))
+        uncertain, live = [], []
+        for row in rows:
+            ownership = _owner_status(row)
+            if ownership == "live owner process":
+                live.append(row["id"])
+            elif not ownership.startswith("owner process is gone") and not ownership.startswith("owner PID"):
+                uncertain.append(row["id"])
+        if live:
+            raise ValueError("refusing recovery; live ownership for run IDs: " +
+                             ", ".join(map(str, live)))
+        if uncertain and not acknowledge_quiescence:
+            raise ValueError("ownership is uncertain for run IDs: " + ", ".join(map(str, uncertain)) +
+                             "; verify scheduler and adapter descendants are quiescent, then acknowledge")
+        now = time.time()
+        for row in rows:
+            detail = (row["detail"] or "")
+            evidence = f"interrupted by owner recovery at {now:.6f}: {reason.strip()}"
+            detail = (detail + "\n" if detail else "") + evidence
+            changed = state.db.execute(
+                "UPDATE run SET outcome='INTERRUPTED', detail=?, ended_at=?, interrupted_at=?, "
+                "recovered_at=?, recovery_reason=? WHERE id=? AND ended_at IS NULL",
+                (detail[:4000], now, now, now, reason.strip()[:4000], row["id"]),
+            ).rowcount
+            if not changed:
+                raise ValueError(f"run {row['id']} changed before recovery; retry inspection")
+            state.db.execute("UPDATE agent SET state='blocked', updated_at=? WHERE id=?",
+                             (now, row["agent_id"]))
+        return rows
 
 
 # --- projects -------------------------------------------------------------

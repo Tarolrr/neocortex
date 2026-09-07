@@ -18,3 +18,9 @@ not inherit the descriptors.
 
 Before preparation the scheduler rereads task and agent eligibility and rejects
 stale selections and active runs. An ended run record is not an ownership release.
+
+Rollback submissions carry the merge commit displayed to the owner. The CLI
+requires `nc rollback TASK --confirm-commit COMMIT`; the browser posts the commit
+shown beside its Roll back button. Shared operations compare this value with the
+current task record while holding lifecycle and repository exclusion, before any
+Git mutation. Missing or stale confirmation requires reloading and resubmitting.

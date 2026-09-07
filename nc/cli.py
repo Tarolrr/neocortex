@@ -365,7 +365,7 @@ def cmd_run(args) -> int:
 def cmd_rollback(args) -> int:
     _, state = _open(args)
     try:
-        result = operations.rollback_task(state, args.task_id)
+        result = operations.rollback_task(state, args.task_id, args.confirm_commit)
     except (LookupError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -567,6 +567,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("rollback", help="revert an accepted task")
     sp.add_argument("task_id")
+    sp.add_argument("--confirm-commit", required=True, help="exact merge commit shown by nc why")
     sp.set_defaults(func=cmd_rollback)
 
     sp = sub.add_parser("stop", help="stop the loop after the current turn")

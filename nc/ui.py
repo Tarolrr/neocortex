@@ -224,7 +224,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
         depends += (f'<p role="alert">{_e(dep)}: cancelled; dependency remains unmet '
                     f'(<a href="/t/{_segment(dep)}">inspect</a>)</p>')
 
-    criteria = "".join(f"<li>{_e(c)}</li>" for c in task["acceptance"]) or "<li>(none)</li>"
+    criteria = "".join(f"<li><pre>{_e(c)}</pre></li>" for c in task["acceptance"]) or "<li>(none)</li>"
     runs = "".join(
         f"<li>#{r['id']} agent={_e(r['agent_id'])} role={_e(r['role'])} "
         f"outcome={_e(r['outcome'] or 'running')} log={_e(r['log_path'] or '(none)')}</li>"
@@ -232,7 +232,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
     ) or "<li>(none)</li>"
     messages = "".join(
         f"<li>#{m['id']} [{_e(m['kind'])}] {_e(m['sender'])} -&gt; {_e(m['recipient'])}: "
-        f"{_e(m['payload'])}</li>"
+        f"<pre>{_e(m['payload'])}</pre></li>"
         for m in task["messages"]
     ) or "<li>(none)</li>"
     check_output = (f"<pre>{_e(task['check_output'])}</pre>" if task["check_output"] is not None
@@ -266,6 +266,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 <details><summary>Roll back this accepted task</summary>
 <form method="post" action="/t/{_segment(task["id"])}/rollback">
 {_csrf_field(csrf)}
+<input type="hidden" name="expected_commit" value="{_e(task["merge_commit"])}">
 <p>Reverts merge commit <code>{_e(task["merge_commit"])}</code> and opens an incident.</p>
 <button type="submit">Roll back</button>
 </form></details>""")
@@ -280,6 +281,10 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 <pre>{_e(task["objective"])}</pre>
 <h3>Acceptance criteria</h3>
 <ul>{criteria}</ul>
+<h3>Boundaries</h3>
+<pre>{_e(chr(10).join(task["boundaries"]))}</pre>
+<h3>Result</h3>
+<pre>{_e(task["result"] or "(none)")}</pre>
 <h3>Runs</h3>
 <ul>{runs}</ul>
 <h3>Messages</h3>
@@ -565,8 +570,8 @@ def _post_requeue(h: Handler, state, params, query, form):
 def _post_rollback(h: Handler, state, params, query, form):
     task_id = params["task_id"]
     try:
-        result = operations.rollback_task(state, task_id)
-    except LookupError as exc:
+        result = operations.rollback_task(state, task_id, form.get("expected_commit"))
+    except (LookupError, ValueError) as exc:
         h.redirect(f"/t/{_segment(task_id)}", error=str(exc))
         return
     ok = f"reverted {result['reverted_commit']} in {result['commit']}"

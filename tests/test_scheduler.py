@@ -204,7 +204,8 @@ def test_accepted_work_is_mirrored_and_can_be_reverted(setup, tmp_path):
     assert f"{tid}: accepted by arbiter" in mirrored
     assert state.open_incidents() == []
 
-    assert cli.main(["--home", str(cfg.home), "rollback", tid]) == 0
+    assert cli.main(["--home", str(cfg.home), "rollback", tid, "--confirm-commit",
+                     state.one("SELECT merge_commit FROM task WHERE id=?", (tid,))[0]]) == 0
     assert not (repo / "marker.txt").exists()
     assert state.one("SELECT * FROM task WHERE id=?", (tid,))["status"] == "blocked"
 
@@ -1047,7 +1048,8 @@ def test_owner_answers_scheduler_question(setup, role, channel, capsys):
             assert accepted.step() == protocol.DONE
             historical = state.send(protocol.QUESTION, agent_id, "owner",
                                     {"question": "Old question"}, tid)
-            operations.rollback_task(state, tid)
+            operations.rollback_task(
+                state, tid, state.one("SELECT merge_commit FROM task WHERE id=?", (tid,))[0])
             operations.requeue_task(cfg, state, tid, fresh=role == "fresh")
             assert state.one("SELECT merge_commit FROM task WHERE id=?", (tid,))[0]
             with pytest.raises(ValueError, match="not a currently answerable"):
@@ -1127,7 +1129,7 @@ def test_acceptance_survives_locked_worktree_and_allows_rollback(setup):
     ))
     incident = state.one("SELECT * FROM incident WHERE kind='worktree_cleanup'")
     assert tid in incident["detail"] and "locked" in incident["detail"]
-    result = operations.rollback_task(state, tid)
+    result = operations.rollback_task(state, tid, task["merge_commit"])
     assert result["reverted_commit"] == task["merge_commit"]
     assert not (repo / "marker.txt").exists()
     assert state.one("SELECT status FROM task WHERE id=?", (tid,))[0] == "blocked"

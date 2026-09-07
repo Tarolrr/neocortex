@@ -279,7 +279,7 @@ def test_rollback_records_once(browser, monkeypatch):
         return "def456"
 
     monkeypatch.setattr(arbiter, "revert", revert)
-    result = operations.rollback_task(state, tid)
+    result = operations.rollback_task(state, tid, "abc123")
     assert result["commit"] == "def456"
     assert state.one("SELECT status FROM task WHERE id=?", (tid,))[0] == "blocked"
     assert len(state.q("SELECT * FROM incident WHERE kind='rollback'")) == 1
@@ -384,7 +384,7 @@ def test_real_git_revert_failure_preserves_database(browser, tmp_path):
     before = list(state.db.iterdump())
     head = arbiter.git(repo, "rev-parse", "HEAD")
     with pytest.raises(RuntimeError):
-        operations.rollback_task(state, tid)
+        operations.rollback_task(state, tid, "0" * 40)
     assert list(state.db.iterdump()) == before
     assert arbiter.git(repo, "rev-parse", "HEAD") == head
     assert not state.db.in_transaction
@@ -458,7 +458,7 @@ def test_conflicting_rollback_cleans_own_revert(browser, tmp_path):
     state.set_task(tid, status="done", merge_commit=commits[1])
     before = list(state.db.iterdump())
     with pytest.raises(RuntimeError):
-        operations.rollback_task(state, tid)
+        operations.rollback_task(state, tid, commits[1])
     assert list(state.db.iterdump()) == before
     assert arbiter.git(repo, "status", "--porcelain") == ""
     assert arbiter.git(repo, "rev-parse", "HEAD") == commits[2]
@@ -500,3 +500,33 @@ def test_identifier_urls_round_trip(browser, project_id):
     assert status == 303, body
     assert headers["Location"] == "/t/" + urllib.parse.quote(project_id + "-T002", safe="")
     assert request(headers["Location"])[0] == 200
+
+
+@pytest.mark.parametrize("confirmation", [None, "old-commit"])
+def test_rollback_requires_current_confirmation(browser, monkeypatch, confirmation):
+    from nc import arbiter, operations
+
+    _, state, tid, _, _ = browser
+    state.set_task(tid, status="done", merge_commit="current-commit")
+    before = list(state.db.iterdump())
+
+    def unexpected_revert(*args):
+        pytest.fail("stale confirmation must not mutate Git")
+
+    monkeypatch.setattr(arbiter, "revert", unexpected_revert)
+    with pytest.raises(ValueError, match="Confirm the current merge commit"):
+        operations.rollback_task(state, tid, confirmation)
+    assert list(state.db.iterdump()) == before
+
+
+def test_detail_preserves_multiline_content(browser):
+    import json
+
+    _, state, tid, _, request = browser
+    state.set_task(tid, objective="first\nsecond", acceptance=json.dumps(["check\nagain"]),
+                   boundaries=json.dumps(["stay\ninside"]), result="result\ncontinued")
+    status, _, body = request(f"/t/{tid}")
+    assert status == 200
+    for content in ("first\nsecond", "check\nagain", "stay\ninside", "result\ncontinued"):
+        assert f"<pre>{content}</pre>" in body
+    assert "(no stored check output)" in body

@@ -175,7 +175,7 @@ def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
             return {"task_id": task_id, "fresh": fresh, "budget": budget}
 
 
-def rollback_task(state: State, task_id: str) -> dict:
+def rollback_task(state: State, task_id: str, expected_commit: str | None = None) -> dict:
     with lifecycle_lock(state):
         task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
         if task is None or not task["merge_commit"]:
@@ -189,6 +189,8 @@ def rollback_task(state: State, task_id: str) -> dict:
         with repository_lock(repo):
             with state.db:
                 state.db.execute("BEGIN IMMEDIATE")
+                if not expected_commit or expected_commit != task["merge_commit"]:
+                    raise ValueError("Confirm the current merge commit before rollback; reload and retry")
                 commit = arbiter.revert(repo, task["merge_commit"])
                 state.db.execute(
                     "UPDATE task SET status='blocked', result=?, updated_at=? WHERE id=?",

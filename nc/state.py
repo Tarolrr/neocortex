@@ -183,6 +183,10 @@ class State:
             ("run", "adapter_pid", "INTEGER"),
             ("run", "adapter_start", "TEXT"),
             ("run", "adapter_pgid", "INTEGER"),
+            # Version 2 records a dedicated cgroup created before adapter exec.
+            # Unlike a process group, it continues to contain a child that
+            # calls setsid()/setpgid() after the scheduler has died.
+            ("run", "adapter_cgroup", "TEXT"),
             ("run", "interrupted_at", "REAL"),
             ("run", "recovered_at", "REAL"),
             ("run", "recovery_reason", "TEXT"),
@@ -522,7 +526,7 @@ class State:
                 "INSERT INTO run(agent_id,task_id,role,model,log_path,started_at,owner_pid,owner_start,ownership_version)"
                 " VALUES(?,?,?,?,?,?,?,?,?)",
                 (agent_id, task_id, role, model, log_path, time.time(), os.getpid(),
-                 self._process_start(os.getpid()), 1),
+                 self._process_start(os.getpid()), 2),
             )
             return int(cur.lastrowid)
 
@@ -545,9 +549,22 @@ class State:
 
     def record_adapter_owner(self, run_id: int, pid: int) -> None:
         """Persist adapter session identity before waiting for untrusted work."""
-        self.x("UPDATE run SET adapter_pid=?, adapter_start=?, adapter_pgid=? "
+        self.x("UPDATE run SET adapter_pid=?, adapter_start=?, adapter_pgid=?, adapter_cgroup=? "
                "WHERE id=? AND ended_at IS NULL",
-               (pid, self._process_start(pid), self._process_pgrp(pid), run_id))
+               (pid, self._process_start(pid), self._process_pgrp(pid),
+                self._adapter_cgroup(pid), run_id))
+
+    @staticmethod
+    def _adapter_cgroup(pid: int) -> str | None:
+        """Return only cgroups created by the adapter launcher for this run."""
+        try:
+            for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines():
+                if line.startswith("0::"):
+                    path = line[3:]
+                    return path if Path(path).name.startswith("neocortex-run-") else None
+        except (FileNotFoundError, OSError):
+            pass
+        return None
 
     def end_run(self, run_id: int, outcome: str, detail: str = "", tokens: int | None = None) -> None:
         self.x(

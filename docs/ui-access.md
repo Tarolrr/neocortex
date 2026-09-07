@@ -69,11 +69,11 @@ means only that the record was not finalized; its ownership field is the process
 evidence and must not be read as a liveness claim.  Inspect the recorded agent,
 task-or-role, start time and log before taking action.
 
-Newer records also retain the adapter's isolated process-group identity.  This
-lets inspection refuse recovery when an adapter child survives a scheduler
-exit.  It is still evidence rather than a promise about a process that has
-deliberately escaped its group; a missing or uninspectable adapter identity is
-shown as uncertain.
+Newer records retain a dedicated cgroup created before adapter code executes.
+This lets inspection refuse recovery when an adapter child survives a scheduler
+exit, including a child that calls `setsid()` or changes process group. A
+missing or uninspectable cgroup identity is shown as uncertain and cannot be
+overridden for a new row.
 
 For known interrupted rows, submit `nc recover-runs RUN_ID [RUN_ID ...] --reason "..."`.
 This records `INTERRUPTED`, timestamps and the owner reason without requeueing,

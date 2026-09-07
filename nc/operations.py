@@ -55,6 +55,17 @@ def _owner_status(row: dict) -> str:
         if current == started:
             return "live scheduler owner process"
         owner_gone = "owner PID was reused; recorded owner is gone"
+    cgroup = row.get("adapter_cgroup")
+    if row.get("ownership_version", 0) >= 2:
+        if not cgroup:
+            return "uncertain (adapter cgroup ownership evidence is absent; " + owner_gone + ")"
+        members = _adapter_cgroup_members(str(cgroup))
+        if members is None:
+            return "uncertain (adapter cgroup cannot be inspected)"
+        if members:
+            return ("live adapter process or descendant "
+                    f"(cgroup {cgroup}: {', '.join(map(str, members))})")
+        return "scheduler and recorded adapter cgroup are gone"
     pgid = row.get("adapter_pgid")
     if pgid is None:
         # A scheduler exit does not prove that its separately-sessioned adapter
@@ -67,6 +78,37 @@ def _owner_status(row: dict) -> str:
     if members:
         return f"live adapter process or descendant (pgrp {pgid}: {', '.join(map(str, members))})"
     return "scheduler and recorded adapter process group are gone"
+
+
+def _adapter_cgroup_members(cgroup: str) -> list[int] | None:
+    """Read a dedicated adapter cgroup; empty is the only absence evidence."""
+    if not cgroup.startswith("/") or Path(cgroup).name.startswith("neocortex-run-") is False:
+        return None
+    try:
+        pids = (Path("/sys/fs/cgroup") / cgroup.lstrip("/") / "cgroup.procs").read_text().split()
+        members = []
+        for text_pid in pids:
+            pid = int(text_pid)
+            try:
+                # A zombie is still briefly listed by cgroup v2, but cannot
+                # execute or own adapter work.  Its eventual reaping is not a
+                # reason to block a safe recovery indefinitely.
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[0]
+            except FileNotFoundError:
+                continue
+            except (PermissionError, OSError, IndexError):
+                return None
+            if state != "Z":
+                members.append(pid)
+        return sorted(members)
+    except (FileNotFoundError, PermissionError, OSError, ValueError):
+        # A removed empty cgroup is absence; failures inspecting an extant one
+        # are uncertainty.  cgroup directories are removed only once empty.
+        path = Path("/sys/fs/cgroup") / cgroup.lstrip("/")
+        try:
+            return [] if not path.exists() else None
+        except OSError:
+            return None
 
 
 def _adapter_group_members(pgid: int) -> list[int] | None:

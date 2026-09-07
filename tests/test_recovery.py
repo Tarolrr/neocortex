@@ -5,10 +5,13 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
+from pathlib import Path
 
 import pytest
 
 from nc import operations
+from nc.adapters import _adapter_cgroup, _run, adapter_ownership
 from nc.config import Config
 from nc.state import State
 
@@ -27,12 +30,22 @@ def recovery_state(tmp_path):
     state.db.close()
 
 
+def adapter_process(state, run, *cmd):
+    """Make test ownership use the same dedicated containment as adapters."""
+    proc = subprocess.Popen(list(cmd), start_new_session=True)
+    cgroup = _adapter_cgroup()
+    assert cgroup is not None
+    (cgroup / "cgroup.procs").write_text(str(proc.pid))
+    state.record_adapter_owner(run, proc.pid)
+    return proc, cgroup
+
+
 def test_surviving_adapter_group_refuses_then_selected_recovery(recovery_state):
     _cfg, state, task = recovery_state
     run = state.start_run("worker", task, "worker", "m", "log")
     # A disposable adapter session has a child; recovery must see it even when
     # the recorded scheduler process has disappeared.
-    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    proc, cgroup = adapter_process(state, run, "sleep", "30")
     try:
         state.record_adapter_owner(run, proc.pid)
         state.x("UPDATE run SET owner_pid=99999999, owner_start='gone' WHERE id=?", (run,))
@@ -43,6 +56,7 @@ def test_surviving_adapter_group_refuses_then_selected_recovery(recovery_state):
     finally:
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
+        cgroup.rmdir()
     operations.recover_runs(state, [run], "scheduler interrupted")
     saved = state.one("SELECT * FROM run WHERE id=?", (run,))
     assert saved["outcome"] == "INTERRUPTED"
@@ -70,7 +84,7 @@ def test_recovery_preserves_long_original_detail_and_mixed_selection_is_atomic(r
             (original, one))
     # A live member makes the whole submitted set fail; the legacy row must
     # not be partially recovered just because it appeared first.
-    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    proc, cgroup = adapter_process(state, two, "sleep", "30")
     try:
         state.record_adapter_owner(two, proc.pid)
         state.x("UPDATE run SET owner_pid=99999999, owner_start='gone' WHERE id=?", (two,))
@@ -80,6 +94,7 @@ def test_recovery_preserves_long_original_detail_and_mixed_selection_is_atomic(r
     finally:
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
+        cgroup.rmdir()
     operations.recover_runs(state, [one], "verified quiescence", True)
     saved = state.one("SELECT * FROM run WHERE id=?", (one,))
     assert saved["detail"] == original
@@ -107,10 +122,14 @@ def test_terminated_disposable_scheduler_blocks_then_allows_budget_requeue(recov
     state.x("UPDATE agent SET state='blocked'")
     code = textwrap.dedent("""
         import subprocess, sys, time
+        from nc.adapters import _adapter_cgroup
         from nc.state import State
         state = State(sys.argv[1])
         run = state.start_run('worker', sys.argv[2], 'worker', 'm', 'log')
         adapter = subprocess.Popen(['sleep', '30'], start_new_session=True)
+        cgroup = _adapter_cgroup()
+        assert cgroup is not None
+        (cgroup / 'cgroup.procs').write_text(str(adapter.pid))
         state.record_adapter_owner(run, adapter.pid)
         print(run, adapter.pid, flush=True)
         time.sleep(30)
@@ -132,6 +151,40 @@ def test_terminated_disposable_scheduler_blocks_then_allows_budget_requeue(recov
     assert result["budget"] == 9
     saved_task = state.one("SELECT status, budget_turns FROM task WHERE id=?", (task,))
     assert tuple(saved_task) == ("queued", 9)
+
+
+def test_cgroup_detects_descendant_that_escapes_adapter_process_group(recovery_state, tmp_path):
+    """setsid defeats pgrp tracking but cannot leave launch-time containment."""
+    _cfg, state, task = recovery_state
+    run = state.start_run("worker", task, "worker", "m", "log")
+    child_pid = tmp_path / "escaped.pid"
+    code = (
+        "import pathlib, os, subprocess, sys; "
+        "p=subprocess.Popen([sys.executable, '-c', "
+        "'import os,time; os.setsid(); time.sleep(30)']); "
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(p.pid))"
+    )
+    with adapter_ownership(lambda pid: state.record_adapter_owner(run, pid)):
+        _run([sys.executable, "-c", code], tmp_path, tmp_path / "adapter.log", 10)
+    escaped = int(child_pid.read_text())
+    state.x("UPDATE run SET owner_pid=99999999, owner_start='gone' WHERE id=?", (run,))
+    try:
+        ownership = operations.unfinished_runs(state)[0]["ownership"]
+        assert "live adapter process or descendant" in ownership
+        assert "cgroup" in ownership
+        with pytest.raises(ValueError, match="live ownership"):
+            operations.recover_runs(state, [run], "scheduler interrupted")
+    finally:
+        os.kill(escaped, signal.SIGKILL)
+        for _ in range(50):
+            try:
+                status = Path(f"/proc/{escaped}/stat").read_text().rsplit(") ", 1)[1].split()[0]
+            except FileNotFoundError:
+                break
+            if status == "Z":
+                break
+            time.sleep(0.01)
+    operations.recover_runs(state, [run], "scheduler interrupted after escaped child ended")
 
 
 def test_incomplete_new_ownership_is_not_overridable(recovery_state):

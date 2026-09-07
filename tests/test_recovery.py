@@ -51,12 +51,22 @@ def test_surviving_adapter_group_refuses_then_selected_recovery(recovery_state):
 def test_legacy_requires_explicit_quiescence_and_preserves_task(recovery_state):
     _cfg, state, task = recovery_state
     run = state.start_run("planner", None, "planner", "m", "log")
-    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL WHERE id=?", (run,))
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?", (run,))
     before = dict(state.one("SELECT * FROM task WHERE id=?", (task,)))
     with pytest.raises(ValueError, match="acknowledge"):
         operations.recover_runs(state, [run], "verified")
     operations.recover_runs(state, [run], "verified scheduler and adapter processes", True)
     assert dict(state.one("SELECT * FROM task WHERE id=?", (task,))) == before
+
+
+def test_incomplete_new_ownership_is_not_overridable(recovery_state):
+    _cfg, state, task = recovery_state
+    run = state.start_run("worker", task, "worker", "m", "log")
+    # Simulates a scheduler death after run registration but before adapter
+    # ownership can be persisted.  This is not a legacy row.
+    state.x("UPDATE run SET owner_pid=99999999, owner_start='gone' WHERE id=?", (run,))
+    with pytest.raises(ValueError, match="ambiguous new ownership"):
+        operations.recover_runs(state, [run], "operator checked", True)
 
 
 def test_blocker_diagnostic_includes_cross_project_and_taskless_rows(recovery_state):

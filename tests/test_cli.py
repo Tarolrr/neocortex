@@ -126,6 +126,24 @@ def test_health_counts(tmp_path, capsys):
     ]
 
 
+def test_runs_inspect_and_recover_selected_legacy_record(tmp_path, capsys):
+    cfg = Config(home=tmp_path / "home")
+    cfg.home.mkdir()
+    state = State(cfg.db_path)
+    state.add_project("demo", "Demo", str(tmp_path), None)
+    task = state.add_task("demo", "Blocked", "objective", [])
+    state.add_agent("worker", "worker", "demo", task, "model")
+    run = state.start_run("worker", task, "worker", "model", "log")
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?", (run,))
+    state.db.close()
+
+    assert main(["--home", str(cfg.home), "runs"]) == 0
+    assert f"#{run} agent=worker" in capsys.readouterr().out
+    assert main(["--home", str(cfg.home), "recover-runs", str(run),
+                 "--reason", "verified scheduler and adapters", "--acknowledge-quiescence"]) == 0
+    assert f"recovered interrupted run IDs: {run}" in capsys.readouterr().out
+
+
 def test_why_evidence(tmp_path, capsys):
     state = State(Config.load(tmp_path).db_path)
     state.add_project("demo", "Demo", str(tmp_path), None)

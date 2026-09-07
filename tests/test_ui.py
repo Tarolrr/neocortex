@@ -116,6 +116,25 @@ def test_post_security_and_success(browser):
     assert state.one("SELECT status FROM task WHERE id=?", (tid,))["status"] == "cancelled"
 
 
+def test_runs_inspection_and_recovery_require_csrf(browser):
+    _, state, tid, server, request = browser
+    state.add_agent("interrupted", "worker", "one", tid, "model")
+    run = state.start_run("interrupted", tid, "worker", "model", "log")
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?", (run,))
+    status, headers, body = request("/runs")
+    assert status == 200 and f"#{run}" in body
+    status, headers, body = request(f"/runs/{run}")
+    assert status == 200
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    valid = {"Cookie": headers["Set-Cookie"].split(";")[0],
+             "Origin": f"http://127.0.0.1:{server.server_port}"}
+    form = {"csrf_token": token, "reason": "verified quiescence",
+            "acknowledge_quiescence": "1"}
+    assert request(f"/runs/{run}/recover", "POST", form)[0] == 403
+    assert request(f"/runs/{run}/recover", "POST", form, valid)[0] == 303
+    assert state.one("SELECT outcome FROM run WHERE id=?", (run,))["outcome"] == "INTERRUPTED"
+
+
 def test_busy_database_returns_retryable_error(browser):
     _, state, tid, server, request = browser
     _, headers, body = request(f"/t/{tid}")

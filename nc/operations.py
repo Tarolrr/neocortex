@@ -91,9 +91,15 @@ def _adapter_group_members(pgid: int) -> list[int] | None:
             bits = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
             if int(bits[2]) == pgid:  # field 5 / pgrp
                 members.append(int(entry.name))
-        except (FileNotFoundError, PermissionError, IndexError, OSError, ValueError):
-            # A racing process is harmless; denied stat makes absence unknowable.
+        except FileNotFoundError:
+            # A process exiting during the scan cannot remain a live member.
             continue
+        except (PermissionError, OSError):
+            # Denied or failed inspection makes absence unknowable.
+            return None
+        except (IndexError, ValueError):
+            # Malformed proc data is also not evidence that the group is empty.
+            return None
     return sorted(members)
 
 
@@ -147,18 +153,28 @@ def recover_runs(state: State, run_ids: list[int], reason: str,
         finished = [r["id"] for r in rows if r["ended_at"] is not None]
         if finished:
             raise ValueError("runs are already finished: " + ", ".join(map(str, finished)))
-        uncertain, live = [], []
+        legacy_uncertain, ambiguous, live = [], [], []
         for row in rows:
             ownership = _owner_status(row)
             if ownership.startswith("live "):
                 live.append(row["id"])
             elif ownership.startswith("uncertain"):
-                uncertain.append(row["id"])
+                # Only pre-ownership-schema rows are legacy.  A current row
+                # that lost its owner or adapter evidence may have started an
+                # untracked process and must never be overridden by an
+                # acknowledgement.
+                if row.get("ownership_version", 0) == 0:
+                    legacy_uncertain.append(row["id"])
+                else:
+                    ambiguous.append(row["id"])
         if live:
             raise ValueError("refusing recovery; live ownership for run IDs: " +
                              ", ".join(map(str, live)))
-        if uncertain and not acknowledge_quiescence:
-            raise ValueError("ownership is uncertain for run IDs: " + ", ".join(map(str, uncertain)) +
+        if ambiguous:
+            raise ValueError("refusing recovery; ambiguous new ownership for run IDs: " +
+                             ", ".join(map(str, ambiguous)))
+        if legacy_uncertain and not acknowledge_quiescence:
+            raise ValueError("legacy ownership is uncertain for run IDs: " + ", ".join(map(str, legacy_uncertain)) +
                              "; verify scheduler and adapter descendants are quiescent, then acknowledge")
         now = time.time()
         for row in rows:

@@ -176,6 +176,10 @@ class State:
             # uncertain record, never evidence that a session is dead.
             ("run", "owner_pid", "INTEGER"),
             ("run", "owner_start", "TEXT"),
+            # 0 means this row predates ownership recording.  It is the only
+            # case in which an operator can attest quiescence; a newer row
+            # with incomplete evidence is an ambiguous interrupted launch.
+            ("run", "ownership_version", "INTEGER NOT NULL DEFAULT 0"),
             ("run", "adapter_pid", "INTEGER"),
             ("run", "adapter_start", "TEXT"),
             ("run", "adapter_pgid", "INTEGER"),
@@ -515,10 +519,10 @@ class State:
             ):
                 raise ValueError("cannot start a run for a cancelled task")
             cur = self.db.execute(
-                "INSERT INTO run(agent_id,task_id,role,model,log_path,started_at,owner_pid,owner_start)"
-                " VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO run(agent_id,task_id,role,model,log_path,started_at,owner_pid,owner_start,ownership_version)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
                 (agent_id, task_id, role, model, log_path, time.time(), os.getpid(),
-                 self._process_start(os.getpid())),
+                 self._process_start(os.getpid()), 1),
             )
             return int(cur.lastrowid)
 

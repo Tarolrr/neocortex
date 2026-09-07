@@ -69,7 +69,22 @@ def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionRe
             )
             callback = _on_adapter_started.get()
             if callback is not None:
-                callback(proc.pid)
+                try:
+                    callback(proc.pid)
+                except BaseException:
+                    # A run cannot be finalized as failed while an adapter
+                    # launched for it survives unrecorded.  The adapter owns
+                    # a fresh session, so kill its complete process group.
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        # Keep the callback error as the reported failure.
+                        pass
+                    raise
             code = proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True

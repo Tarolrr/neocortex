@@ -659,6 +659,9 @@ def _post_answer(h: Handler, state, params, query, form):
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     server_version = "neocortex-ui/1"
+    # StreamRequestHandler.setup applies this before reading the request line
+    # or headers, so idle browser preconnections cannot stall the server forever.
+    timeout = 5.0
 
     def log_message(self, fmt: str, *args: Any) -> None:
         log.info("%s - %s", self.address_string(), fmt % args)
@@ -676,7 +679,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._dispatch("POST")
 
     def _dispatch(self, method: str) -> None:
-        self.connection.settimeout(5)
         self.session_is_new = False
         parsed = urllib.parse.urlsplit(self.path)
         path = urllib.parse.unquote(parsed.path)

@@ -1,5 +1,6 @@
 import http.client
 import re
+import socket
 import threading
 import urllib.parse
 
@@ -8,7 +9,7 @@ import pytest
 from nc import protocol
 from nc.config import Config
 from nc.state import State
-from nc.ui import make_server
+from nc.ui import Handler, make_server
 
 
 @pytest.fixture
@@ -62,6 +63,37 @@ def test_read_pages_isolated_read_only_and_assets(browser):
     assert status == 200 and headers["Content-Type"] == "text/css" and body
     assert request("/static/../ui.py")[0] == 404
     assert request("/")[0] == 303
+    assert list(state.db.iterdump()) == before
+
+
+@pytest.mark.parametrize("partial", [b"", b"GET / HTTP/1.1\r\nHost:"])
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_incomplete_request_times_out_before_dispatch(browser, monkeypatch, partial, shutdown):
+    _, state, _, server, request = browser
+    before = list(state.db.iterdump())
+    assert Handler.timeout == 5.0
+    monkeypatch.setattr(Handler, "timeout", 0.1)
+    accepted = threading.Event()
+    get_request = server.get_request
+
+    def accept():
+        connection = get_request()
+        accepted.set()
+        return connection
+
+    monkeypatch.setattr(server, "get_request", accept)
+    with socket.create_connection(server.server_address, timeout=3) as idle:
+        if partial:
+            idle.sendall(partial)
+        assert accepted.wait(timeout=3)
+        if shutdown:
+            stopping = threading.Thread(target=server.shutdown, daemon=True)
+            stopping.start()
+            stopping.join(timeout=3)
+            assert not stopping.is_alive(), "incomplete request blocked shutdown"
+        else:
+            assert request("/static/style.css")[0] == 200
+        assert idle.recv(1) == b""
     assert list(state.db.iterdump()) == before
 
 

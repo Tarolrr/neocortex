@@ -1131,3 +1131,27 @@ def test_acceptance_survives_locked_worktree_and_allows_rollback(setup):
     assert result["reverted_commit"] == task["merge_commit"]
     assert not (repo / "marker.txt").exists()
     assert state.one("SELECT status FROM task WHERE id=?", (tid,))[0] == "blocked"
+
+
+@pytest.mark.parametrize('action', ['cancel', 'requeue'])
+def test_stale_selection_does_not_prepare_worktree(setup, monkeypatch, action):
+    from nc import arbiter, operations
+
+    cfg, state, _repo = setup
+    tid = state.add_task('neocortex', 'stale', 'must not run', [])
+    scheduler = sched(cfg, state, [])
+    selected = scheduler.pick()
+    if action == 'cancel':
+        state.set_task(tid, status='blocked')
+        operations.cancel_task(state, tid, 'owner cancelled')
+    else:
+        operations.requeue_task(cfg, state, tid)
+    before = list(state.db.iterdump())
+    monkeypatch.setattr(scheduler, 'pick', lambda: selected)
+
+    def unexpected(*args):
+        pytest.fail('stale selection prepared a worktree')
+
+    monkeypatch.setattr(arbiter, 'ensure_worktree', unexpected)
+    assert scheduler.step() == 'idle'
+    assert list(state.db.iterdump()) == before

@@ -1,6 +1,7 @@
 import http.client
 import re
 import socket
+import subprocess
 import threading
 import urllib.parse
 
@@ -15,6 +16,7 @@ from nc.ui import Handler, make_server
 @pytest.fixture
 def browser(tmp_path, monkeypatch):
     monkeypatch.setenv("NC_HOME", str(tmp_path / "isolated"))
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     cfg = Config.load()
     state = State(cfg.db_path)
     state.add_project("one", "<script>alert(1)</script>", str(tmp_path), None)

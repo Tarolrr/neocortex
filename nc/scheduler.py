@@ -17,7 +17,7 @@ from pathlib import Path
 from . import arbiter, protocol, turn
 from .adapters import Adapter, get_adapter
 from .config import Config
-from .lifecycle import LifecycleBusy, lifecycle_lock
+from .lifecycle import LifecycleBusy, lifecycle_lock, repository_lock
 from .state import State
 
 log = logging.getLogger("nc.scheduler")
@@ -183,11 +183,23 @@ class Scheduler:
         task = self.state.one("SELECT * FROM task WHERE id=?", (agent["task_id"],))
         project = self.state.one("SELECT * FROM project WHERE id=?", (agent["project_id"],))
         repo = Path(project["repo_path"])
-        cwd, branch = arbiter.ensure_worktree(repo, self.cfg.work_dir, task["id"])
+        with repository_lock(repo):
+            # Selection is a hint; reread eligibility before worktree preparation.
+            current = self.state.one("SELECT * FROM agent WHERE id=?", (agent["id"],))
+            latest = self.state.one("SELECT * FROM task WHERE id=?", (task["id"],))
+            if (current is None or current["state"] != "runnable"
+                    or latest["status"] not in ("in_progress", "in_review", "blocked")
+                    or current["updated_at"] != agent["updated_at"]
+                    or self.state.one("SELECT 1 FROM run WHERE ended_at IS NULL")):
+                return "idle"
+            return self._task_turn(current, latest, project, repo)
 
+    def _task_turn(self, agent, task, project, repo):
         if agent["turns"] >= task["budget_turns"]:
             self._block(task, agent, f"turn budget ({task['budget_turns']}) exhausted")
             return "budget_exhausted"
+
+        cwd, branch = arbiter.ensure_worktree(repo, self.cfg.work_dir, task["id"])
 
         checks_text = ""
         if agent["role"] == "critic":

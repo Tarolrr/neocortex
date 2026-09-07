@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import arbiter, protocol
 from .config import Config
-from .lifecycle import lifecycle_lock
+from .lifecycle import lifecycle_lock, repository_lock
 from .state import State
 
 
@@ -155,23 +155,24 @@ def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
             raise ValueError("An active run must finish before changing task lifecycle")
         project = get_project(state, task["project_id"])
         repo = Path(project["repo_path"])
-        with state.db:
-            state.db.execute("BEGIN IMMEDIATE")
-            if fresh:
-                arbiter.remove_worktree(repo, cfg.work_dir / task["id"])
-                arbiter.git(repo, "worktree", "prune")
-                branch = f"nc/{task['id']}"
-                if arbiter.git(repo, "branch", "--list", branch):
-                    arbiter.git(repo, "branch", "-D", branch)
-            state.db.execute("UPDATE agent SET state='blocked', turns=0 WHERE task_id=?", (task_id,))
-            state.db.execute("UPDATE message SET delivered=1 WHERE task_id=? AND recipient='owner'",
-                             (task_id,))
-            state.db.execute(
-                "UPDATE task SET status='queued', attempts=0, result=?, budget_turns=?, updated_at=?"
-                " WHERE id=?", (reason or "requeued by the owner", budget if budget is not None else task["budget_turns"],
-                                 time.time(), task_id),
-            )
-        return {"task_id": task_id, "fresh": fresh, "budget": budget}
+        with repository_lock(repo):
+            with state.db:
+                state.db.execute("BEGIN IMMEDIATE")
+                if fresh:
+                    arbiter.remove_worktree(repo, cfg.work_dir / task["id"])
+                    arbiter.git(repo, "worktree", "prune")
+                    branch = f"nc/{task['id']}"
+                    if arbiter.git(repo, "branch", "--list", branch):
+                        arbiter.git(repo, "branch", "-D", branch)
+                state.db.execute("UPDATE agent SET state='blocked', turns=0 WHERE task_id=?", (task_id,))
+                state.db.execute("UPDATE message SET delivered=1 WHERE task_id=? AND recipient='owner'",
+                                 (task_id,))
+                state.db.execute(
+                    "UPDATE task SET status='queued', attempts=0, result=?, budget_turns=?, updated_at=?"
+                    " WHERE id=?", (reason or "requeued by the owner", budget if budget is not None else task["budget_turns"],
+                                     time.time(), task_id),
+                )
+            return {"task_id": task_id, "fresh": fresh, "budget": budget}
 
 
 def rollback_task(state: State, task_id: str) -> dict:
@@ -185,20 +186,21 @@ def rollback_task(state: State, task_id: str) -> dict:
         repo = Path(project["repo_path"])
         if task["status"] != "done":
             raise ValueError(f"{task_id} is not accepted; rollback requires a done task")
-        with state.db:
-            state.db.execute("BEGIN IMMEDIATE")
-            commit = arbiter.revert(repo, task["merge_commit"])
-            state.db.execute(
-                "UPDATE task SET status='blocked', result=?, updated_at=? WHERE id=?",
-                (f"reverted by the owner in {commit}", time.time(), task_id),
-            )
-            state.db.execute(
-                "INSERT INTO incident(kind,detail,created_at) VALUES('rollback',?,?)",
-                (f"{task_id} reverted in {commit}", time.time()),
-            )
-        mirror_error = arbiter.mirror(repo, project["mirror"])
-        return {"task_id": task_id, "reverted_commit": task["merge_commit"], "commit": commit,
-                "mirror_error": mirror_error}
+        with repository_lock(repo):
+            with state.db:
+                state.db.execute("BEGIN IMMEDIATE")
+                commit = arbiter.revert(repo, task["merge_commit"])
+                state.db.execute(
+                    "UPDATE task SET status='blocked', result=?, updated_at=? WHERE id=?",
+                    (f"reverted by the owner in {commit}", time.time(), task_id),
+                )
+                state.db.execute(
+                    "INSERT INTO incident(kind,detail,created_at) VALUES('rollback',?,?)",
+                    (f"{task_id} reverted in {commit}", time.time()),
+                )
+            mirror_error = arbiter.mirror(repo, project["mirror"])
+            return {"task_id": task_id, "reverted_commit": task["merge_commit"], "commit": commit,
+                    "mirror_error": mirror_error}
 
 
 # --- proposals ----------------------------------------------------------

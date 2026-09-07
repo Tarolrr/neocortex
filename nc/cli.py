@@ -263,6 +263,7 @@ def cmd_inbox(args) -> int:
     for row in rows:
         print(f"#{row['id']} [{row['kind']}] from {row['sender']} "
               f"({row['task_id'] or '-'}, {operations.age(row['created_at'])} ago)"
+              f" [{('answerable' if row['answerable'] else ('delivered' if row['delivered'] else 'not answerable'))}]"
               f"\n    {row['text']}\n")
     if not rows:
         print("(no pending messages)")
@@ -285,12 +286,14 @@ def cmd_answer(args) -> int:
 
 def cmd_feedback(args) -> int:
     cfg, state = _open(args)
-    text = args.text if args.cmd == "feedback" else (args.note or "Request a planning pass.")
     try:
-        agent_id, message_id = operations.submit_feedback(
-            state, cfg, args.project, text, getattr(args, "task", None),
-            getattr(args, "proposal", None),
-        )
+        if args.cmd == "plan":
+            agent_id, message_id = operations.request_plan(state, cfg, args.project, args.note)
+        else:
+            agent_id, message_id = operations.submit_feedback(
+                state, cfg, args.project, args.text, getattr(args, "task", None),
+                getattr(args, "proposal", None),
+            )
     except (ValueError, LookupError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

@@ -403,7 +403,8 @@ class State:
 
     def planner_feedback(self, project_id: str | None, text: str, model: str,
                          task_id: str | None = None,
-                         proposal_id: int | None = None) -> tuple[str, int]:
+                         proposal_id: int | None = None,
+                         plan_request: bool = False) -> tuple[str, int]:
         """Atomically resolve the project, store feedback, and create or wake its planner."""
         from .protocol import FEEDBACK
 
@@ -451,7 +452,8 @@ class State:
                 "INSERT INTO message(kind,sender,recipient,task_id,payload,created_at)"
                 " VALUES(?,'owner',?,?,?,?)",
                 (FEEDBACK, agent_id, task_id,
-                 json.dumps({"text": text}, ensure_ascii=False), now),
+                 json.dumps({"text": text, **({"request": "plan"} if plan_request else {})},
+                            ensure_ascii=False), now),
             )
             message_id = int(cur.lastrowid)
             if proposal_id is not None:

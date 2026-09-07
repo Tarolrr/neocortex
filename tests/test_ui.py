@@ -1,4 +1,5 @@
 import http.client
+import json
 import re
 import socket
 import threading
@@ -297,7 +298,14 @@ def test_feedback_proposal_decisions_and_answers(browser):
                         "Origin": f"http://127.0.0.1:{server.server_port}"})
 
     feedback = "/p/one/feedback"
-    assert post(feedback, feedback, {"text": "Plan <script>x</script>"})[0] == 303
+    assert post(feedback, feedback, {"text": "Plan <script>x</script>", "task": tid})[0] == 303
+    body = request(feedback)[2]
+    assert "Delivery means the planner received" in body
+    assert f'href="/t/{tid}"' in body
+    assert "waiting for planner" in body
+    assert post(feedback, "/p/one/plan", {"note": "Plan the boundary"})[0] == 303
+    assert any(json.loads(row['payload']).get('request') == 'plan'
+               for row in state.inbox('planner-one'))
     assert not state.q("SELECT * FROM run")
     spec = [{"project": "one", "title": "Proposed", "objective": "x", "acceptance": []}]
     pid = state.add_proposal("one", "planner", "<script>rationale</script>", spec)

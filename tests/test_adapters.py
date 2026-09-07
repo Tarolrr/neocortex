@@ -1,5 +1,4 @@
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -11,11 +10,17 @@ def test_real_codex_usage(tmp_path, monkeypatch):
     sample = (Path(__file__).parent / "fixtures" / "codex-usage.log").read_text()
     assert parse_tokens(sample) == 26457
 
-    def run(cmd, **kwargs):
-        kwargs["stdout"].write(sample)
-        return SimpleNamespace(returncode=0)
+    class Proc:
+        pid = 123
 
-    monkeypatch.setattr("nc.adapters.subprocess.run", run)
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(cmd, **kwargs):
+        kwargs["stdout"].write(sample)
+        return Proc()
+
+    monkeypatch.setattr("nc.adapters.subprocess.Popen", popen)
     assert _run(["codex", "exec"], tmp_path, tmp_path / "session.log", 10).tokens == 26457
 
 

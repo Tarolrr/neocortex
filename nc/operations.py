@@ -45,15 +45,65 @@ def _owner_status(row: dict) -> str:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return "owner process is gone"
+        owner_gone = "owner process is gone"
     except PermissionError:
         return "uncertain (owner process cannot be inspected)"
-    current = State._process_start(int(pid))
-    if current is None:
-        return "uncertain (owner process identity cannot be inspected)"
-    if current == started:
-        return "live owner process"
-    return "owner PID was reused; recorded owner is gone"
+    else:
+        current = State._process_start(int(pid))
+        if current is None:
+            return "uncertain (owner process identity cannot be inspected)"
+        if current == started:
+            return "live scheduler owner process"
+        owner_gone = "owner PID was reused; recorded owner is gone"
+    pgid = row.get("adapter_pgid")
+    if pgid is None:
+        # A scheduler exit does not prove that its separately-sessioned adapter
+        # exited. Rows from before adapter ownership recording need the
+        # documented, explicit quiescence acknowledgement.
+        return "uncertain (adapter ownership evidence is absent; " + owner_gone + ")"
+    members = _adapter_group_members(int(pgid))
+    if members is None:
+        return "uncertain (adapter process group cannot be inspected)"
+    if members:
+        return f"live adapter process or descendant (pgrp {pgid}: {', '.join(map(str, members))})"
+    return "scheduler and recorded adapter process group are gone"
+
+
+def _adapter_group_members(pgid: int) -> list[int] | None:
+    """Return live members of an adapter's isolated POSIX process group.
+
+    ``start_new_session`` makes the adapter PID its group leader.  Its children
+    normally inherit that group, so this catches adapter descendants after a
+    scheduler crash.  An uninspectable /proc is uncertainty, never absence.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    members: list[int] = []
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            bits = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
+            if int(bits[2]) == pgid:  # field 5 / pgrp
+                members.append(int(entry.name))
+        except (FileNotFoundError, PermissionError, IndexError, OSError, ValueError):
+            # A racing process is harmless; denied stat makes absence unknowable.
+            continue
+    return sorted(members)
+
+
+def unfinished_blockers(state: State) -> str:
+    """Precise, cross-project lifecycle diagnostic shared by owner actions."""
+    rows = unfinished_runs(state)
+    return "; ".join(
+        f"#{r['id']} agent={r['agent_id']} task={r['task_or_role']} role={r['role']} "
+        f"started_at={r['started_at']:.6f} ownership={r['ownership']}" for r in rows
+    )
 
 
 def unfinished_runs(state: State) -> list[dict]:
@@ -100,9 +150,9 @@ def recover_runs(state: State, run_ids: list[int], reason: str,
         uncertain, live = [], []
         for row in rows:
             ownership = _owner_status(row)
-            if ownership == "live owner process":
+            if ownership.startswith("live "):
                 live.append(row["id"])
-            elif not ownership.startswith("owner process is gone") and not ownership.startswith("owner PID"):
+            elif ownership.startswith("uncertain"):
                 uncertain.append(row["id"])
         if live:
             raise ValueError("refusing recovery; live ownership for run IDs: " +
@@ -243,7 +293,8 @@ def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
         if task["status"] == "done":
             raise ValueError(f"{task_id} is already accepted; use rollback instead")
         if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
-            raise ValueError("An active run must finish before changing task lifecycle")
+            raise ValueError("unfinished run records block task lifecycle (not proof of active run): " +
+                             unfinished_blockers(state))
         project = get_project(state, task["project_id"])
         repo = Path(project["repo_path"])
         with state.db:
@@ -271,7 +322,8 @@ def rollback_task(state: State, task_id: str) -> dict:
         if task is None or not task["merge_commit"]:
             raise LookupError(f"{task_id} has no recorded merge commit")
         if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
-            raise ValueError("An active run must finish before changing task lifecycle")
+            raise ValueError("unfinished run records block task lifecycle (not proof of active run): " +
+                             unfinished_blockers(state))
         project = get_project(state, task["project_id"])
         repo = Path(project["repo_path"])
         if task["status"] != "done":

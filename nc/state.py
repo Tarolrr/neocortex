@@ -176,6 +176,9 @@ class State:
             # uncertain record, never evidence that a session is dead.
             ("run", "owner_pid", "INTEGER"),
             ("run", "owner_start", "TEXT"),
+            ("run", "adapter_pid", "INTEGER"),
+            ("run", "adapter_start", "TEXT"),
+            ("run", "adapter_pgid", "INTEGER"),
             ("run", "interrupted_at", "REAL"),
             ("run", "recovered_at", "REAL"),
             ("run", "recovery_reason", "TEXT"),
@@ -527,6 +530,20 @@ class State:
             return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
         except (FileNotFoundError, IndexError, OSError):
             return None
+
+    @staticmethod
+    def _process_pgrp(pid: int) -> int | None:
+        try:
+            # stat field 5 (pgrp); comm may contain spaces.
+            return int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[2])
+        except (FileNotFoundError, IndexError, OSError, ValueError):
+            return None
+
+    def record_adapter_owner(self, run_id: int, pid: int) -> None:
+        """Persist adapter session identity before waiting for untrusted work."""
+        self.x("UPDATE run SET adapter_pid=?, adapter_start=?, adapter_pgid=? "
+               "WHERE id=? AND ended_at IS NULL",
+               (pid, self._process_start(pid), self._process_pgrp(pid), run_id))
 
     def end_run(self, run_id: int, outcome: str, detail: str = "", tokens: int | None = None) -> None:
         self.x(

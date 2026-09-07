@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +18,18 @@ TOKENS_RE = re.compile(
     r"[ \t]*([0-9]+(?:,[0-9]{3})*)[ \t]*\r?$",
     re.IGNORECASE | re.MULTILINE,
 )
+
+_on_adapter_started: ContextVar[object | None] = ContextVar("on_adapter_started", default=None)
+
+
+@contextmanager
+def adapter_ownership(callback):
+    """Let the host record a real adapter session without changing Adapter's API."""
+    token = _on_adapter_started.set(callback)
+    try:
+        yield
+    finally:
+        _on_adapter_started.reset(token)
 
 
 def parse_tokens(text: str) -> int | None:
@@ -48,14 +63,22 @@ def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionRe
     timed_out = False
     with log_path.open("w") as log:
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
-                timeout=timeout_s, env=env, start_new_session=True, check=False,
+                env=env, start_new_session=True,
             )
-            code = proc.returncode
+            callback = _on_adapter_started.get()
+            if callback is not None:
+                callback(proc.pid)
+            code = proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
             code = 124
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
     text = log_path.read_text(errors="replace")
     tokens = parse_tokens(text)
     return SessionResult(exit_code=code, log_path=log_path, tokens=tokens, timed_out=timed_out)

@@ -95,16 +95,18 @@ CREATE TABLE IF NOT EXISTS incident (
 
 
 class State:
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, initialize: bool = True, timeout: float = 30):
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, timeout=30)
+        self.db = sqlite3.connect(self.path, timeout=timeout)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
+        if initialize:
+            self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.executescript(SCHEMA)
-        self._migrate()
-        self.db.commit()
+        if initialize:
+            self.db.executescript(SCHEMA)
+            self._migrate()
+            self.db.commit()
 
     def _migrate(self) -> None:
         """Apply schema changes to new and existing databases, preserving stored history."""

@@ -366,3 +366,26 @@ def test_cancel_unknown_and_blank_reason(gc_project):
     with pytest.raises(ValueError, match="reason"):
         state.cancel_task("missing", " ")
     assert list(state.db.iterdump()) == before
+
+
+def test_task_creation_preserves_title(gc_project, capsys):
+    cfg, state, _ = gc_project
+    assert main(["--home", str(cfg.home), "task", "--project", "demo",
+                 "--title", "  verbatim title  ", "--objective", "objective"]) == 0
+    tid = capsys.readouterr().out.strip()
+    assert state.one("SELECT title FROM task WHERE id=?", (tid,))["title"] == "  verbatim title  "
+
+
+def test_cli_import_preserves_partial_success_output(gc_project, tmp_path, capsys):
+    import json
+
+    cfg, state, _ = gc_project
+    specs = tmp_path / "tasks.json"
+    specs.write_text(json.dumps([
+        {"project": "demo", "title": "first", "objective": "x", "acceptance": []},
+        {"project": "demo"},
+    ]))
+    with pytest.raises(KeyError):
+        main(["--home", str(cfg.home), "task", "--file", str(specs)])
+    tid = state.one("SELECT id FROM task WHERE title='first'")["id"]
+    assert capsys.readouterr().out == tid + "\n"

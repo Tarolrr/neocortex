@@ -337,3 +337,5 @@ revision lineage and feedback on both ends. To iterate again, address feedback t
 the new pending replacement. Approved, rejected, and superseded proposals cannot
 receive revision requests. If planning asks a question, answer with `nc answer`;
 after a failed session, `nc plan PROJECT` retries with the revision context intact.
+
+Local browser console: see [UI access and action mapping](docs/ui-access.md).

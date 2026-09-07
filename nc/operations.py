@@ -1,0 +1,320 @@
+"""Structured owner read/write models shared by the CLI and the browser UI.
+
+Both `nc.cli` and `nc.ui` call into this module instead of duplicating SQL or
+parsing each other's output. Every function here takes a `State` (and an
+`arbiter`/`Config` where repository or filesystem coordination is needed) and
+returns plain dicts/lists or raises one of two errors so callers can format
+them however they like:
+
+- `LookupError` for "no such id" (renders as 404 in the UI, exit 1 in the CLI)
+- `ValueError` for a rejected but well-formed request (400 in the UI, exit 1
+  in the CLI)
+
+Nothing here shells out or re-parses `nc` output; it calls `State` methods and
+`arbiter` helpers directly, the same as any other in-process caller.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+from . import arbiter, protocol
+from .config import Config
+from .lifecycle import lifecycle_lock
+from .state import State
+
+
+def age(ts: float) -> str:
+    """Human-friendly age used by both the CLI inbox and the UI inbox page."""
+    delta = int(time.time() - ts)
+    if delta < 3600:
+        return f"{delta // 60}m"
+    if delta < 86400:
+        return f"{delta // 3600}h"
+    return f"{delta // 86400}d"
+
+
+# --- projects -------------------------------------------------------------
+
+def projects(state: State) -> list[dict]:
+    return [dict(row) for row in state.q("SELECT * FROM project ORDER BY id")]
+
+
+def get_project(state: State, project_id: str) -> dict:
+    row = state.one("SELECT * FROM project WHERE id=?", (project_id,))
+    if row is None:
+        raise LookupError(f"unknown project: {project_id}")
+    return dict(row)
+
+
+# --- tasks ------------------------------------------------------------------
+
+def tasks(state: State, project: str | None = None, include_cancelled: bool = False) -> list[dict]:
+    sql = "SELECT * FROM task WHERE 1=1"
+    params: tuple = ()
+    if project:
+        sql += " AND project_id=?"
+        params = (project,)
+    if not include_cancelled:
+        sql += " AND status != 'cancelled'"
+    rows = [dict(row) for row in state.q(sql + " ORDER BY priority, created_at", params)]
+    for row in rows:
+        row["unmet_dependencies"] = state.unmet_dependencies(row["id"])
+    return rows
+
+
+def create_task(state: State, project_id: str, title: str, objective: str,
+                acceptance: list[str], boundaries: list[str] | None = None,
+                priority: int = 100, budget_turns: int = 6,
+                depends_on: list[str] | None = None) -> str:
+    return state.add_task(project_id, title, objective, acceptance,
+                          boundaries, priority, budget_turns, depends_on)
+
+
+def import_tasks(state: State, specs: list[dict] | dict,
+                 project: str | None = None) -> list[str]:
+    """Import browser batches atomically within the selected project.
+
+    CLI callers omit project and retain the historical per-item import semantics.
+    """
+    items = specs if isinstance(specs, list) else [specs]
+    if project is None:
+        return [state.add_task_spec(spec) for spec in items]
+    get_project(state, project)
+    for spec in items:
+        if not isinstance(spec, dict):
+            raise TypeError("each task must be a JSON object")
+        if spec.get("project") != project:
+            raise ValueError("each task must belong to the selected project")
+        for key in ("title", "objective"):
+            if not isinstance(spec.get(key), str) or not spec[key].strip():
+                raise ValueError(f"{key} is required and must be text")
+        for key in ("acceptance", "boundaries", "depends_on"):
+            value = spec.get(key, [] if key != "acceptance" else None)
+            if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+                raise ValueError(f"{key} must be a list of strings")
+        for key, default in (("priority", 100), ("budget_turns", 6)):
+            value = spec.get(key, default)
+            if type(value) is not int or (key == "budget_turns" and value < 1):
+                raise ValueError(f"{key} must be an integer" +
+                                 (" greater than zero" if key == "budget_turns" else ""))
+    with state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        return [state._add_task_spec(spec) for spec in items]
+
+
+def task_detail(state: State, cfg: Config, task_id: str) -> dict:
+    """Everything `nc why` prints, as data: task, dependants, runs, messages, check output."""
+    task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+    if task is None:
+        raise LookupError(f"unknown task: {task_id}")
+    detail = dict(task)
+    detail["depends_on"] = json.loads(task["depends_on"] or "[]")
+    detail["unmet_dependencies"] = state.unmet_dependencies(task_id)
+    detail["cancelled_dependencies"] = [
+        dep for dep in detail["depends_on"]
+        if (row := state.one("SELECT status FROM task WHERE id=?", (dep,))) is not None
+        and row["status"] == "cancelled"
+    ]
+    detail["acceptance"] = json.loads(task["acceptance"])
+    detail["boundaries"] = json.loads(task["boundaries"] or "[]")
+    detail["runs"] = [dict(r) for r in state.q(
+        "SELECT * FROM run WHERE task_id=? ORDER BY started_at, id", (task_id,),
+    )]
+    detail["messages"] = [dict(m) for m in state.q(
+        "SELECT * FROM message WHERE task_id=? ORDER BY id", (task_id,),
+    )]
+    check_path = cfg.home / "checks" / f"{task_id}.txt"
+    try:
+        detail["check_output"] = check_path.read_text()
+    except FileNotFoundError:
+        detail["check_output"] = None
+    detail["check_path"] = str(check_path)
+    return detail
+
+
+def cancel_task(state: State, task_id: str, reason: str) -> bool:
+    with lifecycle_lock(state):
+        return state.cancel_task(task_id, reason)
+
+
+def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
+                 budget: int | None = None, reason: str | None = None) -> dict:
+    """Put a task back in the queue, optionally discarding its branch and worktree."""
+    if budget is not None and budget < 1:
+        raise ValueError("turn budget must be greater than zero")
+    with lifecycle_lock(state):
+        task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+        if task is None:
+            raise LookupError(f"unknown task: {task_id}")
+        if task["status"] == "done":
+            raise ValueError(f"{task_id} is already accepted; use rollback instead")
+        if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
+            raise ValueError("An active run must finish before changing task lifecycle")
+        project = get_project(state, task["project_id"])
+        repo = Path(project["repo_path"])
+        with state.db:
+            state.db.execute("BEGIN IMMEDIATE")
+            if fresh:
+                arbiter.remove_worktree(repo, cfg.work_dir / task["id"])
+                arbiter.git(repo, "worktree", "prune")
+                branch = f"nc/{task['id']}"
+                if arbiter.git(repo, "branch", "--list", branch):
+                    arbiter.git(repo, "branch", "-D", branch)
+            state.db.execute("UPDATE agent SET state='blocked', turns=0 WHERE task_id=?", (task_id,))
+            state.db.execute("UPDATE message SET delivered=1 WHERE task_id=? AND recipient='owner'",
+                             (task_id,))
+            state.db.execute(
+                "UPDATE task SET status='queued', attempts=0, result=?, budget_turns=?, updated_at=?"
+                " WHERE id=?", (reason or "requeued by the owner", budget if budget is not None else task["budget_turns"],
+                                 time.time(), task_id),
+            )
+        return {"task_id": task_id, "fresh": fresh, "budget": budget}
+
+
+def rollback_task(state: State, task_id: str) -> dict:
+    with lifecycle_lock(state):
+        task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+        if task is None or not task["merge_commit"]:
+            raise LookupError(f"{task_id} has no recorded merge commit")
+        if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
+            raise ValueError("An active run must finish before changing task lifecycle")
+        project = get_project(state, task["project_id"])
+        repo = Path(project["repo_path"])
+        if task["status"] != "done":
+            raise ValueError(f"{task_id} is not accepted; rollback requires a done task")
+        with state.db:
+            state.db.execute("BEGIN IMMEDIATE")
+            commit = arbiter.revert(repo, task["merge_commit"])
+            state.db.execute(
+                "UPDATE task SET status='blocked', result=?, updated_at=? WHERE id=?",
+                (f"reverted by the owner in {commit}", time.time(), task_id),
+            )
+            state.db.execute(
+                "INSERT INTO incident(kind,detail,created_at) VALUES('rollback',?,?)",
+                (f"{task_id} reverted in {commit}", time.time()),
+            )
+        mirror_error = arbiter.mirror(repo, project["mirror"])
+        return {"task_id": task_id, "reverted_commit": task["merge_commit"], "commit": commit,
+                "mirror_error": mirror_error}
+
+
+# --- proposals ----------------------------------------------------------
+
+def proposals(state: State) -> list[dict]:
+    rows = []
+    for row in state.q("SELECT * FROM proposal ORDER BY id"):
+        detail = dict(row)
+        detail["spec"] = json.loads(detail["spec"])
+        detail["findings"] = json.loads(detail["findings"])
+        rows.append(detail)
+    return rows
+
+
+def proposal_detail(state: State, proposal_id: int) -> dict:
+    row = state.one("SELECT * FROM proposal WHERE id=?", (proposal_id,))
+    if row is None:
+        raise LookupError(f"unknown proposal: {proposal_id}")
+    detail = dict(row)
+    detail["spec"] = json.loads(detail["spec"])
+    detail["findings"] = json.loads(detail["findings"])
+    review = state.one(
+        "SELECT status, findings, recommendation FROM plan_review"
+        " WHERE proposal_id=? AND spec=?", (row["id"], row["spec"]),
+    )
+    detail["revisions"] = [
+        {**dict(r), "feedback": json.loads(r["feedback"])}
+        for r in state.q(
+            "SELECT r.*, m.payload AS feedback FROM proposal_revision r"
+            " JOIN message m ON m.id=r.feedback_id"
+            " WHERE r.original_id=? OR r.replacement_id=? ORDER BY r.original_id",
+            (row["id"], row["id"]),
+        )
+    ]
+    detail["plan_review"] = dict(review) if review else None
+    if review:
+        detail["plan_review"]["findings"] = json.loads(review["findings"])
+    return detail
+
+
+def approve_proposal(state: State, proposal_id: int, force: bool = False) -> dict:
+    ids = state.approve_proposal(proposal_id, force=force)
+    row = state.one("SELECT findings FROM proposal WHERE id=?", (proposal_id,))
+    return {"task_ids": ids, "overridden_findings": json.loads(row["findings"])}
+
+
+def reject_proposal(state: State, proposal_id: int, reason: str) -> None:
+    state.reject_proposal(proposal_id, reason)
+
+
+# --- feedback / planning --------------------------------------------------
+
+def submit_feedback(state: State, cfg: Config, project: str | None, text: str,
+                    task: str | None = None, proposal: int | None = None) -> tuple[str, int]:
+    if not text or not text.strip():
+        raise ValueError("feedback text is required")
+    return state.planner_feedback(project, text, cfg.model_for("planner"), task, proposal)
+
+
+# --- inbox / answers -------------------------------------------------------
+
+def inbox(state: State, include_delivered: bool = False) -> list[dict]:
+    rows = []
+    for row in state.inbox("owner", undelivered_only=not include_delivered):
+        item = dict(row)
+        payload = json.loads(item["payload"])
+        item["text"] = payload.get("question") or payload.get("reason") or json.dumps(payload)
+        item["answerable"] = answerable_question(state, item)
+        rows.append(item)
+    return rows
+
+
+def answerable_question(state: State, question) -> bool:
+    if question["kind"] != protocol.QUESTION or question["recipient"] != "owner" or question["delivered"]:
+        return False
+    agent = state.one("SELECT * FROM agent WHERE id=?", (question["sender"],))
+    if agent is None or agent["task_id"] != question["task_id"]:
+        return False
+    if question["task_id"]:
+        task = state.one("SELECT * FROM task WHERE id=?", (question["task_id"],))
+        # merge_commit survives rollback as history; status tracks current acceptance.
+        # Requeue retires old owner messages before starting the next lifecycle.
+        if task is None or task["status"] in ("done", "cancelled"):
+            return False
+    return True
+
+
+def answer_message(state: State, message_id: int, text: str) -> dict:
+    if not text or not text.strip():
+        raise ValueError("an answer is required")
+    with lifecycle_lock(state), state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        question = state.one("SELECT * FROM message WHERE id=?", (message_id,))
+        if question is None:
+            raise LookupError(f"no message #{message_id}")
+        if state.one(
+            "SELECT 1 FROM task WHERE status='cancelled' AND"
+            " (id=? OR id=(SELECT task_id FROM agent WHERE id=?))",
+            (question["task_id"], question["sender"]),
+        ):
+            raise ValueError("task is cancelled; use requeue explicitly to restore it")
+        if not answerable_question(state, question):
+            raise ValueError("message is not a currently answerable owner question")
+        agent_id = question["sender"]
+        now = time.time()
+        from . import protocol
+        state.db.execute(
+            "INSERT INTO message(kind,sender,recipient,payload,task_id,in_reply_to,created_at)"
+            " VALUES(?,'owner',?,?,?,?,?)",
+            (protocol.ANSWER, agent_id, json.dumps({"answer": text}),
+             question["task_id"], question["id"], now),
+        )
+        state.db.execute("UPDATE message SET delivered=1 WHERE id=?", (question["id"],))
+        state.db.execute("UPDATE agent SET state='runnable', updated_at=? WHERE id=?",
+                         (now, agent_id))
+        if question["task_id"]:
+            state.db.execute("UPDATE task SET status='in_progress', updated_at=? WHERE id=?",
+                             (now, question["task_id"]))
+    return {"agent_id": agent_id, "message_id": message_id}

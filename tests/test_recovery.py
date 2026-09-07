@@ -3,6 +3,8 @@
 import os
 import signal
 import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -57,6 +59,79 @@ def test_legacy_requires_explicit_quiescence_and_preserves_task(recovery_state):
         operations.recover_runs(state, [run], "verified")
     operations.recover_runs(state, [run], "verified scheduler and adapter processes", True)
     assert dict(state.one("SELECT * FROM task WHERE id=?", (task,))) == before
+
+
+def test_recovery_preserves_long_original_detail_and_mixed_selection_is_atomic(recovery_state):
+    _cfg, state, task = recovery_state
+    one = state.start_run("worker", task, "worker", "m", "log")
+    two = state.start_run("planner", None, "planner", "m", "log")
+    original = "adapter traceback\n" + "x" * 5000
+    state.x("UPDATE run SET detail=?, owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?",
+            (original, one))
+    # A live member makes the whole submitted set fail; the legacy row must
+    # not be partially recovered just because it appeared first.
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        state.record_adapter_owner(two, proc.pid)
+        state.x("UPDATE run SET owner_pid=99999999, owner_start='gone' WHERE id=?", (two,))
+        with pytest.raises(ValueError, match="live ownership"):
+            operations.recover_runs(state, [one, two], "mixed selection", True)
+        assert state.one("SELECT ended_at FROM run WHERE id=?", (one,))[0] is None
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    operations.recover_runs(state, [one], "verified quiescence", True)
+    saved = state.one("SELECT * FROM run WHERE id=?", (one,))
+    assert saved["detail"] == original
+    assert saved["recovery_reason"] == "verified quiescence"
+    assert saved["interrupted_at"] == saved["recovered_at"]
+
+
+def test_terminated_disposable_scheduler_blocks_then_allows_budget_requeue(recovery_state, tmp_path):
+    """Registration belongs to a disposable scheduler, not this test process.
+
+    Its adapter is separately sessioned, so killing the scheduler first proves
+    that an unfinished record blocks requeue while no agent is runnable, and
+    that a surviving descendant still vetoes recovery.
+    """
+    cfg, state, task = recovery_state
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "README").write_text("seed\n")
+    subprocess.run(["git", "add", "README"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=repo, check=True)
+    state.x("UPDATE project SET repo_path=? WHERE id='one'", (str(repo),))
+    state.x("UPDATE agent SET state='blocked'")
+    code = textwrap.dedent("""
+        import subprocess, sys, time
+        from nc.state import State
+        state = State(sys.argv[1])
+        run = state.start_run('worker', sys.argv[2], 'worker', 'm', 'log')
+        adapter = subprocess.Popen(['sleep', '30'], start_new_session=True)
+        state.record_adapter_owner(run, adapter.pid)
+        print(run, adapter.pid, flush=True)
+        time.sleep(30)
+    """)
+    scheduler = subprocess.Popen([sys.executable, "-c", code, str(cfg.db_path), task],
+                                 stdout=subprocess.PIPE, text=True)
+    line = scheduler.stdout.readline().strip()
+    run, adapter_pid = map(int, line.split())
+    scheduler.terminate()
+    scheduler.wait(timeout=5)
+    assert state.q("SELECT * FROM agent WHERE state='runnable'") == []
+    with pytest.raises(ValueError, match=fr"#{run}"):
+        operations.requeue_task(cfg, state, task, budget=9)
+    with pytest.raises(ValueError, match="live ownership"):
+        operations.recover_runs(state, [run], "scheduler was terminated")
+    os.killpg(adapter_pid, signal.SIGKILL)
+    operations.recover_runs(state, [run], "scheduler terminated after registration")
+    result = operations.requeue_task(cfg, state, task, budget=9)
+    assert result["budget"] == 9
+    saved_task = state.one("SELECT status, budget_turns FROM task WHERE id=?", (task,))
+    assert tuple(saved_task) == ("queued", 9)
 
 
 def test_incomplete_new_ownership_is_not_overridable(recovery_state):

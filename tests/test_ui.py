@@ -133,6 +133,9 @@ def test_runs_inspection_and_recovery_require_csrf(browser):
     assert request(f"/runs/{run}/recover", "POST", form)[0] == 403
     assert request(f"/runs/{run}/recover", "POST", form, valid)[0] == 303
     assert state.one("SELECT outcome FROM run WHERE id=?", (run,))["outcome"] == "INTERRUPTED"
+    # Both an unknown ID and a stale/finished form target are read-only 404s.
+    assert request("/runs/999999")[0] == 404
+    assert request(f"/runs/{run}")[0] == 404
 
 
 def test_busy_database_returns_retryable_error(browser):

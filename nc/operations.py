@@ -178,13 +178,16 @@ def recover_runs(state: State, run_ids: list[int], reason: str,
                              "; verify scheduler and adapter descendants are quiescent, then acknowledge")
         now = time.time()
         for row in rows:
-            detail = (row["detail"] or "")
-            evidence = f"interrupted by owner recovery at {now:.6f}: {reason.strip()}"
-            detail = (detail + "\n" if detail else "") + evidence
+            # ``detail`` is the session's contemporaneous evidence.  In
+            # particular it may be a deliberately long adapter traceback.
+            # Recovery is an owner audit event, not a new session result, so
+            # keep that evidence byte-for-byte and put the recovery facts in
+            # their additive columns rather than squeezing them into detail.
+            detail = row["detail"]
             changed = state.db.execute(
                 "UPDATE run SET outcome='INTERRUPTED', detail=?, ended_at=?, interrupted_at=?, "
                 "recovered_at=?, recovery_reason=? WHERE id=? AND ended_at IS NULL",
-                (detail[:4000], now, now, now, reason.strip()[:4000], row["id"]),
+                (detail, now, now, now, reason.strip(), row["id"]),
             ).rowcount
             if not changed:
                 raise ValueError(f"run {row['id']} changed before recovery; retry inspection")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import re
 import subprocess
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from nc import cli, protocol, turn
 from nc.adapters import SessionResult
 from nc.config import Config
+from nc.lifecycle import LifecycleBusy, lifecycle_lock
 from nc.scheduler import Scheduler
 from nc.state import State
 
@@ -62,6 +64,25 @@ def commit_and_emit(filename: str, content: str, payload: dict):
 
 def nothing(cwd: Path, outcome_path: Path) -> None:
     """A turn that ends without writing an outcome file."""
+
+
+def _run_scheduler_to_barrier(db_path: str, home: str, phase: str, entered, release) -> None:
+    """Run a real turn and pause at a protected scheduler phase in a child."""
+    state = State(Path(db_path), initialize=False)
+    try:
+        scheduler = Scheduler(Config(home=Path(home)), state)
+        scheduler.adapter = ScriptedAdapter([emit({"outcome": "DONE", "verdict": "pass"})])
+        scheduler._adapter_for = lambda role: scheduler.adapter
+
+        def pause(current):
+            if current == phase:
+                entered.set()
+                release.wait(10)
+
+        scheduler._lifecycle_hook = pause
+        scheduler.step()
+    finally:
+        state.db.close()
 
 
 @pytest.fixture
@@ -204,7 +225,8 @@ def test_accepted_work_is_mirrored_and_can_be_reverted(setup, tmp_path):
     assert f"{tid}: accepted by arbiter" in mirrored
     assert state.open_incidents() == []
 
-    assert cli.main(["--home", str(cfg.home), "rollback", tid]) == 0
+    assert cli.main(["--home", str(cfg.home), "rollback", tid, "--confirm-commit",
+                     state.one("SELECT merge_commit FROM task WHERE id=?", (tid,))[0]]) == 0
     assert not (repo / "marker.txt").exists()
     assert state.one("SELECT * FROM task WHERE id=?", (tid,))["status"] == "blocked"
 
@@ -255,7 +277,10 @@ def test_requeue_restarts_a_blocked_task_from_the_base_branch(setup):
     scheduler.step()
     state.set_task(tid, status="blocked")
 
-    assert cli.main(["--home", str(cfg.home), "requeue", tid, "--fresh"]) == 0
+    from nc import operations
+    token = operations.discard_preview(cfg, state, tid)["token"]
+    assert cli.main(["--home", str(cfg.home), "requeue", tid, "--fresh",
+                     "--confirm-discard", token]) == 0
     task = state.one("SELECT * FROM task WHERE id=?", (tid,))
     assert task["status"] == "queued" and task["attempts"] == 0
     assert all(agent["turns"] == 0 and agent["state"] == "blocked"
@@ -1085,8 +1110,12 @@ def test_owner_answers_scheduler_question(setup, role, channel, capsys):
             assert accepted.step() == protocol.DONE
             historical = state.send(protocol.QUESTION, agent_id, "owner",
                                     {"question": "Old question"}, tid)
-            operations.rollback_task(state, tid)
-            operations.requeue_task(cfg, state, tid, fresh=role == "fresh")
+            operations.rollback_task(
+                state, tid, state.one("SELECT merge_commit FROM task WHERE id=?", (tid,))[0])
+            discard = (operations.discard_preview(cfg, state, tid)["token"]
+                       if role == "fresh" else None)
+            operations.requeue_task(cfg, state, tid, fresh=role == "fresh",
+                                    expected_discard=discard)
             assert state.one("SELECT merge_commit FROM task WHERE id=?", (tid,))[0]
             with pytest.raises(ValueError, match="not a currently answerable"):
                 operations.answer_message(state, historical, "Obsolete")
@@ -1165,7 +1194,132 @@ def test_acceptance_survives_locked_worktree_and_allows_rollback(setup):
     ))
     incident = state.one("SELECT * FROM incident WHERE kind='worktree_cleanup'")
     assert tid in incident["detail"] and "locked" in incident["detail"]
-    result = operations.rollback_task(state, tid)
+    result = operations.rollback_task(state, tid, task["merge_commit"])
     assert result["reverted_commit"] == task["merge_commit"]
     assert not (repo / "marker.txt").exists()
     assert state.one("SELECT status FROM task WHERE id=?", (tid,))[0] == "blocked"
+
+
+@pytest.mark.parametrize('action', ['cancel', 'requeue'])
+def test_stale_selection_does_not_prepare_worktree(setup, monkeypatch, action):
+    from nc import arbiter, operations
+
+    cfg, state, _repo = setup
+    tid = state.add_task('neocortex', 'stale', 'must not run', [])
+    scheduler = sched(cfg, state, [])
+    selected = scheduler.pick()
+    if action == 'cancel':
+        state.set_task(tid, status='blocked')
+        operations.cancel_task(state, tid, 'owner cancelled')
+    else:
+        operations.requeue_task(cfg, state, tid)
+    before = list(state.db.iterdump())
+    monkeypatch.setattr(scheduler, 'pick', lambda: selected)
+
+    def unexpected(*args):
+        pytest.fail('stale selection prepared a worktree')
+
+    monkeypatch.setattr(arbiter, 'ensure_worktree', unexpected)
+    assert scheduler.step() == 'idle'
+    assert list(state.db.iterdump()) == before
+
+
+def test_direct_queue_activation_respects_lifecycle_ownership(setup):
+    cfg, state, _repo = setup
+    state.add_task("neocortex", "queued", "must wait", [])
+    scheduler = sched(cfg, state, [])
+
+    with lifecycle_lock(state), pytest.raises(LifecycleBusy, match="retry"):
+        scheduler.spawn_for_queued_task()
+
+    assert scheduler.spawn_for_queued_task()
+
+
+@pytest.mark.parametrize("phase", ["before_worktree_preparation", "after_end_run"])
+def test_real_scheduler_barriers_reject_fresh_requeue_until_release(setup, phase):
+    """Actual scheduler barriers cover preparation and post-end_run checks."""
+    from nc import arbiter, operations
+
+    cfg, state, repo = setup
+    tid = state.add_task("neocortex", "barrier", "do not discard", [])
+    state.set_task(tid, status="in_progress")
+    state.add_agent(f"worker-{tid}", "worker", "neocortex", tid, "model")
+    worktree, branch = arbiter.ensure_worktree(repo, cfg.work_dir, tid)
+    token = operations.discard_preview(cfg, state, tid)["token"]
+    entered, release = multiprocessing.Event(), multiprocessing.Event()
+    child = multiprocessing.Process(
+        target=_run_scheduler_to_barrier,
+        args=(str(cfg.db_path), str(cfg.home), phase, entered, release),
+    )
+    child.start()
+    try:
+        assert entered.wait(5)
+        # Snapshot after the real scheduler reached its protected phase.
+        before = list(state.db.iterdump())
+        with pytest.raises(LifecycleBusy, match="retry"):
+            operations.requeue_task(cfg, state, tid, fresh=True, expected_discard=token)
+        assert worktree.exists()
+        assert arbiter.git(repo, "rev-parse", "--verify", branch)
+        assert list(state.db.iterdump()) == before
+    finally:
+        release.set()
+        child.join(10)
+        if child.is_alive():
+            child.terminate()
+            child.join()
+    assert child.exitcode == 0
+    # Revalidation makes the original confirmation stale after the real turn.
+    token = operations.discard_preview(cfg, state, tid)["token"]
+    operations.requeue_task(cfg, state, tid, fresh=True, expected_discard=token)
+    assert not worktree.exists()
+    assert state.one("SELECT status FROM task WHERE id=?", (tid,))[0] == "queued"
+
+
+def test_real_integration_barrier_blocks_rollback_across_repository_aliases(setup, tmp_path):
+    """Rollback cannot overlap a real scheduler integration through an alias."""
+    from nc import arbiter, operations
+
+    cfg, state, repo = setup
+    accepted = state.add_task("neocortex", "accepted", "already merged", [])
+    other = state.add_task("neocortex", "rollback", "undo me", [])
+    (repo / "accepted.txt").write_text("accepted\n")
+    arbiter.git(repo, "add", "accepted.txt")
+    arbiter.git(repo, "commit", "-m", "accepted")
+    commit = arbiter.git(repo, "rev-parse", "--short", "HEAD")
+    state.set_task(accepted, status="in_review")
+    state.set_task(other, status="done", merge_commit=commit)
+    alias = tmp_path / "repo-alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    state.x("UPDATE project SET repo_path=? WHERE id='neocortex'", (str(alias),))
+    worktree, _branch = arbiter.ensure_worktree(alias, cfg.work_dir, accepted)
+    (worktree / "integrated.txt").write_text("integrated\n")
+    arbiter.git(worktree, "add", "integrated.txt")
+    arbiter.git(worktree, "commit", "-m", "integration work")
+    state.add_agent(f"worker-{accepted}", "worker", "neocortex", accepted, "model")
+    state.set_agent(f"worker-{accepted}", state="blocked")
+    state.add_agent(f"critic-{accepted}-1", "critic", "neocortex", accepted, "model")
+    head = arbiter.git(repo, "rev-parse", "HEAD")
+    entered, release = multiprocessing.Event(), multiprocessing.Event()
+    child = multiprocessing.Process(target=_run_scheduler_to_barrier,
+                                    args=(str(cfg.db_path), str(cfg.home),
+                                          "before_integration", entered, release))
+    child.start()
+    try:
+        assert entered.wait(5)
+        # The critic has recorded its verdict, but integration has not started.
+        before = list(state.db.iterdump())
+        with pytest.raises(LifecycleBusy, match="busy"):
+            operations.rollback_task(state, other, commit)
+        assert arbiter.git(repo, "rev-parse", "HEAD") == head
+        assert list(state.db.iterdump()) == before
+    finally:
+        release.set()
+        child.join(10)
+        if child.is_alive():
+            child.terminate()
+            child.join()
+    assert child.exitcode == 0
+    assert (repo / "integrated.txt").exists()
+    result = operations.rollback_task(state, other, commit)
+    assert result["reverted_commit"] == commit
+    assert state.one("SELECT status FROM task WHERE id=?", (other,))[0] == "blocked"

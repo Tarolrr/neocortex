@@ -30,6 +30,8 @@ import sqlite3
 import subprocess
 import urllib.parse
 from collections.abc import Callable
+from email import policy
+from email.parser import BytesParser
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -201,10 +203,12 @@ def _task_import_page(project: dict, csrf: str, error: str, raw: str) -> str:
 <h2>Import task JSON into {_e(project["title"])}</h2>
 <p>Paste one task spec object, or a JSON list of task specs (the same shape as
 <code>nc task --file</code>).</p>
-<form method="post" action="/p/{_segment(project["id"])}/tasks/import">
+<form method="post" enctype="multipart/form-data" action="/p/{_segment(project["id"])}/tasks/import">
 {_csrf_field(csrf)}
 <div class="field"><label for="spec">Task spec JSON</label>
-<textarea id="spec" name="spec" required rows="12">{_e(raw)}</textarea></div>
+<textarea id="spec" name="spec" rows="12">{_e(raw)}</textarea></div>
+<div class="field"><label for="upload">Or upload UTF-8 JSON (1 MiB form limit)</label>
+<input id="upload" name="upload" type="file" accept=".json,application/json"></div>
 <button type="submit">Import</button>
 </form>"""
     return _page("Import tasks", "projects", body)
@@ -225,7 +229,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
         depends += (f'<p role="alert">{_e(dep)}: cancelled; dependency remains unmet '
                     f'(<a href="/t/{_segment(dep)}">inspect</a>)</p>')
 
-    criteria = "".join(f"<li>{_e(c)}</li>" for c in task["acceptance"]) or "<li>(none)</li>"
+    criteria = "".join(f"<li><pre>{_e(c)}</pre></li>" for c in task["acceptance"]) or "<li>(none)</li>"
     runs = "".join(
         f"<li>#{r['id']} agent={_e(r['agent_id'])} role={_e(r['role'])} "
         f"outcome={_e(r['outcome'] or 'running')} log={_e(r['log_path'] or '(none)')}</li>"
@@ -233,7 +237,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
     ) or "<li>(none)</li>"
     messages = "".join(
         f"<li>#{m['id']} [{_e(m['kind'])}] {_e(m['sender'])} -&gt; {_e(m['recipient'])}: "
-        f"{_e(m['payload'])}</li>"
+        f"<pre>{_e(m['payload'])}</pre></li>"
         for m in task["messages"]
     ) or "<li>(none)</li>"
     check_output = (f"<pre>{_e(task['check_output'])}</pre>" if task["check_output"] is not None
@@ -250,6 +254,12 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 <button type="submit">Cancel task</button>
 </form></details>""")
     if task["status"] != "done":
+        try:
+            preview = operations.discard_preview(cfg, state, task["id"])
+            discard = (f'<pre>{_e(json.dumps(preview, indent=2))}</pre>'
+                       f'<input type="hidden" name="expected_discard" value="{preview["token"]}">')
+        except ValueError as exc:
+            discard = f"<p>{_e(str(exc))}</p>"
         actions.append(f"""
 <details><summary>Requeue this task</summary>
 <form method="post" action="/t/{_segment(task["id"])}/requeue">
@@ -259,7 +269,8 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 <div class="field"><label for="budget">New turn budget (optional)</label>
 <input id="budget" name="budget" type="number" min="1"></div>
 <div class="field checkbox"><input id="fresh" name="fresh" type="checkbox" value="1">
-<label for="fresh">Start from a fresh branch (discard worktree and branch)</label></div>
+<label for="fresh">Confirm discarding the branch and worktree shown below</label></div>
+{discard}
 <button type="submit">Requeue</button>
 </form></details>""")
     if task["status"] == "done" and task["merge_commit"]:
@@ -267,6 +278,7 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 <details><summary>Roll back this accepted task</summary>
 <form method="post" action="/t/{_segment(task["id"])}/rollback">
 {_csrf_field(csrf)}
+<input type="hidden" name="expected_commit" value="{_e(task["merge_commit"])}">
 <p>Reverts merge commit <code>{_e(task["merge_commit"])}</code> and opens an incident.</p>
 <button type="submit">Roll back</button>
 </form></details>""")
@@ -281,6 +293,10 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
 <pre>{_e(task["objective"])}</pre>
 <h3>Acceptance criteria</h3>
 <ul>{criteria}</ul>
+<h3>Boundaries</h3>
+<pre>{_e(chr(10).join(task["boundaries"]))}</pre>
+<h3>Result</h3>
+<pre>{_e(task["result"] or "(none)")}</pre>
 <h3>Runs</h3>
 <ul>{runs}</ul>
 <h3>Messages</h3>
@@ -579,6 +595,13 @@ def _view_task_import(h: Handler, state, params, query):
 def _post_task_import(h: Handler, state, params, query, form):
     project = _require_project(state, params["project"])
     raw = form.get("spec", "")
+    uploaded = form.get("upload", "")
+    if raw.strip() and uploaded.strip():
+        h.send_html(HTTPStatus.BAD_REQUEST, _task_import_page(
+            project, h.csrf_token, "Choose pasted JSON or an upload, not both", raw,
+        ))
+        return
+    raw = uploaded or raw
     try:
         specs = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -689,7 +712,8 @@ def _post_requeue(h: Handler, state, params, query, form):
         return
     try:
         result = operations.requeue_task(h.cfg, state, task_id, form.get("fresh") == "1",
-                                         budget_value, form.get("reason") or None)
+                                         budget_value, form.get("reason") or None,
+                                         form.get("expected_discard"))
     except (ValueError, LookupError) as exc:
         h.redirect(f"/t/{_segment(task_id)}", error=str(exc))
         return
@@ -701,8 +725,8 @@ def _post_requeue(h: Handler, state, params, query, form):
 def _post_rollback(h: Handler, state, params, query, form):
     task_id = params["task_id"]
     try:
-        result = operations.rollback_task(state, task_id)
-    except LookupError as exc:
+        result = operations.rollback_task(state, task_id, form.get("expected_commit"))
+    except (LookupError, ValueError) as exc:
         h.redirect(f"/t/{_segment(task_id)}", error=str(exc))
         return
     ok = f"reverted {result['reverted_commit']} in {result['commit']}"
@@ -1000,12 +1024,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ValueError("transfer encoding is unsupported")
         if len(self.headers.get_all("Content-Length", [])) != 1:
             raise ValueError("one Content-Length header is required")
-        if self.headers.get_content_type() != "application/x-www-form-urlencoded":
-            raise ValueError("expected a URL-encoded form")
+        content_type = self.headers.get_content_type()
+        if content_type not in ("application/x-www-form-urlencoded", "multipart/form-data"):
+            raise ValueError("expected a URL-encoded or multipart form")
         length = int(self.headers.get("Content-Length") or 0)
         if not 0 <= length <= 1024 * 1024:
             raise ValueError("form exceeds the 1 MiB limit")
         raw = self.rfile.read(length) if length else b""
+        if content_type == "multipart/form-data":
+            message = BytesParser(policy=policy.default).parsebytes(
+                ("Content-Type: " + self.headers["Content-Type"] + "\r\n\r\n").encode()
+                + raw,
+            )
+            if not message.is_multipart() or message.defects:
+                raise ValueError("invalid multipart form")
+            form = {}
+            for part in message.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                if not name or name in form or part.is_multipart() or part.defects:
+                    raise ValueError("invalid or duplicate multipart field")
+                # Filenames are untrusted metadata, never filesystem paths.
+                form[name] = (part.get_payload(decode=True) or b"").decode("utf-8")
+            return form
         parsed = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
         return {k: v[-1] for k, v in parsed.items()}
 

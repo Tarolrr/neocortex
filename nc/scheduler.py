@@ -17,7 +17,7 @@ from pathlib import Path
 from . import arbiter, protocol, turn
 from .adapters import Adapter, get_adapter
 from .config import Config
-from .lifecycle import LifecycleBusy, lifecycle_lock
+from .lifecycle import LifecycleBusy, lifecycle_lock, repository_lock
 from .state import State
 
 log = logging.getLogger("nc.scheduler")
@@ -28,6 +28,13 @@ class Scheduler:
         self.cfg = cfg
         self.state = state
         self.consecutive_failures = 0
+        # A deliberately narrow test seam for process barriers.  Hooks run
+        # while the lifecycle/repository exclusions are actually owned.
+        self._lifecycle_hook = None
+
+    def _hook(self, phase: str) -> None:
+        if self._lifecycle_hook is not None:
+            self._lifecycle_hook(phase)
 
     def _adapter_for(self, role: str) -> Adapter:
         return get_adapter(self.cfg.adapter_for(role))
@@ -77,7 +84,9 @@ class Scheduler:
         )
         work = self.state.one(query)
         if work is None:
-            self.spawn_for_queued_task()
+            # ``step`` already owns the lifecycle lock.  Keep the actual
+            # activation private so the public entry point can acquire it too.
+            self._spawn_for_queued_task()
             work = self.state.one(query)
         planner = None
         for candidate in self.state.q(
@@ -122,6 +131,12 @@ class Scheduler:
         return None
 
     def spawn_for_queued_task(self) -> str | None:
+        """Safely expose queued-task activation to non-``step`` callers."""
+        with lifecycle_lock(self.state):
+            return self._spawn_for_queued_task()
+
+    def _spawn_for_queued_task(self) -> str | None:
+        """Activate one ready task; caller owns ``lifecycle_lock``."""
         # Serialize queue selection and activation against owner cancellation.
         with self.state.db:
             self.state.db.execute("BEGIN IMMEDIATE")
@@ -183,11 +198,26 @@ class Scheduler:
         task = self.state.one("SELECT * FROM task WHERE id=?", (agent["task_id"],))
         project = self.state.one("SELECT * FROM project WHERE id=?", (agent["project_id"],))
         repo = Path(project["repo_path"])
-        cwd, branch = arbiter.ensure_worktree(repo, self.cfg.work_dir, task["id"])
+        with repository_lock(repo):
+            # Selection is a hint; reread eligibility before worktree preparation.
+            current = self.state.one("SELECT * FROM agent WHERE id=?", (agent["id"],))
+            latest = self.state.one("SELECT * FROM task WHERE id=?", (task["id"],))
+            if (current is None or current["state"] != "runnable"
+                    or latest["status"] not in ("in_progress", "in_review", "blocked")
+                    or current["updated_at"] != agent["updated_at"]
+                    or self.state.one("SELECT 1 FROM run WHERE ended_at IS NULL")):
+                return "idle"
+            return self._task_turn(current, latest, project, repo)
 
+    def _task_turn(self, agent, task, project, repo):
         if agent["turns"] >= task["budget_turns"]:
             self._block(task, agent, f"turn budget ({task['budget_turns']}) exhausted")
             return "budget_exhausted"
+
+        # This is inside lifecycle_lock and repository_lock.  It is before the
+        # run is registered, so a finished-run timestamp is never its boundary.
+        self._hook("before_worktree_preparation")
+        cwd, branch = arbiter.ensure_worktree(repo, self.cfg.work_dir, task["id"])
 
         checks_text = ""
         if agent["role"] == "critic":
@@ -196,6 +226,9 @@ class Scheduler:
         adapter = self._adapter_for(agent["role"])
         outcome = turn.run_turn(self.state, self.cfg, adapter, agent, cwd, branch,
                                 checks_text)
+        # run_turn has recorded end_run, but acceptance and integration below
+        # remain part of the same ownership window.
+        self._hook("after_end_run")
         log.info("%s (%s) -> %s: %s", agent["id"], agent["role"], outcome.kind,
                  outcome.summary[:200])
 
@@ -290,6 +323,7 @@ class Scheduler:
         if verdict == "pass":
             repo = Path(project["repo_path"])
             try:
+                self._hook("before_integration")
                 commit = arbiter.integrate(repo, branch, task["id"])
             except arbiter.MergeConflict as exc:
                 base = arbiter.base_branch(repo)

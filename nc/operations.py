@@ -16,14 +16,16 @@ Nothing here shells out or re-parses `nc` output; it calls `State` methods and
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import stat
 import time
 from pathlib import Path
 
 from . import arbiter, protocol
 from .config import Config
-from .lifecycle import lifecycle_lock
+from .lifecycle import lifecycle_lock, repository_lock
 from .state import State
 
 
@@ -302,6 +304,12 @@ def import_tasks(state: State, specs: list[dict] | dict,
             if type(value) is not int or (key == "budget_turns" and value < 1):
                 raise ValueError(f"{key} must be an integer" +
                                  (" greater than zero" if key == "budget_turns" else ""))
+        # Validate references before opening the import transaction.  _add_task
+        # repeats this under that transaction to close races with task deletion.
+        state._validate_task_fields(project, spec["title"], spec["objective"],
+                                    spec["acceptance"], spec.get("boundaries"),
+                                    spec.get("priority", 100), spec.get("budget_turns", 6),
+                                    spec.get("depends_on"))
     with state.db:
         state.db.execute("BEGIN IMMEDIATE")
         return [state._add_task_spec(spec) for spec in items]
@@ -329,10 +337,21 @@ def task_detail(state: State, cfg: Config, task_id: str) -> dict:
         "SELECT * FROM message WHERE task_id=? ORDER BY id", (task_id,),
     )]
     check_path = cfg.home / "checks" / f"{task_id}.txt"
-    try:
-        detail["check_output"] = check_path.read_text()
-    except FileNotFoundError:
-        detail["check_output"] = None
+    detail["check_output"] = None
+    # Pin the directory and reject symlinks: evidence is never a browser path.
+    if Path(task_id).name == task_id and task_id not in (".", ".."):
+        try:
+            directory = os.open(cfg.home / "checks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                fd = os.open(f"{task_id}.txt", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=directory)
+                with os.fdopen(fd) as evidence:
+                    if stat.S_ISREG(os.fstat(evidence.fileno()).st_mode):
+                        detail["check_output"] = evidence.read()
+            finally:
+                os.close(directory)
+        except (OSError, UnicodeError):
+            pass  # Missing or unsafe evidence is displayed as absent.
     detail["check_path"] = str(check_path)
     return detail
 
@@ -342,8 +361,82 @@ def cancel_task(state: State, task_id: str, reason: str) -> bool:
         return state.cancel_task(task_id, reason)
 
 
+def retry_blocked_tasks(state: State) -> list[str]:
+    """Atomically make currently blocked task workers runnable again.
+
+    ``nc resume --retry`` is a lifecycle operation, not merely an incident
+    acknowledgement: scheduler ownership must exclude it from selection through
+    outcome application.
+    """
+    with lifecycle_lock(state), state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        rows = state.q("SELECT id FROM task WHERE status='blocked'")
+        now = time.time()
+        ids = []
+        for row in rows:
+            changed = state.db.execute(
+                "UPDATE task SET status='in_progress', attempts=0, updated_at=?"
+                " WHERE id=? AND status='blocked'", (now, row["id"]),
+            ).rowcount
+            if changed:
+                state.db.execute(
+                    "UPDATE agent SET state='runnable', updated_at=? WHERE id=?",
+                    (now, f"worker-{row['id']}"),
+                )
+                ids.append(row["id"])
+        return ids
+
+
+
+def _discard_preview(cfg: Config, state: State, task) -> dict:
+    """Fingerprint the task revision, branch and all discarded worktree content."""
+    repo = Path(get_project(state, task["project_id"])["repo_path"])
+    branch = f"nc/{task['id']}"
+    commit = arbiter.git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
+                         check=False)
+    worktree = cfg.work_dir / task["id"]
+    digest = hashlib.sha256()
+    files = 0
+
+    def scan(path):
+        nonlocal files
+        info = path.lstat()
+        digest.update(json.dumps([str(path.relative_to(worktree)), info.st_mode]).encode())
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode())
+        elif path.is_dir():
+            for child in sorted(path.iterdir()):
+                scan(child)
+        elif path.is_file():
+            files += 1
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            raise ValueError("Cannot confirm special files in worktree")
+    if worktree.exists() or worktree.is_symlink():
+        scan(worktree)
+    snapshot = {"task_id": task["id"], "status": task["status"],
+                "updated_at": task["updated_at"], "budget": task["budget_turns"],
+                "branch": branch, "commit": commit or None, "worktree": str(worktree),
+                "files": files, "content": digest.hexdigest()}
+    snapshot["token"] = hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
+    return snapshot
+
+
+def discard_preview(cfg: Config, state: State, task_id: str) -> dict:
+    with lifecycle_lock(state):
+        task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+        if task is None:
+            raise LookupError(f"unknown task: {task_id}")
+        repo = Path(get_project(state, task["project_id"])["repo_path"])
+        with repository_lock(repo):
+            return _discard_preview(cfg, state, task)
+
+
 def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
-                 budget: int | None = None, reason: str | None = None) -> dict:
+                 budget: int | None = None, reason: str | None = None,
+                 expected_discard: str | None = None) -> dict:
     """Put a task back in the queue, optionally discarding its branch and worktree."""
     if budget is not None and budget < 1:
         raise ValueError("turn budget must be greater than zero")
@@ -358,26 +451,41 @@ def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
                              unfinished_blockers(state))
         project = get_project(state, task["project_id"])
         repo = Path(project["repo_path"])
-        with state.db:
-            state.db.execute("BEGIN IMMEDIATE")
-            if fresh:
-                arbiter.remove_worktree(repo, cfg.work_dir / task["id"])
-                arbiter.git(repo, "worktree", "prune")
-                branch = f"nc/{task['id']}"
-                if arbiter.git(repo, "branch", "--list", branch):
-                    arbiter.git(repo, "branch", "-D", branch)
-            state.db.execute("UPDATE agent SET state='blocked', turns=0 WHERE task_id=?", (task_id,))
-            state.db.execute("UPDATE message SET delivered=1 WHERE task_id=? AND recipient='owner'",
-                             (task_id,))
-            state.db.execute(
-                "UPDATE task SET status='queued', attempts=0, result=?, budget_turns=?, updated_at=?"
-                " WHERE id=?", (reason or "requeued by the owner", budget if budget is not None else task["budget_turns"],
-                                 time.time(), task_id),
-            )
-        return {"task_id": task_id, "fresh": fresh, "budget": budget}
+        with repository_lock(repo):
+            # The rows read before taking repository ownership are only a
+            # routing hint.  Revalidate all lifecycle inputs while both
+            # exclusions are owned, immediately before any Git/state write.
+            task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+            if task is None:
+                raise LookupError(f"unknown task: {task_id}")
+            if task["status"] == "done":
+                raise ValueError(f"{task_id} is already accepted; use rollback instead")
+            if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
+                raise ValueError("An active run must finish before changing task lifecycle")
+            if fresh and (not expected_discard or
+                          expected_discard != _discard_preview(cfg, state, task)["token"]):
+                raise ValueError("Confirm the current discarded work before fresh requeue; "
+                                 "reload the task or use --preview-discard and retry")
+            with state.db:
+                state.db.execute("BEGIN IMMEDIATE")
+                if fresh:
+                    arbiter.remove_worktree(repo, cfg.work_dir / task["id"])
+                    arbiter.git(repo, "worktree", "prune")
+                    branch = f"nc/{task['id']}"
+                    if arbiter.git(repo, "branch", "--list", branch):
+                        arbiter.git(repo, "branch", "-D", branch)
+                state.db.execute("UPDATE agent SET state='blocked', turns=0 WHERE task_id=?", (task_id,))
+                state.db.execute("UPDATE message SET delivered=1 WHERE task_id=? AND recipient='owner'",
+                                 (task_id,))
+                state.db.execute(
+                    "UPDATE task SET status='queued', attempts=0, result=?, budget_turns=?, updated_at=?"
+                    " WHERE id=?", (reason or "requeued by the owner", budget if budget is not None else task["budget_turns"],
+                                     time.time(), task_id),
+                )
+            return {"task_id": task_id, "fresh": fresh, "budget": budget}
 
 
-def rollback_task(state: State, task_id: str) -> dict:
+def rollback_task(state: State, task_id: str, expected_commit: str | None = None) -> dict:
     with lifecycle_lock(state):
         task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
         if task is None or not task["merge_commit"]:
@@ -389,20 +497,33 @@ def rollback_task(state: State, task_id: str) -> dict:
         repo = Path(project["repo_path"])
         if task["status"] != "done":
             raise ValueError(f"{task_id} is not accepted; rollback requires a done task")
-        with state.db:
-            state.db.execute("BEGIN IMMEDIATE")
-            commit = arbiter.revert(repo, task["merge_commit"])
-            state.db.execute(
-                "UPDATE task SET status='blocked', result=?, updated_at=? WHERE id=?",
-                (f"reverted by the owner in {commit}", time.time(), task_id),
-            )
-            state.db.execute(
-                "INSERT INTO incident(kind,detail,created_at) VALUES('rollback',?,?)",
-                (f"{task_id} reverted in {commit}", time.time()),
-            )
-        mirror_error = arbiter.mirror(repo, project["mirror"])
-        return {"task_id": task_id, "reverted_commit": task["merge_commit"], "commit": commit,
-                "mirror_error": mirror_error}
+        with repository_lock(repo):
+            # As above, do not act on the pre-lock snapshot.  This also makes
+            # a confirmation stale if an earlier lifecycle operation changed
+            # the task while a caller was waiting to acquire repository scope.
+            task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+            if task is None or not task["merge_commit"]:
+                raise LookupError(f"{task_id} has no recorded merge commit")
+            if task["status"] != "done":
+                raise ValueError(f"{task_id} is not accepted; rollback requires a done task")
+            if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
+                raise ValueError("An active run must finish before changing task lifecycle")
+            with state.db:
+                state.db.execute("BEGIN IMMEDIATE")
+                if not expected_commit or expected_commit != task["merge_commit"]:
+                    raise ValueError("Confirm the current merge commit before rollback; reload and retry")
+                commit = arbiter.revert(repo, task["merge_commit"])
+                state.db.execute(
+                    "UPDATE task SET status='blocked', result=?, updated_at=? WHERE id=?",
+                    (f"reverted by the owner in {commit}", time.time(), task_id),
+                )
+                state.db.execute(
+                    "INSERT INTO incident(kind,detail,created_at) VALUES('rollback',?,?)",
+                    (f"{task_id} reverted in {commit}", time.time()),
+                )
+            mirror_error = arbiter.mirror(repo, project["mirror"])
+            return {"task_id": task_id, "reverted_commit": task["merge_commit"], "commit": commit,
+                    "mirror_error": mirror_error}
 
 
 # --- proposals ----------------------------------------------------------

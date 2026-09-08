@@ -243,7 +243,11 @@ class State:
     def _add_task(self, project_id: str, title: str, objective: str,
                   acceptance: list[str], boundaries: list[str] | None = None,
                   priority: int = 100, budget_turns: int = 6,
-                  depends_on: list[str] | None = None) -> str:
+                  depends_on: list[str] | None = None,
+                  allowed_dependencies: set[str] | None = None) -> str:
+        self._validate_task_fields(project_id, title, objective, acceptance,
+                                   boundaries, priority, budget_turns, depends_on,
+                                   allowed_dependencies)
         tid = self._next_task_id(project_id)
         now = time.time()
         self.db.execute(
@@ -254,6 +258,39 @@ class State:
              json.dumps(depends_on or []), now, now),
         )
         return tid
+
+    def _validate_task_fields(self, project_id: str, title: str, objective: str,
+                              acceptance: list[str], boundaries: list[str] | None,
+                              priority: int, budget_turns: int,
+                              depends_on: list[str] | None,
+                              allowed_dependencies: set[str] | None = None) -> None:
+        """Reject malformed task input before allocating an id or writing state."""
+        if not isinstance(project_id, str) or self.one("SELECT 1 FROM project WHERE id=?",
+                                                       (project_id,)) is None:
+            raise ValueError(f"unknown project: {project_id}")
+        for name, value in (("title", title), ("objective", objective)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} is required and must be text")
+        for name, value in (("acceptance", acceptance),
+                            ("boundaries", [] if boundaries is None else boundaries),
+                            ("depends_on", [] if depends_on is None else depends_on)):
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise ValueError(f"{name} must be a list of strings")
+        if type(priority) is not int:
+            raise ValueError("priority must be an integer")
+        if type(budget_turns) is not int or budget_turns < 1:
+            raise ValueError("budget_turns must be an integer greater than zero")
+        # Dependencies are task IDs, not free-form labels.  Validating this at
+        # the state boundary keeps imported/browser-created tasks from becoming
+        # permanently unready due to a typo or a task in another project.
+        allowed = allowed_dependencies or set()
+        for dependency in depends_on or []:
+            row = self.one("SELECT project_id FROM task WHERE id=?", (dependency,))
+            if row is None:
+                if dependency not in allowed:
+                    raise ValueError(f"unknown dependency: {dependency}")
+            elif row["project_id"] != project_id:
+                raise ValueError(f"dependency belongs to another project: {dependency}")
 
     def cancel_task(self, task_id: str, reason: str) -> bool:
         """Atomically retire a task and its agents, retaining existing evidence."""
@@ -368,10 +405,23 @@ class State:
                 raise ValueError("proposal has findings (use --force to override):\n"
                                  + "\n".join(findings))
             ids = []
+            local_dependencies = {spec["id"] for spec in specs if spec.get("id")}
+            # Proposal-local IDs are resolved after rows receive their canonical
+            # IDs.  A forced proposal may deliberately retain an advisory
+            # unknown-dependency finding, so it is the sole internal caller
+            # allowed to defer that existence check.
+            if force:
+                local_dependencies.update(
+                    dep for spec in specs for dep in spec.get("depends_on", [])
+                )
             for spec in specs:
                 if spec["project"] != row["project_id"]:
                     raise ValueError("proposed task belongs to another project")
-                ids.append(self._add_task_spec(spec))
+                ids.append(self._add_task(spec["project"], spec["title"], spec["objective"],
+                                          spec["acceptance"], spec.get("boundaries"),
+                                          spec.get("priority", 100),
+                                          spec.get("budget_turns", 6),
+                                          spec.get("depends_on"), local_dependencies))
             local_ids = {spec["id"]: tid for spec, tid in zip(specs, ids) if spec.get("id")}
             for spec, tid in zip(specs, ids):
                 deps = [local_ids.get(dep, dep) for dep in spec.get("depends_on", [])]

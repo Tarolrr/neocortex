@@ -8,10 +8,12 @@ import logging
 import sqlite3
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 from . import arbiter, operations, protocol
 from .config import Config
+from .lifecycle import LifecycleBusy, lifecycle_lock, repository_identity, repository_lock
 from .scheduler import Scheduler
 from .state import State
 
@@ -74,8 +76,11 @@ def cmd_requeue(args) -> int:
     """Put a task back in the queue, optionally from a clean branch off the base."""
     cfg, state = _open(args)
     try:
+        if args.preview_discard:
+            print(json.dumps(operations.discard_preview(cfg, state, args.task_id), indent=2))
+            return 0
         result = operations.requeue_task(cfg, state, args.task_id, args.fresh,
-                                         args.budget, args.reason)
+                                         args.budget, args.reason, args.confirm_discard)
     except (ValueError, LookupError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -252,38 +257,53 @@ def cmd_gc(args) -> int:
     cfg, state = _open(args)
     work_root = cfg.work_dir.resolve()
     result = 0
-    repos = set()
-    # Keep task statuses stable while removing their worktrees.
-    with state.db:
-        state.db.execute("BEGIN IMMEDIATE")
-        tasks = state.q(
-            "SELECT task.id, project.repo_path FROM task"
-            " JOIN project ON project.id=task.project_id"
-            " WHERE task.status IN ('done', 'blocked') ORDER BY task.id"
-        )
-        for task in tasks:
-            path = work_root / task["id"]
-            if path.is_symlink() or path.resolve().parent != work_root:
-                print(f"refusing worktree outside work directory: {path}", file=sys.stderr)
-                result = 1
-                continue
-            repo = Path(task["repo_path"])
-            repos.add(repo)
-            if not path.exists():
-                continue
-            try:
-                arbiter.git(repo, "worktree", "remove", "--force", str(path))
-            except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
-                result = 1
-            else:
-                print(f"removed {path}")
-        for repo in sorted(repos):
-            try:
-                arbiter.git(repo, "worktree", "prune")
-            except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
-                result = 1
+    try:
+        # Lock ordering is lifecycle first, then canonical repositories sorted
+        # by identity.  This makes GC cooperate with turns, requeue and rollback.
+        with lifecycle_lock(state):
+            candidates = state.q(
+                "SELECT DISTINCT project.repo_path FROM task"
+                " JOIN project ON project.id=task.project_id"
+                " WHERE task.status IN ('done', 'blocked')"
+            )
+            repos = sorted((Path(row["repo_path"]) for row in candidates),
+                           key=lambda repo: str(repository_identity(repo)))
+            with ExitStack() as locks:
+                for repo in repos:
+                    locks.enter_context(repository_lock(repo))
+                # Reread after ownership is held: GC candidates are only hints.
+                tasks = state.q(
+                    "SELECT task.id, project.repo_path FROM task"
+                    " JOIN project ON project.id=task.project_id"
+                    " WHERE task.status IN ('done', 'blocked') ORDER BY task.id"
+                )
+                touched = set()
+                for task in tasks:
+                    path = work_root / task["id"]
+                    if path.is_symlink() or path.resolve().parent != work_root:
+                        print(f"refusing worktree outside work directory: {path}", file=sys.stderr)
+                        result = 1
+                        continue
+                    repo = Path(task["repo_path"])
+                    touched.add(repo)
+                    if not path.exists():
+                        continue
+                    try:
+                        arbiter.git(repo, "worktree", "remove", "--force", str(path))
+                    except RuntimeError as exc:
+                        print(str(exc), file=sys.stderr)
+                        result = 1
+                    else:
+                        print(f"removed {path}")
+                for repo in sorted(touched, key=lambda repo: str(repository_identity(repo))):
+                    try:
+                        arbiter.git(repo, "worktree", "prune")
+                    except RuntimeError as exc:
+                        print(str(exc), file=sys.stderr)
+                        result = 1
+    except LifecycleBusy as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return result
 
 
@@ -398,7 +418,7 @@ def cmd_run(args) -> int:
 def cmd_rollback(args) -> int:
     _, state = _open(args)
     try:
-        result = operations.rollback_task(state, args.task_id)
+        result = operations.rollback_task(state, args.task_id, args.confirm_commit)
     except (LookupError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -422,21 +442,12 @@ def cmd_resume(args) -> int:
         stop.unlink()
     state.resolve_open_incidents("Closed by nc resume")
     if args.retry:
-        for row in state.q("SELECT * FROM task WHERE status='blocked'"):
-            # Selection may be stale: serialize the guarded transition and
-            # worker update with cancellation, which retires both together.
-            with state.db:
-                changed = state.db.execute(
-                    "UPDATE task SET status='in_progress', attempts=0, updated_at=?"
-                    " WHERE id=? AND status='blocked'", (time.time(), row["id"]),
-                ).rowcount
-                if not changed:
-                    continue
-                state.db.execute(
-                    "UPDATE agent SET state='runnable', updated_at=? WHERE id=?",
-                    (time.time(), f"worker-{row['id']}"),
-                )
-            print(f"unblocked {row['id']}")
+        try:
+            for task_id in operations.retry_blocked_tasks(state):
+                print(f"unblocked {task_id}")
+        except LifecycleBusy as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     print("resumed")
     return 0
 
@@ -510,6 +521,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("requeue", help="put a blocked or failed task back in the queue")
     sp.add_argument("task_id")
+    sp.add_argument("--preview-discard", action="store_true", help="show exact fresh discard target")
+    sp.add_argument("--confirm-discard", help="token from --preview-discard")
     sp.add_argument("--fresh", action="store_true",
                     help="discard its branch and worktree and start from the base branch")
     sp.add_argument("--reason")
@@ -608,6 +621,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("rollback", help="revert an accepted task")
     sp.add_argument("task_id")
+    sp.add_argument("--confirm-commit", required=True, help="exact merge commit shown by nc why")
     sp.set_defaults(func=cmd_rollback)
 
     sp = sub.add_parser("stop", help="stop the loop after the current turn")

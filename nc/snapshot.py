@@ -7,6 +7,7 @@ transactional part of this format.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -14,7 +15,6 @@ import shutil
 import sqlite3
 import tempfile
 import time
-import fcntl
 from pathlib import Path
 
 from . import __version__

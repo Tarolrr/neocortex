@@ -41,7 +41,12 @@ def _sha256(path: Path) -> str:
 def _schema_metadata(database: Path) -> tuple[int, str]:
     """Return metadata without initializing or changing an existing database."""
     try:
-        db = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=BACKUP_TIMEOUT_S)
+        # Snapshot databases are immutable while being checked.  Besides being
+        # the right access mode, this prevents SQLite from creating -wal/-shm
+        # sidecars inside the staged snapshot directory.
+        db = sqlite3.connect(
+            f"file:{database}?mode=ro&immutable=1", uri=True, timeout=BACKUP_TIMEOUT_S
+        )
         try:
             check = db.execute("PRAGMA integrity_check").fetchone()
             if not check or check[0] != "ok":
@@ -167,6 +172,15 @@ def _validate(snapshot: Path, *, require_compatible: bool) -> dict[str, object]:
         raise SnapshotError("snapshot application version is incompatible")
     if not isinstance(manifest["files"], dict) or set(manifest["files"]) not in ({DATABASE}, {DATABASE, CONFIG}):
         raise SnapshotError("unsafe snapshot file list")
+    # A snapshot is a closed format.  In particular, do not let a file that is
+    # absent from the signed file list hitch a ride into a restored home.
+    expected_names = {MANIFEST, *manifest["files"]}
+    try:
+        actual_names = {entry.name for entry in snapshot.iterdir()}
+    except OSError as exc:
+        raise SnapshotError("cannot inspect snapshot") from exc
+    if actual_names != expected_names:
+        raise SnapshotError("snapshot contains unsupported payload files")
     if not isinstance(manifest["sqlite_user_version"], int) or not isinstance(manifest["schema_sha256"], str):
         raise SnapshotError("invalid snapshot metadata")
     for name, checksum in manifest["files"].items():
@@ -187,17 +201,24 @@ def _validate(snapshot: Path, *, require_compatible: bool) -> dict[str, object]:
 def restore(snapshot: Path, home: Path) -> Path:
     """Validate *snapshot*, then publish it into a stopped, fresh *home*."""
     snapshot, home = Path(snapshot), Path(home)
-    _validate(snapshot, require_compatible=True)
+    manifest = _validate(snapshot, require_compatible=True)
     if home.exists() and (not home.is_dir() or any(home.iterdir())):
         raise SnapshotError(f"restore home is not empty: {home}")
     temp = _temporary_sibling(home)
     try:
         os.chmod(temp, 0o700)
-        for name in (DATABASE, CONFIG):
-            source = snapshot / name
-            if source.exists():
-                shutil.copyfile(source, temp / name)
-                os.chmod(temp / name, 0o600)
+        # Copy only payload explicitly named by the validated manifest.  The
+        # snapshot may be modified after the first validation, so validate the
+        # exact staged bytes again immediately before publication.
+        files = manifest["files"]
+        assert isinstance(files, dict)  # established by _validate
+        for name in files:
+            shutil.copyfile(snapshot / name, temp / name)
+            os.chmod(temp / name, 0o600)
+        (temp / MANIFEST).write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+        os.chmod(temp / MANIFEST, 0o600)
+        _validate(temp, require_compatible=True)
+        (temp / MANIFEST).unlink()
         # This is deliberately created before the directory becomes usable.
         (temp / "STOP").write_text(
             "restored snapshot; verify repositories and interrupted runs before nc resume\n"

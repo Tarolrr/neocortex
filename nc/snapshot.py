@@ -195,7 +195,20 @@ def _copy_blocks(path: Path, blocks_dir: Path) -> tuple[list[dict[str, object]],
             try:
                 with os.fdopen(fd, "wb") as output:
                     output.write(data); output.flush(); os.fsync(output.fileno())
-                os.chmod(name, 0o600); os.replace(name, target); new += len(data)
+                os.chmod(name, 0o600)
+                os.replace(name, target)
+                # The manifest must never point at an entry which was only in
+                # the filesystem cache.  Check the bytes we published too:
+                # hashing the staged input alone does not detect a failed or
+                # damaged write to the new store object.
+                if target.is_symlink() or not target.is_file() or _sha256(target) != block["sha256"]:
+                    raise SnapshotError("shared block verification failed")
+                directory_fd = os.open(blocks_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                new += len(data)
             except Exception:
                 Path(name).unlink(missing_ok=True)
                 raise

@@ -8,10 +8,18 @@ the agent that wrote the code must not make them.
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+
+# Keep this in lockstep with deploy/neocortex.service and bootstrap.sh.  Do
+# not consult the invoking login shell: the scheduler is started by systemd.
+SERVICE_PATH = "/opt/neocortex-runner/.venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 @dataclass
@@ -89,19 +97,106 @@ def parse_acceptance(acceptance: list[str]) -> tuple[list[str], list[str]]:
     return commands, prose
 
 
-def run_checks(cwd: Path, commands: list[str], timeout_s: int = 900) -> list[CheckResult]:
+def run_checks(cwd: Path, commands: list[str], timeout_s: int = 900,
+               env: dict[str, str] | None = None) -> list[CheckResult]:
     results = []
     for command in commands:
         try:
             proc = subprocess.run(
                 command, cwd=cwd, shell=True, capture_output=True, text=True,
-                timeout=timeout_s, check=False,
+                timeout=timeout_s, check=False, env=env,
             )
             results.append(CheckResult(command, proc.returncode == 0,
                                        (proc.stdout + proc.stderr)))
         except subprocess.TimeoutExpired:
             results.append(CheckResult(command, False, f"timed out after {timeout_s}s"))
     return results
+
+
+def host_requirements(adapter_clis: set[str]) -> tuple[list[str], list[str], str | None]:
+    """Resolve runner prerequisites using systemd's PATH, never login PATH."""
+    reports, errors = [f"service PATH: {SERVICE_PATH}"], []
+    resolved: dict[str, str] = {}
+    for name in ("python", "git", "sqlite3", "pytest", "ruff", *sorted(adapter_clis)):
+        path = shutil.which(name, path=SERVICE_PATH)
+        if path is None:
+            errors.append(f"missing {name} on service PATH")
+        else:
+            resolved[name] = path
+            reports.append(f"{name}: {path}")
+    python = resolved.get("python")
+    if python:
+        try:
+            version = subprocess.run([python, "--version"], capture_output=True, text=True,
+                                     timeout=10, check=False,
+                                     env=dict(os.environ, PATH=SERVICE_PATH))
+            text = (version.stdout + version.stderr).strip()
+            reports.append(f"python version: {text}")
+            if version.returncode or not text.startswith("Python 3.13."):
+                errors.append(f"python must be Python 3.13 (found {text or 'unusable'})")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"python cannot be executed: {exc}")
+    return reports, errors, resolved.get("python")
+
+
+def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
+                    python: str | None = None) -> list[CheckResult]:
+    """Run a project's configured test command from a detached disposable base tree."""
+    git_path = shutil.which("git", path=SERVICE_PATH)
+    if git_path is None:
+        return [CheckResult(test_cmd, False, "git is missing from service PATH")]
+    env = dict(os.environ, PATH=SERVICE_PATH)
+    scratch = Path(tempfile.mkdtemp(prefix="nc-readiness-"))
+    scratch.rmdir()
+    added = False
+    try:
+        # Resolve the base with the same git executable we just validated.
+        branches = subprocess.run([git_path, "branch", "--format=%(refname:short)"], cwd=repo,
+                                  capture_output=True, text=True, timeout=300, check=False,
+                                  env=env)
+        names = branches.stdout.splitlines()
+        if branches.returncode:
+            return [CheckResult(test_cmd, False, branches.stderr.strip())]
+        base = "main" if "main" in names else "master" if "master" in names else subprocess.run(
+            [git_path, "branch", "--show-current"], cwd=repo, capture_output=True, text=True,
+            timeout=300, check=False, env=env).stdout.strip()
+        if not base:
+            return [CheckResult(test_cmd, False, "cannot detect a base branch")]
+        proc = subprocess.run([git_path, "worktree", "add", "--detach", str(scratch), base],
+                              cwd=repo, capture_output=True, text=True, timeout=300,
+                              check=False, env=env)
+        if proc.returncode:
+            return [CheckResult(test_cmd, False, proc.stderr.strip())]
+        added = True
+        results = run_checks(scratch, [test_cmd], timeout_s, env)
+        # A source checkout of Neocortex must import itself, not an unrelated
+        # installed copy.  Other projects do not have this package contract.
+        if (scratch / "nc").is_dir() and python:
+            code = "import nc; from pathlib import Path; assert Path(nc.__file__).resolve().is_relative_to(Path.cwd().resolve())"
+            try:
+                probe = subprocess.run([python, "-c", code], cwd=scratch, capture_output=True,
+                                       text=True, timeout=timeout_s, check=False, env=env)
+                results.append(CheckResult("worktree-local import nc", probe.returncode == 0,
+                                           probe.stdout + probe.stderr))
+            except subprocess.TimeoutExpired:
+                results.append(CheckResult("worktree-local import nc", False,
+                                           f"timed out after {timeout_s}s"))
+        return results
+    except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+        return [CheckResult(test_cmd, False, str(exc))]
+    finally:
+        try:
+            if added or scratch.exists():
+                subprocess.run([git_path, "worktree", "remove", "--force", str(scratch)], cwd=repo,
+                               capture_output=True, text=True, timeout=300, check=False, env=env)
+            subprocess.run([git_path, "worktree", "prune"], cwd=repo, capture_output=True,
+                           text=True, timeout=300, check=False, env=env)
+        except (OSError, subprocess.TimeoutExpired):
+            # Best effort only: never let a diagnostic mask its test result.
+            pass
+        if scratch.exists():
+            # It was never registered, or removal failed after pruning.
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 def integrate(repo: Path, branch: str, task_id: str) -> str:

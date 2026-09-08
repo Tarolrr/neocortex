@@ -254,6 +254,14 @@ it specifies the guaranteed tools and interpreter, these exact checks, the
 arbiter's worktree-root execution, the service PATH, and the prohibition on
 worker package installation or writes outside the assigned worktree.
 
+Before `nc run` dispatches a worker it also performs one bounded readiness check
+per configured project: it resolves the runner prerequisites using the fixed
+systemd service PATH and runs that project's `test_cmd` from a detached,
+disposable worktree of its detected base branch. This costs one normal project
+test run per project per `nc run` invocation (not per agent turn). Run the same
+check explicitly with `nc doctor --project PROJECT`; it reports missing tools
+and bootstrap guidance without printing credentials.
+
 ## Proposal approval
 
 Proposals hold suggested tasks outside the queue until the owner decides:

@@ -479,3 +479,17 @@ def test_cli_import_preserves_partial_success_output(gc_project, tmp_path, capsy
         main(["--home", str(cfg.home), "task", "--file", str(specs)])
     tid = state.one("SELECT id FROM task WHERE title='first'")["id"]
     assert capsys.readouterr().out == tid + "\n"
+
+
+def test_run_readiness_failure_is_deduplicated_and_leaves_task_queued(gc_project, monkeypatch):
+    cfg, state, _ = gc_project
+    task = state.add_task("demo", "queued", "objective", [])
+    scheduler = __import__("nc.scheduler", fromlist=["Scheduler"]).Scheduler(cfg, state)
+    monkeypatch.setattr(scheduler, "preflight", lambda: (True, "model ok"))
+    monkeypatch.setattr(scheduler, "readiness", lambda: (False, "missing pytest"))
+
+    assert scheduler.run() is False
+    assert scheduler.run() is False
+    row = state.one("SELECT status, attempts FROM task WHERE id=?", (task,))
+    assert tuple(row) == ("queued", 0)
+    assert state.one("SELECT COUNT(*) FROM incident WHERE kind='host_environment'")[0] == 1

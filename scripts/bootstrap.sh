@@ -61,16 +61,13 @@ ensure_npm_package() {
     command -v "$executable" >/dev/null 2>&1 || fail "$executable was not installed onto PATH"
 }
 
-install_runner() {
-    if [ -e "$RUNNER" ]; then
-        git -C "$RUNNER" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "$RUNNER exists but is not a git checkout"
-    else
-        git clone "$SOURCE_REPO" "$RUNNER"
-    fi
-    # Run the import from the runner so the invoking checkout cannot mask a
-    # missing editable installation through its current working directory.
-    if [ ! -x "$RUNNER/.venv/bin/python" ] || [ ! -x "$RUNNER/.venv/bin/nc" ] ||
-       ! (cd "$RUNNER" && ./.venv/bin/python -c '
+runner_install_is_valid() {
+    # Do not run this probe from the checkout: Python puts the current working
+    # directory on sys.path, which would make a missing editable install look
+    # healthy.  An import from / with PYTHONPATH removed must resolve nc back
+    # into this checkout through the venv's editable-install metadata.
+    [ -x "$RUNNER/.venv/bin/python" ] && [ -x "$RUNNER/.venv/bin/nc" ] &&
+       (cd / && env -u PYTHONPATH "$RUNNER/.venv/bin/python" -c '
 import nc
 import pathlib
 import sys
@@ -78,13 +75,23 @@ import sys
 root = pathlib.Path(sys.argv[1]).resolve()
 origin = pathlib.Path(nc.__file__).resolve()
 raise SystemExit(sys.version_info[:2] != (3, 13) or not origin.is_relative_to(root))
-' "$RUNNER") ||
-       ! "$RUNNER/.venv/bin/python" -c 'import pytest, ruff'; then
+' "$RUNNER") &&
+       "$RUNNER/.venv/bin/python" -c 'import pytest, ruff'
+}
+
+install_runner() {
+    if [ -e "$RUNNER" ]; then
+        git -C "$RUNNER" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "$RUNNER exists but is not a git checkout"
+    else
+        git clone "$SOURCE_REPO" "$RUNNER"
+    fi
+    if ! runner_install_is_valid; then
         rm -rf "$RUNNER/.venv"
         python3.13 -m venv "$RUNNER/.venv"
         "$RUNNER/.venv/bin/pip" install -e "$RUNNER"
         "$RUNNER/.venv/bin/pip" install "pytest==8.3.5" "ruff==0.9.10"
     fi
+    runner_install_is_valid || fail "runner editable installation did not validate"
 }
 
 install_units() {

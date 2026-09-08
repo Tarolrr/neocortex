@@ -56,11 +56,18 @@ echo version
 def prepared_runner(tmp_path: Path, env: dict[str, str]) -> None:
     runner = Path(env["BOOTSTRAP_PREFIX"])
     subprocess.run(["git", "clone", str(ROOT), str(runner)], check=True, capture_output=True)
-    venv_bin = runner / ".venv/bin"
-    venv_bin.mkdir(parents=True)
-    (venv_bin / "python").symlink_to(shutil.which("python3.13") or shutil.which("python3"))
-    # The symlinked interpreter sees the test environment's pinned tools.
-    stub(venv_bin, "nc", "mkdir -p \"$NC_HOME\"; [ \"${1:-}\" != init ] || echo '{}' > \"$NC_HOME/config.json\"")
+    python = Path(shutil.which("python3.13") or shutil.which("python3")).resolve()
+    venv = runner / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "lib/python3.13/site-packages").mkdir(parents=True)
+    (venv / "bin/python").symlink_to(python)
+    (venv / "pyvenv.cfg").write_text(f"home = {python.parent}\ninclude-system-site-packages = true\n")
+    # Reproduce the editable import metadata produced by pip. The test host
+    # deliberately has no setuptools, so using pip itself would fetch it.
+    # The rerun test must not accept a checkout merely because cwd imports nc.
+    site_packages = venv / "lib/python3.13/site-packages"
+    (site_packages / "__editable__.neocortex-0.1.0.pth").write_text(f"{runner}\n")
+    stub(venv / "bin", "nc", 'exec "$(dirname "$0")/python" -m nc.cli "$@"')
 
 
 def test_bootstrap_rerun_preserves_config_and_does_not_reinstall(tmp_path):
@@ -135,16 +142,16 @@ def test_bootstrap_repairs_runner_missing_editable_install(tmp_path):
     (venv_bin / "python").symlink_to(shutil.which("python3.13") or shutil.which("python3"))
 
     # This Python 3.13 environment can import pytest and ruff, but deliberately
-    # lacks nc.  The venv stub makes the repair observable without network use.
+    # lacks nc. The venv stub makes the repair observable without network use.
     bin_dir = Path(env["PATH"].split(":", 1)[0])
     stub(bin_dir, "python3.13", f'''
 echo "python3.13 $*" >> "{log}"
 if [ "${{1:-}}" = -m ] && [ "${{2:-}}" = venv ]; then
     venv="$3"
-    mkdir -p "$venv/bin"
-    printf '%s\\n' '#!/bin/sh' 'echo "pip $*" >> "{log}"' 'bin=$(dirname "$0")' \
-        'printf "%s\\n" "#!/bin/sh" "mkdir -p \\\"$NC_HOME\\\"" "[ \\\"\\${{1:-}}\\\" != init ] || echo "{{}}" > \\\"$NC_HOME/config.json\\\"" > "$bin/nc"' \
-        'chmod +x "$bin/nc"' > "$venv/bin/pip"
+    mkdir -p "$venv/bin" "$venv/lib/python3.13/site-packages"
+    ln -s /usr/bin/python3.13 "$venv/bin/python"
+    printf '%s\\n' 'home = /usr/bin' 'include-system-site-packages = true' > "$venv/pyvenv.cfg"
+    printf '%s\\n' '#!/bin/sh' 'echo "pip $*" >> "{log}"' 'if [ "$1" = install ] && [ "$2" = -e ]; then echo "$3" > "$(dirname "$0")/../lib/python3.13/site-packages/__editable__.neocortex-0.1.0.pth"; printf "%s\\n" "#!/bin/sh" "exec \\\"$(dirname \"$0\")/python\\\" -m nc.cli \\\"\\$@\\\"" > "$(dirname "$0")/nc"; chmod +x "$(dirname "$0")/nc"; fi' > "$venv/bin/pip"
     chmod +x "$venv/bin/pip"
 fi
 ''')
@@ -163,10 +170,18 @@ def test_bare_pytest_prefers_each_checkout_over_runner_editable_install(tmp_path
     runner = tmp_path / "runner"
     subprocess.run(["git", "clone", str(ROOT), str(runner)], check=True, capture_output=True)
     venv = tmp_path / "venv"
-    subprocess.run([shutil.which("python3.13") or shutil.which("python3"), "-m", "venv",
-                    "--system-site-packages", str(venv)], check=True)
+    system_python = Path(shutil.which("python3.13") or shutil.which("python3")).resolve()
+    (venv / "bin").mkdir(parents=True)
+    (venv / "lib/python3.13/site-packages").mkdir(parents=True)
+    (venv / "bin/python").symlink_to(system_python)
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {system_python.parent}\ninclude-system-site-packages = true\n"
+    )
     python = venv / "bin/python"
-    subprocess.run([python, "-m", "pip", "install", "-e", runner], check=True, capture_output=True)
+    # Model the path metadata produced by the runner's editable pip install.
+    # Avoid invoking a build backend here: bootstrap's installer is covered by
+    # the isolated-command test above.
+    (venv / "lib/python3.13/site-packages/__editable__.neocortex-0.1.0.pth").write_text(f"{runner}\n")
     pytest = venv / "bin/pytest"
     pytest.write_text("#!" + str(python) + "\nfrom pytest import console_main\nraise SystemExit(console_main())\n")
     pytest.chmod(0o755)

@@ -11,7 +11,7 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
-from . import arbiter, operations, protocol
+from . import arbiter, backup_worker, operations, protocol
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_identity, repository_lock
 from .scheduler import Scheduler
@@ -19,7 +19,6 @@ from .snapshot import SnapshotError
 from .snapshot import backup as create_backup
 from .snapshot import restore as restore_backup
 from .state import State
-from . import backup_worker
 
 
 def _open(args) -> tuple[Config, State]:

@@ -163,6 +163,36 @@ def test_backup_rejects_overwrite_and_interrupted_publication(tmp_path, monkeypa
     assert not list(tmp_path.glob(".snapshot.tmp-*"))
 
 
+def test_backup_timeout_does_not_publish_snapshot_or_staging(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    State(home / "state.db").db.close()
+    destination = tmp_path / "snapshot"
+    real_connect = snapshot_module.sqlite3.connect
+
+    class BusySource:
+        def backup(self, _target, *, pages, progress, sleep):
+            # Simulate a SQLite backup which remains busy until its deadline.
+            assert pages == 64
+            assert sleep == 0.05
+            progress(sqlite3.SQLITE_BUSY, 1, 1)
+
+        def close(self):
+            pass
+
+    def connect_busy_source(database, *args, **kwargs):
+        if str(database).endswith("state.db?mode=ro"):
+            return BusySource()
+        return real_connect(database, *args, **kwargs)
+
+    timestamps = iter((0.0, snapshot_module.BACKUP_TIMEOUT_S + 0.01))
+    monkeypatch.setattr(snapshot_module.sqlite3, "connect", connect_busy_source)
+    monkeypatch.setattr(snapshot_module.time, "monotonic", lambda: next(timestamps))
+    with pytest.raises(SnapshotError, match="SQLite backup timed out"):
+        backup(home, destination)
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".snapshot.tmp-*"))
+
+
 def test_restore_rejects_corrupt_and_incompatible_metadata(tmp_path):
     home = tmp_path / "home"
     State(home / "state.db").db.close()

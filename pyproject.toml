@@ -2,7 +2,7 @@
 name = "neocortex"
 version = "0.1.0"
 description = "Multi-agent runner: cooperative scheduler, typed turn outcomes, deterministic arbiter"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = []
 
 [project.scripts]
@@ -20,7 +20,7 @@ nc = ["static/*.css"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py313"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

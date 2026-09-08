@@ -11,6 +11,10 @@ OS_RELEASE=${OS_RELEASE:-/etc/os-release}
 SOURCE_REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CODEX_VERSION=${CODEX_VERSION:-0.86.0}
 CLAUDE_VERSION=${CLAUDE_VERSION:-2.1.76}
+# Keep this in lockstep with deploy/neocortex.service.  SERVICE_PATH is
+# overrideable only by the isolated command-stub tests; production uses this
+# exact service PATH when locating and invoking vendor CLIs.
+SERVICE_PATH=${SERVICE_PATH:-/opt/neocortex-runner/.venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
 ENABLE_TIMER=false
 
 usage() {
@@ -29,13 +33,31 @@ validate_host() {
     [ -r "$OS_RELEASE" ] || fail "cannot read $OS_RELEASE"
     # shellcheck disable=SC1090
     . "$OS_RELEASE"
-    case "${ID:-}" in debian|armbian) ;; *) fail "unsupported OS ID ${ID:-unknown}; supported: Debian 13 (trixie) and Armbian 25 Trixie" ;; esac
-    [ "${VERSION_CODENAME:-}" = trixie ] || fail "unsupported release ${VERSION_CODENAME:-unknown}; supported: Debian 13 (trixie) and Armbian 25 Trixie"
+    case "${ID:-}" in
+        debian)
+            [ "${VERSION_CODENAME:-}" = trixie ] || fail "unsupported Debian release ${VERSION_CODENAME:-unknown}; supported: Debian 13 (trixie)"
+            ;;
+        armbian)
+            # Armbian publishes its release family in VERSION_ID (for example
+            # 25.11.1), while VERSION_CODENAME names the Debian base.
+            case "${VERSION_ID:-}" in 25|25.*) ;; *) fail "unsupported Armbian release ${VERSION_ID:-unknown}; supported: Armbian 25 Trixie" ;; esac
+            [ "${VERSION_CODENAME:-}" = trixie ] || fail "unsupported Armbian base ${VERSION_CODENAME:-unknown}; supported: Armbian 25 Trixie"
+            ;;
+        *) fail "unsupported OS ID ${ID:-unknown}; supported: Debian 13 (trixie) and Armbian 25 Trixie" ;;
+    esac
     case "$(dpkg --print-architecture)" in amd64|arm64) ;; *) fail "unsupported architecture; supported: amd64 and arm64" ;; esac
     [ -f "$SOURCE_REPO/pyproject.toml" ] || fail "source checkout lacks pyproject.toml: $SOURCE_REPO"
     if [ "${BOOTSTRAP_SKIP_ROOT_CHECK:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
         fail "run as root (for /opt and systemd installation)"
     fi
+}
+
+service_command() {
+    PATH="$SERVICE_PATH" command -v "$1" >/dev/null 2>&1
+}
+
+service_run() {
+    PATH="$SERVICE_PATH" "$@"
 }
 
 missing_packages() {
@@ -54,11 +76,11 @@ ensure_packages() {
 
 ensure_npm_package() {
     package=$1 version=$2 executable=$3
-    if npm list -g --depth=0 "$package@$version" >/dev/null 2>&1 && command -v "$executable" >/dev/null 2>&1; then
+    if npm list -g --depth=0 "$package@$version" >/dev/null 2>&1 && service_command "$executable"; then
         return 0
     fi
     npm install -g "$package@$version"
-    command -v "$executable" >/dev/null 2>&1 || fail "$executable was not installed onto PATH"
+    service_command "$executable" || fail "$executable was not installed onto the service PATH: $SERVICE_PATH"
 }
 
 runner_install_is_valid() {
@@ -106,10 +128,10 @@ install_units() {
     if [ "$changed" = true ]; then "$SYSTEMCTL" daemon-reload; fi
     if [ "$ENABLE_TIMER" = true ]; then
         [ ! -e "$NC_HOME/STOP" ] || fail "STOP exists; run nc resume before enabling the timer"
-        command -v codex >/dev/null 2>&1 || fail "codex is unavailable; run codex login first"
-        command -v claude >/dev/null 2>&1 || fail "claude is unavailable; run claude login first"
-        codex login status >/dev/null 2>&1 || fail "codex is not logged in; run codex login first"
-        claude auth status >/dev/null 2>&1 || fail "claude is not logged in; run claude login first"
+        service_command codex || fail "codex is unavailable on the service PATH; run codex login first"
+        service_command claude || fail "claude is unavailable on the service PATH; run claude login first"
+        service_run codex login status >/dev/null 2>&1 || fail "codex is not logged in; run codex login first"
+        service_run claude auth status >/dev/null 2>&1 || fail "claude is not logged in; run claude login first"
         "$SYSTEMCTL" enable --now neocortex.timer
     fi
 }

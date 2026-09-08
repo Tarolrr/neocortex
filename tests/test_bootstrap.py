@@ -44,6 +44,10 @@ echo version
     os_release.write_text("ID=debian\nVERSION_CODENAME=trixie\n")
     env = os.environ | {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        # The production default is the fixed PATH in neocortex.service.  The
+        # isolated test substitutes its temporary service bin, ensuring that
+        # bootstrap cannot accidentally validate the invoking shell PATH.
+        "SERVICE_PATH": str(bin_dir),
         "BOOTSTRAP_SKIP_ROOT_CHECK": "1",
         "BOOTSTRAP_PREFIX": str(tmp_path / "runner"),
         "NC_HOME": str(tmp_path / "home"),
@@ -98,6 +102,53 @@ def test_bootstrap_rejects_unsupported_host_before_commands(tmp_path):
     assert result.returncode == 1
     assert "unsupported OS ID ubuntu" in result.stderr
     assert not log.exists()
+
+
+def test_bootstrap_rejects_non_25_armbian_before_commands(tmp_path):
+    env, log = environment(tmp_path)
+    Path(env["OS_RELEASE"]).write_text(
+        "ID=armbian\nVERSION_ID=24.8.1\nVERSION_CODENAME=trixie\n"
+    )
+
+    result = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 1
+    assert "unsupported Armbian release 24.8.1" in result.stderr
+    assert not log.exists()
+
+
+def test_bootstrap_accepts_armbian_25_os_release_fields(tmp_path):
+    env, _ = environment(tmp_path)
+    prepared_runner(tmp_path, env)
+    Path(env["OS_RELEASE"]).write_text(
+        "ID=armbian\nVERSION_ID=25.11.1\nVERSION_CODENAME=trixie\n"
+    )
+
+    result = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_enable_timer_requires_clis_on_service_path(tmp_path):
+    env, log = environment(tmp_path)
+    prepared_runner(tmp_path, env)
+    home = Path(env["NC_HOME"])
+    home.mkdir()
+    (home / "config.json").write_text("{}")
+    # The invoking shell still has the stubs on PATH, but they are deliberately
+    # absent from the simulated service PATH.
+    env["SERVICE_PATH"] = str(tmp_path / "empty-service-bin")
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    # Simulate npm successfully retaining its globally installed packages in a
+    # non-service prefix; bootstrap must reject that layout before activation.
+    stub(bin_dir, "npm", "exit 0")
+
+    result = subprocess.run([str(SCRIPT), "--enable-timer"], env=env,
+                            text=True, capture_output=True, check=False)
+
+    assert result.returncode == 1
+    assert "codex was not installed onto the service PATH" in result.stderr
+    assert "systemctl enable" not in (log.read_text() if log.exists() else "")
 
 
 def test_enable_timer_respects_stop(tmp_path):

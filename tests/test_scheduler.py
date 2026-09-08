@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import re
 import subprocess
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 from nc import cli, protocol
 from nc.adapters import SessionResult
 from nc.config import Config
-from nc.lifecycle import LifecycleBusy, lifecycle_lock
+from nc.lifecycle import LifecycleBusy, lifecycle_lock, repository_lock
 from nc.scheduler import Scheduler
 from nc.state import State
 
@@ -63,6 +64,32 @@ def commit_and_emit(filename: str, content: str, payload: dict):
 
 def nothing(cwd: Path, outcome_path: Path) -> None:
     """A turn that ends without writing an outcome file."""
+
+
+def _hold_scheduler_ownership(db_path: str, entered, release, ended_run: bool) -> None:
+    """Child-process barrier used to prove flock ownership is not process-local."""
+    state = State(Path(db_path), initialize=False)
+    try:
+        if ended_run:
+            task = state.one("SELECT * FROM task LIMIT 1")
+            agent = state.add_agent("barrier-worker", "worker", task["project_id"],
+                                    task["id"], "model")
+            run = state.start_run(agent, task["id"], "worker", "model", "barrier")
+            state.end_run(run, protocol.DONE)
+        # This is deliberately the scheduler ownership window: preparation and
+        # post-turn checks occur inside it, even when no run is open.
+        with lifecycle_lock(state):
+            entered.set()
+            release.wait(10)
+    finally:
+        state.db.close()
+
+
+def _hold_repository_ownership(repo_path: str, entered, release) -> None:
+    """Pause a cooperating scheduler's integration repository section."""
+    with repository_lock(Path(repo_path)):
+        entered.set()
+        release.wait(10)
 
 
 @pytest.fixture
@@ -1175,3 +1202,86 @@ def test_direct_queue_activation_respects_lifecycle_ownership(setup):
         scheduler.spawn_for_queued_task()
 
     assert scheduler.spawn_for_queued_task()
+
+
+@pytest.mark.parametrize("after_end_run", [False, True])
+def test_process_scheduler_ownership_rejects_fresh_requeue_until_release(setup, after_end_run):
+    """A scheduler process owns a task both before a run and after ``end_run``.
+
+    The barriers make this race deterministic rather than depending on a slow
+    Git command.  The owner operation must leave both the branch/worktree and
+    task row alone while another process owns the scheduler window.
+    """
+    from nc import arbiter, operations
+
+    cfg, state, repo = setup
+    tid = state.add_task("neocortex", "barrier", "do not discard", [])
+    worktree, branch = arbiter.ensure_worktree(repo, cfg.work_dir, tid)
+    token = operations.discard_preview(cfg, state, tid)["token"]
+    entered, release = multiprocessing.Event(), multiprocessing.Event()
+    child = multiprocessing.Process(
+        target=_hold_scheduler_ownership,
+        args=(str(cfg.db_path), entered, release, after_end_run),
+    )
+    child.start()
+    try:
+        assert entered.wait(5)
+        # The post-end_run case deliberately records run history; snapshot only
+        # after the scheduler has reached its deterministic barrier.
+        before = list(state.db.iterdump())
+        with pytest.raises(LifecycleBusy, match="retry"):
+            operations.requeue_task(cfg, state, tid, fresh=True, expected_discard=token)
+        assert worktree.exists()
+        assert arbiter.git(repo, "rev-parse", "--verify", branch)
+        assert list(state.db.iterdump()) == before
+    finally:
+        release.set()
+        child.join(10)
+        if child.is_alive():
+            child.terminate()
+            child.join()
+    assert child.exitcode == 0
+    # Ownership ending is not enough by itself: re-read current state and then
+    # perform the explicitly confirmed destructive operation.
+    operations.requeue_task(cfg, state, tid, fresh=True, expected_discard=token)
+    assert not worktree.exists()
+    assert state.one("SELECT status FROM task WHERE id=?", (tid,))[0] == "queued"
+
+
+def test_process_repository_alias_blocks_rollback_until_integration_releases(setup, tmp_path):
+    """Aliases share one Git common-dir lock across scheduler/UI processes."""
+    from nc import arbiter, operations
+
+    _cfg, state, repo = setup
+    accepted = state.add_task("neocortex", "accepted", "already merged", [])
+    other = state.add_task("neocortex", "rollback", "undo me", [])
+    (repo / "accepted.txt").write_text("accepted\n")
+    arbiter.git(repo, "add", "accepted.txt")
+    arbiter.git(repo, "commit", "-m", "accepted")
+    commit = arbiter.git(repo, "rev-parse", "--short", "HEAD")
+    state.set_task(accepted, status="done", merge_commit=commit)
+    state.set_task(other, status="done", merge_commit=commit)
+    alias = tmp_path / "repo-alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    before = list(state.db.iterdump())
+    head = arbiter.git(repo, "rev-parse", "HEAD")
+    entered, release = multiprocessing.Event(), multiprocessing.Event()
+    child = multiprocessing.Process(target=_hold_repository_ownership,
+                                    args=(str(alias), entered, release))
+    child.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(LifecycleBusy, match="Repository is busy"):
+            operations.rollback_task(state, other, commit)
+        assert arbiter.git(repo, "rev-parse", "HEAD") == head
+        assert list(state.db.iterdump()) == before
+    finally:
+        release.set()
+        child.join(10)
+        if child.is_alive():
+            child.terminate()
+            child.join()
+    assert child.exitcode == 0
+    result = operations.rollback_task(state, other, commit)
+    assert result["reverted_commit"] == commit
+    assert state.one("SELECT status FROM task WHERE id=?", (other,))[0] == "blocked"

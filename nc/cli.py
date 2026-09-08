@@ -15,6 +15,9 @@ from . import arbiter, operations, protocol
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_identity, repository_lock
 from .scheduler import Scheduler
+from .snapshot import SnapshotError
+from .snapshot import backup as create_backup
+from .snapshot import restore as restore_backup
 from .state import State
 
 
@@ -34,6 +37,28 @@ def cmd_init(args) -> int:
     cfg.runs_dir.mkdir(parents=True, exist_ok=True)
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
     print(f"initialized {cfg.home}")
+    return 0
+
+
+def cmd_backup(args) -> int:
+    """Create a verified state-only snapshot without opening State."""
+    try:
+        cfg = Config.load(args.home)
+        destination = create_backup(cfg.home, args.destination)
+    except (SnapshotError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"backup created: {destination}")
+    return 0
+
+
+def cmd_restore(args) -> int:
+    try:
+        home = restore_backup(args.snapshot, args.home)
+    except (SnapshotError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"restored stopped home: {home}")
     return 0
 
 
@@ -507,6 +532,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_ui)
 
     sub.add_parser("init").set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("backup", help="create a verified SQLite state snapshot")
+    sp.add_argument("--destination", required=True, type=Path)
+    sp.set_defaults(func=cmd_backup)
+
+    sp = sub.add_parser("restore", help="restore a snapshot into a fresh stopped home")
+    sp.add_argument("snapshot", type=Path)
+    sp.add_argument("--home", required=True, type=Path,
+                    help="new empty state directory; restored with STOP present")
+    sp.set_defaults(func=cmd_restore)
 
     sp = sub.add_parser("project", help="register or update a project")
     sp.add_argument("id")

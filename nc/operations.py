@@ -103,6 +103,12 @@ def import_tasks(state: State, specs: list[dict] | dict,
             if type(value) is not int or (key == "budget_turns" and value < 1):
                 raise ValueError(f"{key} must be an integer" +
                                  (" greater than zero" if key == "budget_turns" else ""))
+        # Validate references before opening the import transaction.  _add_task
+        # repeats this under that transaction to close races with task deletion.
+        state._validate_task_fields(project, spec["title"], spec["objective"],
+                                    spec["acceptance"], spec.get("boundaries"),
+                                    spec.get("priority", 100), spec.get("budget_turns", 6),
+                                    spec.get("depends_on"))
     with state.db:
         state.db.execute("BEGIN IMMEDIATE")
         return [state._add_task_spec(spec) for spec in items]

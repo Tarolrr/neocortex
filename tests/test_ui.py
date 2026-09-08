@@ -176,6 +176,41 @@ def test_import_valid_batch(browser):
         "first", "second"]
 
 
+@pytest.mark.parametrize("dependency, error", [
+    ("missing", "unknown dependency"),
+    ("two-T001", "another project"),
+])
+def test_browser_creation_and_import_reject_invalid_dependencies(browser, dependency, error):
+    import json
+
+    _, state, _, server, request = browser
+    foreign = state.add_task("two", "foreign", "objective", [])
+    dependency = foreign if dependency == "two-T001" else dependency
+    before = list(state.db.iterdump())
+
+    _, headers, body = request("/p/one/tasks/new")
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    status, _, body = request("/p/one/tasks/new", "POST", {
+        "csrf_token": token, "title": "bad", "objective": "objective",
+        "acceptance": "", "boundaries": "", "after": dependency,
+        "priority": "100", "budget_turns": "6",
+    }, {"Cookie": headers["Set-Cookie"].split(";")[0],
+        "Origin": f"http://127.0.0.1:{server.server_port}"})
+    assert status == 400 and error in body
+    assert list(state.db.iterdump()) == before
+
+    _, headers, body = request("/p/one/tasks/import")
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    spec = {"project": "one", "title": "bad import", "objective": "objective",
+            "acceptance": [], "depends_on": [dependency]}
+    status, _, body = request("/p/one/tasks/import", "POST", {
+        "csrf_token": token, "spec": json.dumps(spec),
+    }, {"Cookie": headers["Set-Cookie"].split(";")[0],
+        "Origin": f"http://127.0.0.1:{server.server_port}"})
+    assert status == 400 and error in body
+    assert list(state.db.iterdump()) == before
+
+
 def test_lifecycle_busy_rejects_mutations_without_writes(browser):
     from nc import operations
     from nc.lifecycle import LifecycleBusy, lifecycle_lock

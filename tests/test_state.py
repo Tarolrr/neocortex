@@ -57,6 +57,18 @@ def test_add_task_rejects_invalid_fields_before_allocating_an_id(tmp_path, kwarg
     assert state.one("SELECT id FROM task") is None
 
 
+def test_task_dependencies_must_exist_in_the_same_project(tmp_path):
+    state = make_state(tmp_path)
+    state.add_project("other", "Other", str(tmp_path / "other"), None)
+    foreign = state.add_task("other", "foreign", "obj", [])
+
+    with pytest.raises(ValueError, match="unknown dependency: missing"):
+        state.add_task("neocortex", "unknown", "obj", [], depends_on=["missing"])
+    with pytest.raises(ValueError, match="another project"):
+        state.add_task("neocortex", "foreign", "obj", [], depends_on=[foreign])
+    assert state.one("SELECT id FROM task WHERE project_id='neocortex'") is None
+
+
 def test_inbox_delivers_once(tmp_path):
     state = make_state(tmp_path)
     tid = state.add_task("neocortex", "t", "obj", ["x"])

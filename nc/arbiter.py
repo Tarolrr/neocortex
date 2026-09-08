@@ -11,6 +11,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -100,14 +101,25 @@ def run_checks(cwd: Path, commands: list[str], timeout_s: int = 900,
                env: dict[str, str] | None = None) -> list[CheckResult]:
     results = []
     for command in commands:
+        proc: subprocess.Popen[str] | None = None
         try:
-            proc = subprocess.run(
-                command, cwd=cwd, shell=True, capture_output=True, text=True,
-                timeout=timeout_s, check=False, env=env,
+            # A shell command may create children.  Give it a process group so
+            # a timeout is truly bounded and does not strand a child in the
+            # disposable readiness worktree.
+            proc = subprocess.Popen(
+                command, cwd=cwd, shell=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
             )
+            stdout, stderr = proc.communicate(timeout=timeout_s)
             results.append(CheckResult(command, proc.returncode == 0,
-                                       (proc.stdout + proc.stderr)))
+                                       stdout + stderr))
         except subprocess.TimeoutExpired:
+            assert proc is not None
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
             results.append(CheckResult(command, False, f"timed out after {timeout_s}s"))
     return results
 

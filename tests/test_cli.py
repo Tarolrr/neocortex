@@ -4,8 +4,7 @@ import sqlite3
 
 import pytest
 
-from nc import arbiter
-import nc.cli as cli
+from nc import arbiter, cli
 from nc.cli import main
 from nc.config import Config
 from nc.lifecycle import lifecycle_lock

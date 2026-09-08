@@ -74,6 +74,10 @@ Your outcome must be DONE with a verdict:
 unmet — findings must be concrete and actionable. `reject` means the approach is
 wrong. `pass` means every criterion is demonstrably met by the diff.
 
+The `verdict` key is mandatory for a Critic's DONE: the generic DONE form below,
+without `verdict`, is not a review and is discarded. Do not put the verdict only
+into `summary`.
+
 {contract}
 """
 

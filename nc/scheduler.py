@@ -22,6 +22,8 @@ from .state import State
 
 log = logging.getLogger("nc.scheduler")
 
+VERDICTS = {"pass", "rework", "reject"}
+
 
 class Scheduler:
     def __init__(self, cfg: Config, state: State):
@@ -313,7 +315,18 @@ class Scheduler:
         self.state.set_task(task["id"], status="in_review")
 
     def _apply_verdict(self, agent, task, project, cwd, branch, outcome) -> None:
-        verdict = outcome.verdict or "rework"
+        verdict = outcome.verdict
+        if verdict not in VERDICTS:
+            # A review without a verdict is a protocol violation by the critic, not
+            # a finding against the worker: retry the review instead of reworking.
+            self.state.incident(
+                "protocol",
+                f"{task['id']}: {agent['id']} ended DONE without a verdict "
+                f"(got {verdict!r}): {outcome.summary[:200]}",
+            )
+            self.consecutive_failures += 1
+            self._on_fail(agent, task, project, cwd, branch, outcome)
+            return
         worker_id = f"worker-{task['id']}"
         self.state.send(protocol.REVIEW_VERDICT, agent["id"], worker_id,
                         {"verdict": verdict, "summary": outcome.summary,

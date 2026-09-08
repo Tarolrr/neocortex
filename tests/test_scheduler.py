@@ -185,6 +185,30 @@ def test_merge_conflict_after_a_pass_sends_the_worker_back_without_an_attempt(se
     assert (repo / "README.md").read_text() == "from main\nfrom worker\n"
 
 
+def test_critic_done_without_verdict_retries_the_review_instead_of_reworking(setup):
+    cfg, state, _repo = setup
+    tid = state.add_task("neocortex", "add marker", "create marker.txt", [])
+    scheduler = sched(cfg, state, [
+        commit_and_emit("marker.txt", "hello\n",
+                        {"outcome": "DONE", "summary": "created marker.txt"}),
+        emit({"outcome": "DONE", "summary": "Verdict: pass. Findings: none."}),
+        emit({"outcome": "DONE", "verdict": "pass", "summary": "criteria met"}),
+    ])
+
+    assert scheduler.step() == protocol.DONE            # worker
+    assert scheduler.step() == protocol.DONE            # critic forgot `verdict`
+    task = state.one("SELECT * FROM task WHERE id=?", (tid,))
+    assert (task["status"], task["attempts"]) == ("in_review", 1)
+    assert state.one("SELECT * FROM agent WHERE id=?", (f"worker-{tid}",))["state"] == "blocked"
+    assert state.one("SELECT * FROM agent WHERE id=?", (f"critic-{tid}-1",))["state"] == "runnable"
+    assert not state.q("SELECT * FROM message WHERE kind='review_verdict'")
+    assert "without a verdict" in state.one("SELECT * FROM incident WHERE kind='protocol'")["detail"]
+    assert "verdict" in scheduler.adapter.briefs[1]
+
+    assert scheduler.step() == protocol.DONE            # same critic, proper verdict
+    assert state.one("SELECT * FROM task WHERE id=?", (tid,))["status"] == "done"
+
+
 def test_unexpected_handler_error_blocks_the_task_instead_of_crashing(setup, monkeypatch):
     cfg, state, _repo = setup
     tid = state.add_task("neocortex", "add marker", "create marker.txt", [])

@@ -154,6 +154,32 @@ def cancel_task(state: State, task_id: str, reason: str) -> bool:
         return state.cancel_task(task_id, reason)
 
 
+def retry_blocked_tasks(state: State) -> list[str]:
+    """Atomically make currently blocked task workers runnable again.
+
+    ``nc resume --retry`` is a lifecycle operation, not merely an incident
+    acknowledgement: scheduler ownership must exclude it from selection through
+    outcome application.
+    """
+    with lifecycle_lock(state), state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        rows = state.q("SELECT id FROM task WHERE status='blocked'")
+        now = time.time()
+        ids = []
+        for row in rows:
+            changed = state.db.execute(
+                "UPDATE task SET status='in_progress', attempts=0, updated_at=?"
+                " WHERE id=? AND status='blocked'", (now, row["id"]),
+            ).rowcount
+            if changed:
+                state.db.execute(
+                    "UPDATE agent SET state='runnable', updated_at=? WHERE id=?",
+                    (now, f"worker-{row['id']}"),
+                )
+                ids.append(row["id"])
+        return ids
+
+
 
 def _discard_preview(cfg: Config, state: State, task) -> dict:
     """Fingerprint the task revision, branch and all discarded worktree content."""

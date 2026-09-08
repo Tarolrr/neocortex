@@ -1,3 +1,4 @@
+import multiprocessing
 import shutil
 
 import pytest
@@ -5,7 +6,18 @@ import pytest
 from nc import arbiter
 from nc.cli import main
 from nc.config import Config
+from nc.lifecycle import lifecycle_lock
 from nc.state import State
+
+
+def _hold_lifecycle_lock(db_path, entered, release):
+    state = State(db_path, initialize=False)
+    try:
+        with lifecycle_lock(state):
+            entered.set()
+            release.wait(10)
+    finally:
+        state.db.close()
 
 
 @pytest.fixture
@@ -234,29 +246,30 @@ def test_costs_totals(tmp_path, capsys, monkeypatch):
     assert "critic runs=2 tokens=50 unknown_runs=1 wall=35.0s" in output
 
 
-def test_resume_retry_does_not_revive_concurrently_cancelled_task(gc_project, monkeypatch, capsys):
+def test_resume_retry_is_serialized_with_lifecycle_ownership(gc_project, capsys):
     cfg, state, _repo = gc_project
     task = state.add_task("demo", "Superseded", "objective", [])
     state.set_task(task, status="blocked", attempts=3)
     agent = state.add_agent(f"worker-{task}", "worker", "demo", task, "m")
     state.set_agent(agent, state="blocked")
-    original_q = State.q
-    snapshots = {}
-
-    def cancel_after_selection(connection, sql, params=()):
-        rows = original_q(connection, sql, params)
-        if sql == "SELECT * FROM task WHERE status='blocked'":
-            assert connection is not state
-            state.cancel_task(task, "concurrent cancellation")
-            snapshots["task"] = dict(state.one("SELECT * FROM task WHERE id=?", (task,)))
-            snapshots["agent"] = dict(state.one("SELECT * FROM agent WHERE id=?", (agent,)))
-        return rows
-
-    monkeypatch.setattr(State, "q", cancel_after_selection)
+    entered, release = multiprocessing.Event(), multiprocessing.Event()
+    child = multiprocessing.Process(target=_hold_lifecycle_lock,
+                                    args=(str(cfg.db_path), entered, release))
+    child.start()
+    try:
+        assert entered.wait(5)
+        before_task = dict(state.one("SELECT * FROM task WHERE id=?", (task,)))
+        before_agent = dict(state.one("SELECT * FROM agent WHERE id=?", (agent,)))
+        assert main(["--home", str(cfg.home), "resume", "--retry"]) == 1
+        assert dict(state.one("SELECT * FROM task WHERE id=?", (task,))) == before_task
+        assert dict(state.one("SELECT * FROM agent WHERE id=?", (agent,))) == before_agent
+        assert "busy; retry" in capsys.readouterr().err
+    finally:
+        release.set()
+        child.join(10)
+    assert child.exitcode == 0
     assert main(["--home", str(cfg.home), "resume", "--retry"]) == 0
-    assert dict(state.one("SELECT * FROM task WHERE id=?", (task,))) == snapshots["task"]
-    assert dict(state.one("SELECT * FROM agent WHERE id=?", (agent,))) == snapshots["agent"]
-    assert "unblocked" not in capsys.readouterr().out
+    assert state.one("SELECT status FROM task WHERE id=?", (task,))[0] == "in_progress"
 
 
 def test_cancel_history_and_restoration(gc_project, capsys):

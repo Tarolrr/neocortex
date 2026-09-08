@@ -74,14 +74,40 @@ configured checks directory; unavailable or unsafe evidence displays as absent.
 
 Repeatable import/evidence smoke steps in a disposable project:
 
-1. Open the project's task list and choose Import JSON. Paste a spec with all
+1. Open the project's task list. Confirm the project filter is applied, then
+   toggle “include cancelled” and confirm a cancelled task appears with its
+   status and unmet dependencies. Open both tasks and verify the detail shows
+   multiline objective, acceptance, boundaries, result, runs, messages, and
+   “no stored check output” when evidence is missing.
+2. Choose New task and submit every field: project, title, multiline objective,
+   acceptance, boundaries, priority, turn budget, and dependencies. Try an
+   empty title, zero budget, unknown dependency, and cross-project dependency;
+   each must display a validation error without creating a task.
+3. Open a blocked task and use Requeue with a reason and changed budget; confirm
+   the queued result and displayed budget. Choose Fresh requeue: inspect the
+   discarded-work summary, submit its confirmation, and verify the worktree is
+   removed. Change the task in another tab before submitting the old token and
+   verify the stale-confirmation error. While a scheduler turn is paused, submit
+   Fresh requeue and verify its retryable busy error and that no worktree or
+   task state changes.
+4. Open an active task, choose Cancel, enter a reason, and submit; verify the
+   cancelled status and retained history. Use the cancelled-list toggle to find
+   it. Try cancellation/requeue while a run is active and verify the visible
+   rejection leaves it unchanged.
+5. Open an accepted task, choose Roll back, inspect the displayed merge commit,
+   and explicitly confirm it. Verify the success message and blocked result.
+   Submit a stale commit from a second tab and verify the confirmation error;
+   while another task's integration is paused, submit rollback and verify the
+   retryable busy error and unchanged repository/task state. Retry after release
+   and verify coherent history and the success message.
+6. Choose Import JSON. Paste a spec with all
    fields (`project`, `title`, `objective`, `acceptance`, `boundaries`, `priority`,
    `budget_turns`, `depends_on`); submit and inspect the resulting task detail.
-2. Upload the equivalent UTF-8 JSON object, then an array of two objects. Check
+7. Upload the equivalent UTF-8 JSON object, then an array of two objects. Check
    the imported count and multiline objective, acceptance, and boundaries.
-3. Submit malformed JSON, a zero budget, a different project, and both pasted
+8. Submit malformed JSON, a zero budget, a different project, and both pasted
    and uploaded JSON. Each must show a validation error and create no tasks.
-4. Open a task without check evidence: it must show “no stored check output”.
+9. Open a task without check evidence: it must show “no stored check output”.
    In the disposable home, create `checks/TASK_ID.txt` and reload to see it.
    Replace that file with a symlink to external text and reload: external text
    must not appear. Repeat with the checks directory itself as a symlink.

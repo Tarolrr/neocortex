@@ -409,21 +409,12 @@ def cmd_resume(args) -> int:
         stop.unlink()
     state.resolve_open_incidents("Closed by nc resume")
     if args.retry:
-        for row in state.q("SELECT * FROM task WHERE status='blocked'"):
-            # Selection may be stale: serialize the guarded transition and
-            # worker update with cancellation, which retires both together.
-            with state.db:
-                changed = state.db.execute(
-                    "UPDATE task SET status='in_progress', attempts=0, updated_at=?"
-                    " WHERE id=? AND status='blocked'", (time.time(), row["id"]),
-                ).rowcount
-                if not changed:
-                    continue
-                state.db.execute(
-                    "UPDATE agent SET state='runnable', updated_at=? WHERE id=?",
-                    (time.time(), f"worker-{row['id']}"),
-                )
-            print(f"unblocked {row['id']}")
+        try:
+            for task_id in operations.retry_blocked_tasks(state):
+                print(f"unblocked {task_id}")
+        except LifecycleBusy as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     print("resumed")
     return 0
 

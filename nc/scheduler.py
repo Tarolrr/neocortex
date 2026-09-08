@@ -28,6 +28,13 @@ class Scheduler:
         self.cfg = cfg
         self.state = state
         self.consecutive_failures = 0
+        # A deliberately narrow test seam for process barriers.  Hooks run
+        # while the lifecycle/repository exclusions are actually owned.
+        self._lifecycle_hook = None
+
+    def _hook(self, phase: str) -> None:
+        if self._lifecycle_hook is not None:
+            self._lifecycle_hook(phase)
 
     def _adapter_for(self, role: str) -> Adapter:
         return get_adapter(self.cfg.adapter_for(role))
@@ -207,6 +214,9 @@ class Scheduler:
             self._block(task, agent, f"turn budget ({task['budget_turns']}) exhausted")
             return "budget_exhausted"
 
+        # This is inside lifecycle_lock and repository_lock.  It is before the
+        # run is registered, so a finished-run timestamp is never its boundary.
+        self._hook("before_worktree_preparation")
         cwd, branch = arbiter.ensure_worktree(repo, self.cfg.work_dir, task["id"])
 
         checks_text = ""
@@ -216,6 +226,9 @@ class Scheduler:
         adapter = self._adapter_for(agent["role"])
         outcome = turn.run_turn(self.state, self.cfg, adapter, agent, cwd, branch,
                                 checks_text)
+        # run_turn has recorded end_run, but acceptance and integration below
+        # remain part of the same ownership window.
+        self._hook("after_end_run")
         log.info("%s (%s) -> %s: %s", agent["id"], agent["role"], outcome.kind,
                  outcome.summary[:200])
 
@@ -310,6 +323,7 @@ class Scheduler:
         if verdict == "pass":
             repo = Path(project["repo_path"])
             try:
+                self._hook("before_integration")
                 commit = arbiter.integrate(repo, branch, task["id"])
             except arbiter.MergeConflict as exc:
                 base = arbiter.base_branch(repo)

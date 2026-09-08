@@ -52,9 +52,10 @@ def run_once(home: Path, destination: Path | None, *, retain: int = 96,
     """
     home = Path(home); now = time.time() if now is None else now
     try:
-        destination = validate_destination(home, destination)
+        # Open state first.  A bad mount is itself an attempted automated
+        # backup and must be visible durably when the database is available.
         db = _connect(home)
-    except (OSError, sqlite3.Error, BackupConfigurationError) as exc:
+    except (OSError, sqlite3.Error) as exc:
         # Journal is the only dependable diagnostics channel when state.db is
         # absent or unreadable.
         LOG.error("backup unavailable: %s", exc)
@@ -66,6 +67,19 @@ def run_once(home: Path, destination: Path | None, *, retain: int = 96,
             LOG.error("backup state unavailable: %s", exc); return False
         if row is None:
             LOG.error("backup state unavailable: migration has not completed"); return False
+        try:
+            destination = validate_destination(home, destination)
+        except (OSError, BackupConfigurationError) as exc:
+            # Do not clear a previous diagnostic until an actual snapshot has
+            # succeeded.  This write is deliberately outside foreground work.
+            try:
+                db.execute("UPDATE backup_state SET last_attempt_at=?, last_error=? WHERE id=1",
+                           (now, str(exc)))
+                db.commit()
+            except sqlite3.Error:
+                LOG.exception("could not record backup configuration failure")
+            LOG.error("backup unavailable: %s", exc)
+            return False
         generation = int(row["dirty_generation"])
         due = (row["last_success_at"] is None
                or now - float(row["last_success_at"]) >= FALLBACK_SECONDS)
@@ -98,15 +112,18 @@ def run_once(home: Path, destination: Path | None, *, retain: int = 96,
 def status(home: Path, destination: Path | None, *, now: float | None = None) -> tuple[
         dict[str, object], bool]:
     now = time.time() if now is None else now
-    result: dict[str, object] = {"destination": str(destination) if destination else "unknown"}
-    try:
-        validate_destination(Path(home), destination)
-    except (OSError, BackupConfigurationError) as exc:
-        result.update({"health": "unhealthy", "error": str(exc)})
-        return result, False
+    result: dict[str, object] = {
+        "destination": str(destination) if destination else "unknown",
+        "last_attempt": None, "last_error": None,
+        "last_verified_success": None, "age_seconds": None,
+        "covered_generation": None, "pending_generation": None, "pending": None,
+    }
     try:
         db = _connect(Path(home))
-        row = db.execute("SELECT * FROM backup_state WHERE id=1").fetchone(); db.close()
+        try:
+            row = db.execute("SELECT * FROM backup_state WHERE id=1").fetchone()
+        finally:
+            db.close()
         if row is None: raise sqlite3.Error("backup state unavailable")
     except (OSError, sqlite3.Error) as exc:
         result.update({"health": "unhealthy", "error": f"state unavailable: {exc}"})
@@ -114,11 +131,19 @@ def status(home: Path, destination: Path | None, *, now: float | None = None) ->
     success = row["last_success_at"]
     age = None if success is None else max(0.0, now - float(success))
     pending = int(row["dirty_generation"]) > int(row["acknowledged_generation"])
-    healthy = (success is not None and age is not None and age <= STALE_SECONDS
-               and not row["last_error"])
     result.update({"last_attempt": row["last_attempt_at"], "last_error": row["last_error"],
                    "last_verified_success": success, "age_seconds": age,
                    "covered_generation": int(row["acknowledged_generation"]),
-                   "pending_generation": int(row["dirty_generation"]), "pending": pending,
-                   "health": "healthy" if healthy else "unhealthy"})
+                   "pending_generation": int(row["dirty_generation"]), "pending": pending})
+    try:
+        validate_destination(Path(home), destination)
+    except (OSError, BackupConfigurationError) as exc:
+        result.update({"health": "unhealthy", "error": str(exc)})
+        return result, False
+    healthy = (success is not None and age is not None and age <= STALE_SECONDS
+               and not row["last_error"])
+    result["health"] = "healthy" if healthy else "unhealthy"
+    if not healthy and not row["last_error"]:
+        result["error"] = ("no verified successful backup" if success is None
+                           else "backup is stale")
     return result, healthy

@@ -32,6 +32,29 @@ queued task -> worker turn(s) -> arbiter runs acceptance checks -> critic review
 Everything lives in SQLite (`$NC_HOME/state.db`), so state survives between
 turns, restarts and days.
 
+## Backup and recovery
+
+Create a verified, portable snapshot of the database (and `config.json`, when
+present):
+
+```bash
+nc backup --destination /safe/place/neocortex-snapshot
+nc restore /safe/place/neocortex-snapshot --home /safe/place/neocortex-restored
+```
+
+`backup` uses SQLite's online backup API, so it includes committed WAL changes
+without copying a live `state.db` file. It publishes only a checksum-verified,
+integrity-checked snapshot with a versioned manifest. `restore` verifies that
+manifest before it creates a fresh home and always creates `STOP`; inspect and
+explicitly run `nc resume` only when recovery is complete.
+
+This is database consistency, not a cross-resource checkpoint. Git history,
+runtime logs and checks, worktrees, and uncommitted changes are outside the
+snapshot. Before resuming, stop scheduler, timer, and UI writers; recover Git
+separately; then check project repository paths, base tips, merge commits, and
+interrupted runs. Reconcile any differences explicitly—restore never migrates
+data, resumes agents, or reconciles Git automatically.
+
 ## Usage
 
 ```bash

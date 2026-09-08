@@ -16,7 +16,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-
 # Keep this in lockstep with deploy/neocortex.service and bootstrap.sh.  Do
 # not consult the invoking login shell: the scheduler is started by systemd.
 SERVICE_PATH = "/opt/neocortex-runner/.venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -146,7 +145,9 @@ def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
     if git_path is None:
         return [CheckResult(test_cmd, False, "git is missing from service PATH")]
     env = dict(os.environ, PATH=SERVICE_PATH)
-    scratch = Path(tempfile.mkdtemp(prefix="nc-readiness-"))
+    # Keep the disposable checkout on the project's filesystem rather than
+    # shared /tmp, which can be unavailable even when the runner is healthy.
+    scratch = Path(tempfile.mkdtemp(prefix="nc-readiness-", dir=repo.parent))
     scratch.rmdir()
     added = False
     try:

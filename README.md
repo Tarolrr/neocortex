@@ -106,10 +106,14 @@ the stored acceptance check output from `$NC_HOME/checks/neocortex-T007.txt`.
 Missing check output is reported explicitly; an unknown task exits with status 1.
 
 A project with a `mirror` remote gets its history pushed there right after the
-arbiter merges — the task branch as `nc/<task-id>` and the runner's base branch
-as `nc/main`, so the mirror can never fight the forge's own base branch. The
-diff is reviewable on the forge while the queue keeps running; a failed push is
-an incident, never a block.
+arbiter merges — the task branch as `nc/<task-id>` and the local base branch to
+the same-named remote base branch (for example, `main:refs/heads/main`). If the
+remote base has advanced, Git safely rejects the non-force push: the owner must
+reconcile it outside Neocortex. The accepted local work remains complete, the
+queue keeps running, and a nonblocking `mirror_push` incident records the
+failure. Rollback likewise publishes its history-preserving revert to the real
+remote base; a failed rollback publication is reported without undoing the
+completed local revert.
 To undo one task:
 
 ```bash

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from nc import cli, protocol, turn
+from nc import cli, operations, protocol, turn
 from nc.adapters import SessionResult
 from nc.config import Config
 from nc.lifecycle import LifecycleBusy, lifecycle_lock
@@ -229,8 +229,9 @@ def test_unexpected_handler_error_blocks_the_task_instead_of_crashing(setup, mon
 
 def test_accepted_work_is_mirrored_and_can_be_reverted(setup, tmp_path):
     cfg, state, repo = setup
+    subprocess.run(["git", "branch", "-m", "trunk"], cwd=repo, check=True)
     remote = tmp_path / "mirror.git"
-    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(remote)], check=True)
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "trunk", str(remote)], check=True)
     subprocess.run(["git", "remote", "add", "mirror", str(remote)], cwd=repo, check=True)
     state.add_project("neocortex", "Neocortex", str(repo), None, mirror="mirror")
 
@@ -244,15 +245,96 @@ def test_accepted_work_is_mirrored_and_can_be_reverted(setup, tmp_path):
 
     task = state.one("SELECT * FROM task WHERE id=?", (tid,))
     assert task["merge_commit"]
-    mirrored = subprocess.run(["git", "log", "--oneline", "nc/main"], cwd=remote,
+    mirrored = subprocess.run(["git", "log", "--oneline", "trunk"], cwd=remote,
                               capture_output=True, text=True, check=True).stdout
     assert f"{tid}: accepted by arbiter" in mirrored
+    assert subprocess.run(["git", "rev-parse", "--verify", f"refs/heads/nc/{tid}"],
+                          cwd=remote, capture_output=True).returncode == 0
+    # New mirrors publish the real base, never the retired nc/<base> alias.
+    assert subprocess.run(["git", "rev-parse", "--verify", "refs/heads/nc/trunk"],
+                          cwd=remote, capture_output=True).returncode != 0
     assert state.open_incidents() == []
 
     assert cli.main(["--home", str(cfg.home), "rollback", tid, "--confirm-commit",
                      state.one("SELECT merge_commit FROM task WHERE id=?", (tid,))[0]]) == 0
     assert not (repo / "marker.txt").exists()
     assert state.one("SELECT * FROM task WHERE id=?", (tid,))["status"] == "blocked"
+    reverted = subprocess.run(["git", "log", "--oneline", "trunk"], cwd=remote,
+                               capture_output=True, text=True, check=True).stdout
+    assert "Revert" in reverted
+
+
+def test_diverged_mirror_does_not_undo_acceptance_or_block_queue(setup, tmp_path):
+    cfg, state, repo = setup
+    remote = tmp_path / "mirror.git"
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(remote)], check=True)
+    subprocess.run(["git", "remote", "add", "mirror", str(remote)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "mirror", "main:main"], cwd=repo, check=True)
+    state.add_project("neocortex", "Neocortex", str(repo), None, mirror="mirror")
+    first = state.add_task("neocortex", "first", "create one.txt", [])
+    second = state.add_task("neocortex", "second", "create two.txt", [])
+    scheduler = sched(cfg, state, [
+        commit_and_emit("one.txt", "one\n", {"outcome": "DONE", "summary": "done"}),
+        emit({"outcome": "DONE", "verdict": "pass", "summary": "ok"}),
+        commit_and_emit("two.txt", "two\n", {"outcome": "DONE", "summary": "done"}),
+        emit({"outcome": "DONE", "verdict": "pass", "summary": "ok"}),
+    ])
+    scheduler.step()                                    # first worker
+
+    writer = tmp_path / "remote-writer"
+    subprocess.run(["git", "clone", "-q", str(remote), str(writer)], check=True)
+    subprocess.run(["git", "config", "user.email", "nc@test"], cwd=writer, check=True)
+    subprocess.run(["git", "config", "user.name", "nc"], cwd=writer, check=True)
+    (writer / "remote.txt").write_text("remote advance\n")
+    subprocess.run(["git", "add", "remote.txt"], cwd=writer, check=True)
+    subprocess.run(["git", "commit", "-qm", "remote advance"], cwd=writer, check=True)
+    subprocess.run(["git", "push", "origin", "main"], cwd=writer, check=True)
+    remote_tip = subprocess.run(["git", "rev-parse", "main"], cwd=remote,
+                                capture_output=True, text=True, check=True).stdout.strip()
+
+    scheduler.step()                                    # accepted locally; mirror rejected
+    task = state.one("SELECT * FROM task WHERE id=?", (first,))
+    assert task["status"] == "done" and task["merge_commit"]
+    assert not (cfg.work_dir / first).exists()
+    assert subprocess.run(["git", "rev-parse", "main"], cwd=remote,
+                          capture_output=True, text=True, check=True).stdout.strip() == remote_tip
+    incident = state.one("SELECT detail FROM incident WHERE kind='mirror_push'")
+    assert first in incident["detail"]
+    assert "remote=mirror base=refs/heads/main" in incident["detail"]
+    assert "local_tip=" in incident["detail"] and f"remote_tip={remote_tip}" in incident["detail"]
+    assert "reason=" in incident["detail"]
+
+    scheduler.step()
+    scheduler.step()
+    assert state.one("SELECT status FROM task WHERE id=?", (second,))["status"] == "done"
+
+
+def test_mirror_exceptions_do_not_undo_acceptance_or_completed_rollback(setup, monkeypatch):
+    cfg, state, repo = setup
+    state.db.execute("UPDATE project SET mirror='unreachable' WHERE id='neocortex'")
+    tid = state.add_task("neocortex", "add marker", "create marker.txt", [])
+    scheduler = sched(cfg, state, [
+        commit_and_emit("marker.txt", "hi\n", {"outcome": "DONE", "summary": "done"}),
+        emit({"outcome": "DONE", "verdict": "pass", "summary": "ok"}),
+    ])
+
+    def timed_out(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("git push", 300)
+
+    monkeypatch.setattr("nc.scheduler.arbiter.mirror", timed_out)
+    scheduler.step()
+    scheduler.step()
+    task = state.one("SELECT * FROM task WHERE id=?", (tid,))
+    assert task["status"] == "done" and task["merge_commit"]
+    assert state.one("SELECT detail FROM incident WHERE kind='mirror_push'")
+
+    monkeypatch.setattr("nc.operations.arbiter.mirror", lambda *_args: (_ for _ in ()).throw(OSError("offline")))
+    result = operations.rollback_task(state, tid, task["merge_commit"])
+    assert result["mirror_error"] == "offline"
+    assert state.one("SELECT status FROM task WHERE id=?", (tid,))["status"] == "blocked"
+    assert not (repo / "marker.txt").exists()
+    incidents = state.q("SELECT detail FROM incident WHERE kind='mirror_push'")
+    assert any("offline" in row["detail"] for row in incidents)
 
 
 def test_a_dependent_task_waits_until_its_dependency_is_accepted(setup):

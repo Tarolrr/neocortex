@@ -126,19 +126,49 @@ def integrate(repo: Path, branch: str, task_id: str) -> str:
     return git(repo, "rev-parse", "--short", "HEAD")
 
 
+def _mirror_tip(repo: Path, ref: str) -> str:
+    """Best-effort local object name for a mirror failure report."""
+    try:
+        return git(repo, "rev-parse", ref)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
+def _remote_mirror_tip(repo: Path, remote: str, ref: str) -> str:
+    """Best-effort remote object name for a mirror failure report."""
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", "--heads", remote, ref], cwd=repo,
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if proc.returncode:
+            return "unknown"
+        return proc.stdout.split()[0] if proc.stdout.split() else "(missing)"
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
 def mirror(repo: Path, remote: str | None, branch: str | None = None) -> str:
-    """Push accepted work to a review remote. Failure here never blocks the queue."""
+    """Push base and accepted task branch without letting failures block local work."""
     if not remote:
         return ""
     base = base_branch(repo)
-    # The mirror is a review surface, not the project's upstream: the runner's own
-    # history lands on nc/<base> so it can never fight the forge's real base branch.
-    refs = [f"{base}:refs/heads/nc/{base}"] + ([branch] if branch else [])
-    proc = subprocess.run(
-        ["git", "push", remote, *refs], cwd=repo, capture_output=True, text=True,
-        timeout=300, check=False,
-    )
-    return "" if proc.returncode == 0 else (proc.stderr or proc.stdout).strip()[-500:]
+    base_ref = f"refs/heads/{base}"
+    refs = [f"{base}:{base_ref}"] + ([f"{branch}:refs/heads/{branch}"] if branch else [])
+    local_tip = _mirror_tip(repo, base)
+    try:
+        proc = subprocess.run(
+            ["git", "push", remote, *refs], cwd=repo, capture_output=True, text=True,
+            timeout=300, check=False,
+        )
+        if proc.returncode == 0:
+            return ""
+        reason = (proc.stderr or proc.stdout).strip()[-500:]
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        reason = str(exc)
+    remote_tip = _remote_mirror_tip(repo, remote, base_ref)
+    return (f"remote={remote} base={base_ref} local_tip={local_tip} "
+            f"remote_tip={remote_tip} reason={reason}")
 
 
 def revert(repo: Path, commit: str) -> str:

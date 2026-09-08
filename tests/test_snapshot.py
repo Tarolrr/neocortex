@@ -1,6 +1,9 @@
+import errno
 import json
 import os
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -228,3 +231,162 @@ def test_restore_rejects_boolean_manifest_version_metadata(tmp_path, field, valu
 
     with pytest.raises(SnapshotError, match="manifest types"):
         restore(snapshot, tmp_path / "restored")
+
+
+def test_incremental_snapshots_reuse_blocks_and_restore_identical_rows(tmp_path):
+    home = tmp_path / "home"
+    state = State(home / "state.db")
+    state.db.execute(
+        "INSERT INTO incident(kind, detail, created_at) VALUES(?,?,?)",
+        ("large", "x" * (3 * 1024 * 1024), 1.0),
+    )
+    state.db.commit()
+    before = [tuple(row) for row in state.db.execute("SELECT * FROM incident ORDER BY id")]
+    store = tmp_path / "store"
+    first = backup(home, store, incremental=True)
+    state.db.execute(
+        "INSERT INTO incident(kind, detail, created_at) VALUES(?,?,?)", ("small", "changed", 2.0)
+    )
+    state.db.commit()
+    second = backup(home, store, incremental=True)
+    state.db.close()
+
+    first_manifest = json.loads((first / "manifest.json").read_text())
+    second_manifest = json.loads((second / "manifest.json").read_text())
+    assert first_manifest["new_bytes"] == first_manifest["logical_bytes"]
+    assert 0 < second_manifest["reused_bytes"] < second_manifest["logical_bytes"]
+    assert second_manifest["new_bytes"] + second_manifest["reused_bytes"] == second_manifest["logical_bytes"]
+
+    restored = tmp_path / "restored"
+    restore(second, restored)
+    db = sqlite3.connect(restored / "state.db")
+    assert [tuple(row) for row in db.execute("SELECT * FROM incident ORDER BY id")][:-1] == before
+    assert db.execute("SELECT detail FROM incident WHERE kind='small'").fetchone()[0] == "changed"
+    db.close()
+
+
+def test_unchanged_incremental_snapshot_writes_no_blocks(tmp_path):
+    home = tmp_path / "home"
+    state = State(home / "state.db")
+    state.db.close()
+    store = tmp_path / "store"
+    first = backup(home, store, incremental=True)
+    block_count = len(list((store / "blocks").iterdir()))
+    second = backup(home, store, incremental=True)
+
+    first_manifest = json.loads((first / "manifest.json").read_text())
+    second_manifest = json.loads((second / "manifest.json").read_text())
+    assert len(list((store / "blocks").iterdir())) == block_count
+    assert second_manifest["new_bytes"] == 0
+    assert second_manifest["reused_bytes"] == second_manifest["logical_bytes"]
+    assert first_manifest["logical_bytes"] == second_manifest["logical_bytes"]
+
+
+def test_incremental_restore_rejects_missing_or_corrupt_shared_block(tmp_path):
+    home = tmp_path / "home"
+    State(home / "state.db").db.close()
+    snapshot = backup(home, tmp_path / "store", incremental=True)
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    block = next(iter(manifest["files"]["state.db"]["blocks"]))["sha256"]
+    path = tmp_path / "store" / "blocks" / block
+    path.unlink()
+    with pytest.raises(SnapshotError, match="shared block"):
+        restore(snapshot, tmp_path / "missing")
+
+    snapshot = backup(home, tmp_path / "store", incremental=True)
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    path = tmp_path / "store" / "blocks" / manifest["files"]["state.db"]["blocks"][0]["sha256"]
+    path.write_bytes(b"corrupt")
+    with pytest.raises(SnapshotError, match="shared block"):
+        restore(snapshot, tmp_path / "corrupt")
+
+
+def test_incremental_failure_before_manifest_does_not_prune_snapshot(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    State(home / "state.db").db.close()
+    store = tmp_path / "store"
+    previous = backup(home, store, incremental=True, retain=1)
+
+    def interrupted(*_args, **_kwargs):
+        raise OSError("simulated full disk")
+
+    monkeypatch.setattr(snapshot_module, "_atomic_manifest", interrupted)
+    with pytest.raises(OSError, match="full disk"):
+        backup(home, store, incremental=True, retain=1)
+    assert (previous / "manifest.json").exists()
+    assert restore(previous, tmp_path / "restored")
+
+
+def test_incremental_full_disk_while_writing_block_keeps_previous_snapshot(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    state = State(home / "state.db")
+    (home / "config.json").write_text('{"version": 1}')
+    store = tmp_path / "store"
+    previous = backup(home, store, incremental=True, retain=1)
+    (home / "config.json").write_text('{"version": 2}')
+
+    real_fsync = snapshot_module.os.fsync
+
+    def full_disk(fd):
+        if "/blocks/.block-" in os.readlink(f"/proc/self/fd/{fd}"):
+            raise OSError(errno.ENOSPC, "simulated full disk")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(snapshot_module.os, "fsync", full_disk)
+    with pytest.raises(OSError, match="full disk"):
+        backup(home, store, incremental=True, retain=1)
+
+    assert (previous / "manifest.json").exists()
+    assert len(list((store / "snapshots" / snapshot_module._source_id(home)).iterdir())) == 1
+    assert restore(previous, tmp_path / "restored")
+    assert not list((store / "blocks").glob(".block-*"))
+    state.db.close()
+
+
+def test_incremental_pruning_keeps_blocks_referenced_by_other_source(tmp_path):
+    home_a = tmp_path / "home-a"
+    home_b = tmp_path / "home-b"
+    state_a = State(home_a / "state.db")
+    state_b = State(home_b / "state.db")
+    state_a.db.close()
+    state_b.db.close()
+    store = tmp_path / "store"
+
+    (home_a / "config.json").write_text('{"value": "unique"}')
+    first = backup(home_a, store, incremental=True, retain=1)
+    unique = json.loads((first / "manifest.json").read_text())["files"]["config.json"]["blocks"][0]["sha256"]
+    (home_a / "config.json").write_text('{"value": "shared"}')
+    second = backup(home_a, store, incremental=True, retain=1)
+    assert not (store / "blocks" / unique).exists()
+
+    (home_b / "config.json").write_text('{"value": "shared"}')
+    other = backup(home_b, store, incremental=True, retain=1)
+    shared = json.loads((second / "manifest.json").read_text())["files"]["config.json"]["blocks"][0]["sha256"]
+    assert shared == json.loads((other / "manifest.json").read_text())["files"]["config.json"]["blocks"][0]["sha256"]
+    (home_a / "config.json").write_text('{"value": "new"}')
+    backup(home_a, store, incremental=True, retain=1)
+
+    assert (store / "blocks" / shared).is_file()
+    assert len(list((store / "snapshots" / snapshot_module._source_id(home_a)).iterdir())) == 1
+    assert restore(other, tmp_path / "restored-other")
+
+
+def test_incremental_concurrent_backup_and_retention_are_serialized(tmp_path):
+    home = tmp_path / "home"
+    state = State(home / "state.db")
+    state.db.close()
+    store = tmp_path / "store"
+    barrier = threading.Barrier(2)
+
+    def take_backup():
+        barrier.wait()
+        return backup(home, store, incremental=True, retain=1)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _item: take_backup(), range(2)))
+
+    assert len(results) == 2
+    snapshots = store / "snapshots" / snapshot_module._source_id(home)
+    complete = [path for path in snapshots.iterdir() if (path / "manifest.json").is_file()]
+    assert len(complete) == 1
+    assert restore(complete[0], tmp_path / "restored")

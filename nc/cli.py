@@ -44,11 +44,16 @@ def cmd_backup(args) -> int:
     """Create a verified state-only snapshot without opening State."""
     try:
         cfg = Config.load(args.home)
-        destination = create_backup(cfg.home, args.destination)
+        destination = create_backup(cfg.home, args.destination, incremental=args.incremental,
+                                    retain=args.retain)
     except (SnapshotError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"backup created: {destination}")
+    if args.incremental:
+        manifest = json.loads((destination / "manifest.json").read_text())
+        print("logical bytes: {logical_bytes}; newly written bytes: {new_bytes}; "
+              "reused bytes: {reused_bytes}".format(**manifest))
     return 0
 
 
@@ -535,6 +540,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("backup", help="create a verified SQLite state snapshot")
     sp.add_argument("--destination", required=True, type=Path)
+    sp.add_argument("--incremental", action="store_true",
+                    help="store verified shared blocks under destination")
+    sp.add_argument("--retain", type=int, default=96,
+                    help="successful incremental snapshots to retain (default: 96)")
     sp.set_defaults(func=cmd_backup)
 
     sp = sub.add_parser("restore", help="restore a snapshot into a fresh stopped home")

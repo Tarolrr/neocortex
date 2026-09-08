@@ -7,10 +7,12 @@ import json
 import logging
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 from . import arbiter, operations, protocol
 from .config import Config
+from .lifecycle import LifecycleBusy, lifecycle_lock, repository_identity, repository_lock
 from .scheduler import Scheduler
 from .state import State
 
@@ -225,38 +227,53 @@ def cmd_gc(args) -> int:
     cfg, state = _open(args)
     work_root = cfg.work_dir.resolve()
     result = 0
-    repos = set()
-    # Keep task statuses stable while removing their worktrees.
-    with state.db:
-        state.db.execute("BEGIN IMMEDIATE")
-        tasks = state.q(
-            "SELECT task.id, project.repo_path FROM task"
-            " JOIN project ON project.id=task.project_id"
-            " WHERE task.status IN ('done', 'blocked') ORDER BY task.id"
-        )
-        for task in tasks:
-            path = work_root / task["id"]
-            if path.is_symlink() or path.resolve().parent != work_root:
-                print(f"refusing worktree outside work directory: {path}", file=sys.stderr)
-                result = 1
-                continue
-            repo = Path(task["repo_path"])
-            repos.add(repo)
-            if not path.exists():
-                continue
-            try:
-                arbiter.git(repo, "worktree", "remove", "--force", str(path))
-            except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
-                result = 1
-            else:
-                print(f"removed {path}")
-        for repo in sorted(repos):
-            try:
-                arbiter.git(repo, "worktree", "prune")
-            except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
-                result = 1
+    try:
+        # Lock ordering is lifecycle first, then canonical repositories sorted
+        # by identity.  This makes GC cooperate with turns, requeue and rollback.
+        with lifecycle_lock(state):
+            candidates = state.q(
+                "SELECT DISTINCT project.repo_path FROM task"
+                " JOIN project ON project.id=task.project_id"
+                " WHERE task.status IN ('done', 'blocked')"
+            )
+            repos = sorted((Path(row["repo_path"]) for row in candidates),
+                           key=lambda repo: str(repository_identity(repo)))
+            with ExitStack() as locks:
+                for repo in repos:
+                    locks.enter_context(repository_lock(repo))
+                # Reread after ownership is held: GC candidates are only hints.
+                tasks = state.q(
+                    "SELECT task.id, project.repo_path FROM task"
+                    " JOIN project ON project.id=task.project_id"
+                    " WHERE task.status IN ('done', 'blocked') ORDER BY task.id"
+                )
+                touched = set()
+                for task in tasks:
+                    path = work_root / task["id"]
+                    if path.is_symlink() or path.resolve().parent != work_root:
+                        print(f"refusing worktree outside work directory: {path}", file=sys.stderr)
+                        result = 1
+                        continue
+                    repo = Path(task["repo_path"])
+                    touched.add(repo)
+                    if not path.exists():
+                        continue
+                    try:
+                        arbiter.git(repo, "worktree", "remove", "--force", str(path))
+                    except RuntimeError as exc:
+                        print(str(exc), file=sys.stderr)
+                        result = 1
+                    else:
+                        print(f"removed {path}")
+                for repo in sorted(touched, key=lambda repo: str(repository_identity(repo))):
+                    try:
+                        arbiter.git(repo, "worktree", "prune")
+                    except RuntimeError as exc:
+                        print(str(exc), file=sys.stderr)
+                        result = 1
+    except LifecycleBusy as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return result
 
 

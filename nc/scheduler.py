@@ -77,7 +77,9 @@ class Scheduler:
         )
         work = self.state.one(query)
         if work is None:
-            self.spawn_for_queued_task()
+            # ``step`` already owns the lifecycle lock.  Keep the actual
+            # activation private so the public entry point can acquire it too.
+            self._spawn_for_queued_task()
             work = self.state.one(query)
         planner = None
         for candidate in self.state.q(
@@ -122,6 +124,12 @@ class Scheduler:
         return None
 
     def spawn_for_queued_task(self) -> str | None:
+        """Safely expose queued-task activation to non-``step`` callers."""
+        with lifecycle_lock(self.state):
+            return self._spawn_for_queued_task()
+
+    def _spawn_for_queued_task(self) -> str | None:
+        """Activate one ready task; caller owns ``lifecycle_lock``."""
         # Serialize queue selection and activation against owner cancellation.
         with self.state.db:
             self.state.db.execute("BEGIN IMMEDIATE")

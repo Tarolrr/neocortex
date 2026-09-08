@@ -12,6 +12,7 @@ import pytest
 from nc import cli, protocol
 from nc.adapters import SessionResult
 from nc.config import Config
+from nc.lifecycle import LifecycleBusy, lifecycle_lock
 from nc.scheduler import Scheduler
 from nc.state import State
 
@@ -1163,3 +1164,14 @@ def test_stale_selection_does_not_prepare_worktree(setup, monkeypatch, action):
     monkeypatch.setattr(arbiter, 'ensure_worktree', unexpected)
     assert scheduler.step() == 'idle'
     assert list(state.db.iterdump()) == before
+
+
+def test_direct_queue_activation_respects_lifecycle_ownership(setup):
+    cfg, state, _repo = setup
+    state.add_task("neocortex", "queued", "must wait", [])
+    scheduler = sched(cfg, state, [])
+
+    with lifecycle_lock(state), pytest.raises(LifecycleBusy, match="retry"):
+        scheduler.spawn_for_queued_task()
+
+    assert scheduler.spawn_for_queued_task()

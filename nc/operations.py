@@ -218,6 +218,16 @@ def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
         project = get_project(state, task["project_id"])
         repo = Path(project["repo_path"])
         with repository_lock(repo):
+            # The rows read before taking repository ownership are only a
+            # routing hint.  Revalidate all lifecycle inputs while both
+            # exclusions are owned, immediately before any Git/state write.
+            task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+            if task is None:
+                raise LookupError(f"unknown task: {task_id}")
+            if task["status"] == "done":
+                raise ValueError(f"{task_id} is already accepted; use rollback instead")
+            if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
+                raise ValueError("An active run must finish before changing task lifecycle")
             if fresh and (not expected_discard or
                           expected_discard != _discard_preview(cfg, state, task)["token"]):
                 raise ValueError("Confirm the current discarded work before fresh requeue; "
@@ -253,6 +263,16 @@ def rollback_task(state: State, task_id: str, expected_commit: str | None = None
         if task["status"] != "done":
             raise ValueError(f"{task_id} is not accepted; rollback requires a done task")
         with repository_lock(repo):
+            # As above, do not act on the pre-lock snapshot.  This also makes
+            # a confirmation stale if an earlier lifecycle operation changed
+            # the task while a caller was waiting to acquire repository scope.
+            task = state.one("SELECT * FROM task WHERE id=?", (task_id,))
+            if task is None or not task["merge_commit"]:
+                raise LookupError(f"{task_id} has no recorded merge commit")
+            if task["status"] != "done":
+                raise ValueError(f"{task_id} is not accepted; rollback requires a done task")
+            if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
+                raise ValueError("An active run must finish before changing task lifecycle")
             with state.db:
                 state.db.execute("BEGIN IMMEDIATE")
                 if not expected_commit or expected_commit != task["merge_commit"]:

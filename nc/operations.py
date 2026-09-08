@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import time
 from pathlib import Path
 
@@ -521,7 +522,13 @@ def rollback_task(state: State, task_id: str, expected_commit: str | None = None
                     "INSERT INTO incident(kind,detail,created_at) VALUES('rollback',?,?)",
                     (f"{task_id} reverted in {commit}", time.time()),
                 )
-            mirror_error = arbiter.mirror(repo, project["mirror"])
+            try:
+                mirror_error = arbiter.mirror(repo, project["mirror"])
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+                # The revert and its lifecycle transition are already durable.
+                mirror_error = str(exc)
+            if mirror_error:
+                state.incident("mirror_push", f"{task_id}: {mirror_error}")
             return {"task_id": task_id, "reverted_commit": task["merge_commit"], "commit": commit,
                     "mirror_error": mirror_error}
 

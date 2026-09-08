@@ -20,6 +20,7 @@ from pathlib import Path
 # Keep this in lockstep with deploy/neocortex.service and bootstrap.sh.  Do
 # not consult the invoking login shell: the scheduler is started by systemd.
 SERVICE_PATH = "/opt/neocortex-runner/.venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+CLEANUP_TIMEOUT_S = 30
 
 
 @dataclass
@@ -198,18 +199,45 @@ def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
     except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
         return [CheckResult(test_cmd, False, str(exc))]
     finally:
+        # `git worktree remove` can itself get wedged (for example, on a
+        # filesystem hiccup).  In that case remove the checkout before the
+        # final prune: git only drops a stale registration once its path is
+        # gone.  Cleanup is deliberately bounded, just like the diagnostic.
         try:
             if added or scratch.exists():
-                subprocess.run([git_path, "worktree", "remove", "--force", str(scratch)], cwd=repo,
-                               capture_output=True, text=True, timeout=300, check=False, env=env)
-            subprocess.run([git_path, "worktree", "prune"], cwd=repo, capture_output=True,
-                           text=True, timeout=300, check=False, env=env)
+                cleanup = subprocess.Popen(
+                    [git_path, "worktree", "remove", "--force", str(scratch)], cwd=repo,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                    start_new_session=True,
+                )
+                try:
+                    cleanup.communicate(timeout=CLEANUP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(cleanup.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    cleanup.communicate()
         except (OSError, subprocess.TimeoutExpired):
             # Best effort only: never let a diagnostic mask its test result.
             pass
-        if scratch.exists():
-            # It was never registered, or removal failed after pruning.
-            shutil.rmtree(scratch, ignore_errors=True)
+        # It was never registered, or removal failed.  This must precede
+        # prune so a failed/terminated remove cannot strand a registration.
+        shutil.rmtree(scratch, ignore_errors=True)
+        try:
+            prune = subprocess.Popen([git_path, "worktree", "prune"], cwd=repo,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     env=env, start_new_session=True)
+            try:
+                prune.communicate(timeout=CLEANUP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(prune.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                prune.communicate()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def integrate(repo: Path, branch: str, task_id: str) -> str:

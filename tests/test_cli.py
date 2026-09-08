@@ -1,9 +1,11 @@
 import multiprocessing
 import shutil
+import sqlite3
 
 import pytest
 
 from nc import arbiter
+import nc.cli as cli
 from nc.cli import main
 from nc.config import Config
 from nc.lifecycle import lifecycle_lock
@@ -493,3 +495,19 @@ def test_run_readiness_failure_is_deduplicated_and_leaves_task_queued(gc_project
     row = state.one("SELECT status, attempts FROM task WHERE id=?", (task,))
     assert tuple(row) == ("queued", 0)
     assert state.one("SELECT COUNT(*) FROM incident WHERE kind='host_environment'")[0] == 1
+
+
+def test_doctor_reports_host_errors_when_state_database_cannot_open(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli.arbiter, "host_requirements",
+                        lambda adapters: (["python: /runner/python"], [], "/runner/python"))
+
+    def unavailable(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cli, "State", unavailable)
+    assert main(["--home", str(tmp_path / "home"), "doctor", "--project", "demo"]) == 1
+
+    captured = capsys.readouterr()
+    assert "python: /runner/python" in captured.out
+    assert "ERROR: state database unavailable: database is locked" in captured.err
+    assert "bootstrap.sh" in captured.err

@@ -210,3 +210,21 @@ def test_restore_rejects_corrupt_and_incompatible_metadata(tmp_path):
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(SnapshotError, match="application version"):
         restore(snapshot, tmp_path / "incompatible-home")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("format_version", True), ("sqlite_user_version", False)],
+)
+def test_restore_rejects_boolean_manifest_version_metadata(tmp_path, field, value):
+    home = tmp_path / "home"
+    State(home / "state.db").db.close()
+    snapshot = tmp_path / "snapshot"
+    backup(home, snapshot)
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(SnapshotError, match="manifest types"):
+        restore(snapshot, tmp_path / "restored")

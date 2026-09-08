@@ -166,11 +166,23 @@ def _validate(snapshot: Path, *, require_compatible: bool) -> dict[str, object]:
     required = {"format", "format_version", "application_version", "sqlite_user_version", "schema_sha256", "files"}
     if not isinstance(manifest, dict) or set(manifest) != required:
         raise SnapshotError("unsupported snapshot manifest")
+    # Compare only values with the exact JSON types used by this format.  In
+    # particular, ``bool`` is an ``int`` subclass in Python, so ``true`` must
+    # not be allowed to masquerade as format version 1 (or user version 0).
+    if (
+        type(manifest["format"]) is not str
+        or type(manifest["format_version"]) is not int
+        or type(manifest["application_version"]) is not str
+        or type(manifest["sqlite_user_version"]) is not int
+        or type(manifest["schema_sha256"]) is not str
+        or type(manifest["files"]) is not dict
+    ):
+        raise SnapshotError("invalid snapshot manifest types")
     if manifest["format"] != FORMAT or manifest["format_version"] != FORMAT_VERSION:
         raise SnapshotError("unsupported snapshot format")
     if require_compatible and manifest["application_version"] != __version__:
         raise SnapshotError("snapshot application version is incompatible")
-    if not isinstance(manifest["files"], dict) or set(manifest["files"]) not in ({DATABASE}, {DATABASE, CONFIG}):
+    if set(manifest["files"]) not in ({DATABASE}, {DATABASE, CONFIG}):
         raise SnapshotError("unsafe snapshot file list")
     # A snapshot is a closed format.  In particular, do not let a file that is
     # absent from the signed file list hitch a ride into a restored home.
@@ -181,8 +193,6 @@ def _validate(snapshot: Path, *, require_compatible: bool) -> dict[str, object]:
         raise SnapshotError("cannot inspect snapshot") from exc
     if actual_names != expected_names:
         raise SnapshotError("snapshot contains unsupported payload files")
-    if not isinstance(manifest["sqlite_user_version"], int) or not isinstance(manifest["schema_sha256"], str):
-        raise SnapshotError("invalid snapshot metadata")
     for name, checksum in manifest["files"].items():
         # Names are whitelisted above; this guard makes path traversal impossible even if changed.
         if name not in (DATABASE, CONFIG) or not isinstance(checksum, str):

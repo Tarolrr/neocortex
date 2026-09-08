@@ -42,6 +42,28 @@ nc backup --destination /safe/place/neocortex-snapshot
 nc restore /safe/place/neocortex-snapshot --home /safe/place/neocortex-restored
 ```
 
+For a destination that is a private incremental store, opt in explicitly:
+
+```bash
+nc backup --incremental --destination /safe/place/neocortex-store --retain 96
+```
+
+Each resulting manifest is independently restorable and refers to verified
+content-addressed blocks in that store. Unchanged blocks are reused, reducing
+destination storage and writes; the command reports logical, newly-written and
+reused bytes in its manifest. It still reads and stages a complete consistent
+SQLite database locally. This is not SQLite page-level capture, WAL shipping,
+or a promise of zero local full copies. Only database/config are included:
+logs and worktrees are deliberately omitted.
+
+GitHub Actions artifacts can be an optional *additional* export only when a
+workflow runs, transfers a self-contained verified snapshot (manifest plus all
+payload/block data), and its authentication, repository access controls and
+retention/deletion policy permit later recovery. Uploading only a manifest is
+insufficient; immutable, expiring artifacts are not this shared incremental
+store. See GitHub's official [artifact documentation](https://docs.github.com/actions/using-workflows/storing-workflow-data-as-artifacts)
+and [artifact retention documentation](https://docs.github.com/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/removing-workflow-artifacts).
+
 `backup` uses SQLite's online backup API, so it includes committed WAL changes
 without copying a live `state.db` file. It publishes only a checksum-verified,
 integrity-checked snapshot with a versioned manifest. `restore` verifies that

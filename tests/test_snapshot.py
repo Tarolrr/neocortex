@@ -233,14 +233,17 @@ def test_restore_rejects_boolean_manifest_version_metadata(tmp_path, field, valu
 def test_incremental_snapshots_reuse_blocks_and_restore_identical_rows(tmp_path):
     home = tmp_path / "home"
     state = State(home / "state.db")
-    state.db.execute("CREATE TABLE backup_payload(id INTEGER PRIMARY KEY, value BLOB)")
-    state.db.execute("INSERT INTO backup_payload(value) VALUES(zeroblob(?))", (3 * 1024 * 1024,))
+    state.db.execute(
+        "INSERT INTO incident(kind, detail, created_at) VALUES(?,?,?)",
+        ("large", "x" * (3 * 1024 * 1024), 1.0),
+    )
     state.db.commit()
-    before = [tuple(row) for row in state.db.execute("SELECT * FROM backup_payload")]
+    before = [tuple(row) for row in state.db.execute("SELECT * FROM incident ORDER BY id")]
     store = tmp_path / "store"
     first = backup(home, store, incremental=True)
-    state.db.execute("CREATE TABLE small_change(value TEXT)")
-    state.db.execute("INSERT INTO small_change VALUES('changed')")
+    state.db.execute(
+        "INSERT INTO incident(kind, detail, created_at) VALUES(?,?,?)", ("small", "changed", 2.0)
+    )
     state.db.commit()
     second = backup(home, store, incremental=True)
     state.db.close()
@@ -254,8 +257,8 @@ def test_incremental_snapshots_reuse_blocks_and_restore_identical_rows(tmp_path)
     restored = tmp_path / "restored"
     restore(second, restored)
     db = sqlite3.connect(restored / "state.db")
-    assert [tuple(row) for row in db.execute("SELECT * FROM backup_payload")] == before
-    assert db.execute("SELECT value FROM small_change").fetchone()[0] == "changed"
+    assert [tuple(row) for row in db.execute("SELECT * FROM incident ORDER BY id")][:-1] == before
+    assert db.execute("SELECT detail FROM incident WHERE kind='small'").fetchone()[0] == "changed"
     db.close()
 
 

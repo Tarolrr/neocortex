@@ -107,6 +107,20 @@ def test_health_empty_home(tmp_path, capsys):
     ]
 
 
+def test_project_test_cmd_changes_only_named_project(tmp_path, capsys):
+    home = tmp_path / "home"
+    state = State(Config.load(home).db_path)
+    state.add_project("one", "One", str(tmp_path), "old one", mirror="origin")
+    state.add_project("two", "Two", str(tmp_path), "old two")
+
+    assert main(["--home", str(home), "project-test-cmd", "one", "pytest -q"]) == 0
+
+    assert capsys.readouterr().out == "project one test command updated\n"
+    one = state.one("SELECT test_cmd, mirror FROM project WHERE id='one'")
+    assert tuple(one) == ("pytest -q", "origin")
+    assert state.one("SELECT test_cmd FROM project WHERE id='two'")[0] == "old two"
+
+
 def test_health_counts(tmp_path, capsys):
     state = State(Config.load(tmp_path).db_path)
     for project in ("one", "two"):

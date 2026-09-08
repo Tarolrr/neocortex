@@ -33,6 +33,10 @@ Boundaries — do not go outside them:
 - Prefer the smallest change that satisfies the acceptance criteria.
 - If a criterion is ambiguous or contradicts the code, ASK — do not guess.
 - This machine has ~1 GB RAM. Do not start heavy builds or install large packages.
+- Follow the repository-root `AGENTS.md` contract: workers never install packages
+  or modify `/root/neocortex` or `/opt/neocortex-runner`.
+- The canonical checks are `pytest -q` and `ruff check .`; run them from this
+  worktree root when the task's acceptance criteria require them.
 
 {contract}
 """
@@ -135,6 +139,9 @@ Boundaries must describe invariants, never lists of files or directory fences.
 Include depends_on whenever work builds on another task, using existing task IDs
 or proposal-local IDs declared in an id field. Avoid duplicating queued work.
 More than five tasks is a protocol failure; split the scope before proposing.
+The canonical commands for this project are `$ pytest -q` and `$ ruff check .`;
+include them in relevant task acceptance criteria. The arbiter runs shell checks
+from the assigned worktree root. See the repository-root `AGENTS.md` contract.
 
 Write exactly one JSON object to {outcome_path}:
 {{"outcome":"DONE", "summary":"rationale", "proposal":[{{"project":"{project_id}",

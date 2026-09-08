@@ -217,6 +217,11 @@ class State:
             (pid, title, repo_path, test_cmd, mirror, quota_share, time.time()),
         )
 
+    def set_project_test_cmd(self, pid: str, test_cmd: str) -> None:
+        """Update just one project's arbiter command, preserving its other settings."""
+        if self.x("UPDATE project SET test_cmd=? WHERE id=?", (test_cmd, pid)).rowcount != 1:
+            raise LookupError(f"unknown project: {pid}")
+
     # --- tasks -----------------------------------------------------------
     def next_task_id(self, project_id: str) -> str:
         """Ids are never reused, even after a task row is deleted."""

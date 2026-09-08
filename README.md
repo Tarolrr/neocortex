@@ -38,7 +38,7 @@ turns, restarts and days.
 pip install -e .
 export NC_HOME=~/.neocortex
 nc init
-nc project neocortex /root/neocortex --test-cmd "pytest -q" --mirror origin
+nc project neocortex /root/neocortex --test-cmd "pytest -q && ruff check ." --mirror origin
 
 nc task --project neocortex \
   --title "Add a health command" \
@@ -183,11 +183,52 @@ time and no recorded note.
 
 ## Unattended operation
 
-`nc run` drains the queue and exits, so it is a natural oneshot unit:
+### Supported host bootstrap
+
+On a fresh **Debian 13 (Trixie)** or **Armbian 25 Trixie** host on `amd64` or
+`arm64`, from the reviewed checkout run the one owner-only command:
 
 ```bash
-cp deploy/neocortex.{service,timer} /etc/systemd/system/
-systemctl enable --now neocortex.timer
+sudo scripts/bootstrap.sh
+```
+
+The script refuses other releases and architectures before it changes the host.
+Armbian 25 is detected from its `ARMBIAN_PRETTY_NAME` metadata or
+`/etc/armbian-release` (`VERSION` and `DISTRIBUTION_CODENAME`); its Debian-base
+`ID=debian` and `VERSION_ID=13` alone are intentionally not treated as Armbian.
+It installs only missing Debian packages, creates `/opt/neocortex-runner` with a
+Python 3.13 virtual environment and editable install, preserves an existing
+runner checkout and `$NC_HOME` state/configuration, and installs units without
+restarting anything. It pins the official npm packages `@openai/codex@0.86.0`
+and `@anthropic-ai/claude-code@2.1.76`; npm is the vendors' documented CLI
+installation method. It never replaces the distribution `python3` interpreter.
+
+Log in after bootstrap (credentials are never supplied to the script):
+
+```bash
+codex login
+claude auth login
+sudo scripts/bootstrap.sh --enable-timer
+```
+
+The last command checks `codex login status` and `claude auth status` before it
+activates the timer; it refuses if either vendor session is not ready or if
+`$NC_HOME/STOP` exists, so a stopped runner is never overridden.
+For an existing project, change only its arbiter command explicitly rather than
+re-registering projects: `nc project-test-cmd neocortex 'pytest -q && ruff check .'`.
+
+To smoke-test a fresh host, run the first bootstrap command, verify
+`/opt/neocortex-runner/.venv/bin/python --version`, `codex --version`,
+`claude --version`, and `nc --home /root/.neocortex health`; log in, then enable
+the timer and inspect `systemctl status neocortex.timer`.
+
+`nc run` drains the queue and exits, so it is a natural oneshot unit. Bootstrap
+installs the service and timer units; do not enable the timer directly with
+`systemctl`. After the vendor-login and STOP checks above, activate it only
+through:
+
+```bash
+sudo scripts/bootstrap.sh --enable-timer
 journalctl -u neocortex -f
 ```
 
@@ -205,6 +246,13 @@ performing it. Promote a reviewed state with
 pytest -q
 ruff check .
 ```
+
+These are the canonical project checks. The arbiter runs them from each task
+worktree when listed as `$ pytest -q` and `$ ruff check .` acceptance criteria.
+The repository-root [AGENTS.md](AGENTS.md) is the worktree contract for agents:
+it specifies the guaranteed tools and interpreter, these exact checks, the
+arbiter's worktree-root execution, the service PATH, and the prohibition on
+worker package installation or writes outside the assigned worktree.
 
 ## Proposal approval
 

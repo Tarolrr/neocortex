@@ -45,6 +45,17 @@ def cmd_project(args) -> int:
     return 0
 
 
+def cmd_project_test_cmd(args) -> int:
+    _, state = _open(args)
+    try:
+        state.set_project_test_cmd(args.id, args.test_cmd)
+    except LookupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"project {args.id} test command updated")
+    return 0
+
+
 def cmd_task(args) -> int:
     _, state = _open(args)
     acceptance = args.accept or []
@@ -505,6 +516,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--quota", type=float, default=1.0)
     sp.add_argument("--mirror", help="git remote to push accepted work to")
     sp.set_defaults(func=cmd_project)
+
+    sp = sub.add_parser("project-test-cmd", help="update one existing project's arbiter test command")
+    sp.add_argument("id")
+    sp.add_argument("test_cmd")
+    sp.set_defaults(func=cmd_project_test_cmd)
 
     sp = sub.add_parser("task", help="add a task")
     sp.add_argument("--file", help="JSON task spec")

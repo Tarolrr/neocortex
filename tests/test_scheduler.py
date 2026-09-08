@@ -249,10 +249,10 @@ def test_accepted_work_is_mirrored_and_can_be_reverted(setup, tmp_path):
                               capture_output=True, text=True, check=True).stdout
     assert f"{tid}: accepted by arbiter" in mirrored
     assert subprocess.run(["git", "rev-parse", "--verify", f"refs/heads/nc/{tid}"],
-                          cwd=remote, capture_output=True).returncode == 0
+                          cwd=remote, capture_output=True, check=False).returncode == 0
     # New mirrors publish the real base, never the retired nc/<base> alias.
     assert subprocess.run(["git", "rev-parse", "--verify", "refs/heads/nc/trunk"],
-                          cwd=remote, capture_output=True).returncode != 0
+                          cwd=remote, capture_output=True, check=False).returncode != 0
     assert state.open_incidents() == []
 
     assert cli.main(["--home", str(cfg.home), "rollback", tid, "--confirm-commit",

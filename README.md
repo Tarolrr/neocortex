@@ -208,8 +208,9 @@ claude login
 sudo scripts/bootstrap.sh --enable-timer
 ```
 
-The last command activates the timer only after both executables are available;
-it refuses if `$NC_HOME/STOP` exists, so a stopped runner is never overridden.
+The last command checks `codex login status` and `claude auth status` before it
+activates the timer; it refuses if either vendor session is not ready or if
+`$NC_HOME/STOP` exists, so a stopped runner is never overridden.
 For an existing project, change only its arbiter command explicitly rather than
 re-registering projects: `nc project-test-cmd neocortex 'pytest -q && ruff check .'`.
 

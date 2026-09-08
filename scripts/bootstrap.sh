@@ -67,7 +67,19 @@ install_runner() {
     else
         git clone "$SOURCE_REPO" "$RUNNER"
     fi
-    if [ ! -x "$RUNNER/.venv/bin/python" ] || ! "$RUNNER/.venv/bin/python" -c 'import sys; import pytest, ruff; raise SystemExit(sys.version_info[:2] != (3, 13))'; then
+    # Run the import from the runner so the invoking checkout cannot mask a
+    # missing editable installation through its current working directory.
+    if [ ! -x "$RUNNER/.venv/bin/python" ] || [ ! -x "$RUNNER/.venv/bin/nc" ] ||
+       ! (cd "$RUNNER" && ./.venv/bin/python -c '
+import nc
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+origin = pathlib.Path(nc.__file__).resolve()
+raise SystemExit(sys.version_info[:2] != (3, 13) or not origin.is_relative_to(root))
+' "$RUNNER") ||
+       ! "$RUNNER/.venv/bin/python" -c 'import pytest, ruff'; then
         rm -rf "$RUNNER/.venv"
         python3.13 -m venv "$RUNNER/.venv"
         "$RUNNER/.venv/bin/pip" install -e "$RUNNER"
@@ -89,6 +101,8 @@ install_units() {
         [ ! -e "$NC_HOME/STOP" ] || fail "STOP exists; run nc resume before enabling the timer"
         command -v codex >/dev/null 2>&1 || fail "codex is unavailable; run codex login first"
         command -v claude >/dev/null 2>&1 || fail "claude is unavailable; run claude login first"
+        codex login status >/dev/null 2>&1 || fail "codex is not logged in; run codex login first"
+        claude auth status >/dev/null 2>&1 || fail "claude is not logged in; run claude login first"
         "$SYSTEMCTL" enable --now neocortex.timer
     fi
 }

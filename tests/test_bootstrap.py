@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -25,8 +26,20 @@ def environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     stub(bin_dir, "dpkg", "echo amd64")
     stub(bin_dir, "dpkg-query", "echo installed")
     stub(bin_dir, "npm", "[ \"$1\" = list ] || exit 1")
-    for command in ("codex", "claude"):
-        stub(bin_dir, command, "echo version")
+    stub(bin_dir, "codex", '''
+if [ "${1:-}" = login ] && [ "${2:-}" = status ]; then
+    [ "${CODEX_READY:-1}" = 1 ]
+    exit
+fi
+echo version
+''')
+    stub(bin_dir, "claude", '''
+if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
+    [ "${CLAUDE_READY:-1}" = 1 ]
+    exit
+fi
+echo version
+''')
     os_release = tmp_path / "os-release"
     os_release.write_text("ID=debian\nVERSION_CODENAME=trixie\n")
     env = os.environ | {
@@ -94,3 +107,84 @@ def test_enable_timer_respects_stop(tmp_path):
     assert result.returncode == 1
     assert "STOP exists" in result.stderr
     assert "systemctl enable" not in (log.read_text() if log.exists() else "")
+
+
+def test_enable_timer_requires_vendor_readiness(tmp_path):
+    env, log = environment(tmp_path)
+    prepared_runner(tmp_path, env)
+    home = Path(env["NC_HOME"])
+    home.mkdir()
+    (home / "config.json").write_text("{}")
+
+    for variable, expected in (("CODEX_READY", "codex is not logged in"),
+                               ("CLAUDE_READY", "claude is not logged in")):
+        failed_env = env | {variable: "0"}
+        result = subprocess.run([str(SCRIPT), "--enable-timer"], env=failed_env,
+                                text=True, capture_output=True, check=False)
+        assert result.returncode == 1
+        assert expected in result.stderr
+        assert "systemctl enable" not in (log.read_text() if log.exists() else "")
+
+
+def test_bootstrap_repairs_runner_missing_editable_install(tmp_path):
+    env, log = environment(tmp_path)
+    runner = Path(env["BOOTSTRAP_PREFIX"])
+    subprocess.run(["git", "clone", str(ROOT), str(runner)], check=True, capture_output=True)
+    venv_bin = runner / ".venv/bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(shutil.which("python3.13") or shutil.which("python3"))
+
+    # This Python 3.13 environment can import pytest and ruff, but deliberately
+    # lacks nc.  The venv stub makes the repair observable without network use.
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    stub(bin_dir, "python3.13", f'''
+echo "python3.13 $*" >> "{log}"
+if [ "${{1:-}}" = -m ] && [ "${{2:-}}" = venv ]; then
+    venv="$3"
+    mkdir -p "$venv/bin"
+    printf '%s\\n' '#!/bin/sh' 'echo "pip $*" >> "{log}"' 'bin=$(dirname "$0")' \
+        'printf "%s\\n" "#!/bin/sh" "mkdir -p \\\"$NC_HOME\\\"" "[ \\\"\\${{1:-}}\\\" != init ] || echo "{{}}" > \\\"$NC_HOME/config.json\\\"" > "$bin/nc"' \
+        'chmod +x "$bin/nc"' > "$venv/bin/pip"
+    chmod +x "$venv/bin/pip"
+fi
+''')
+
+    result = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text()
+    assert "python3.13 -m venv" in calls
+    assert "pip install -e" in calls
+    assert (Path(env["NC_HOME"]) / "config.json").exists()
+
+
+def test_bare_pytest_prefers_each_checkout_over_runner_editable_install(tmp_path):
+    """The retained pytest pythonpath makes a checkout win over runner's editable nc."""
+    runner = tmp_path / "runner"
+    subprocess.run(["git", "clone", str(ROOT), str(runner)], check=True, capture_output=True)
+    venv = tmp_path / "venv"
+    subprocess.run([shutil.which("python3.13") or shutil.which("python3"), "-m", "venv",
+                    "--system-site-packages", str(venv)], check=True)
+    python = venv / "bin/python"
+    subprocess.run([python, "-m", "pip", "install", "-e", runner], check=True, capture_output=True)
+    pytest = venv / "bin/pytest"
+    pytest.write_text("#!" + str(python) + "\nfrom pytest import console_main\nraise SystemExit(console_main())\n")
+    pytest.chmod(0o755)
+    other = tmp_path / "other-worktree"
+    subprocess.run(["git", "-C", runner, "worktree", "add", "--detach", str(other)],
+                   check=True, capture_output=True)
+    probe = tmp_path / "test_checkout_import.py"
+    probe.write_text(textwrap.dedent("""\
+        from pathlib import Path
+        import nc
+
+        def test_checkout_owns_nc():
+            assert Path(nc.__file__).resolve().is_relative_to(Path.cwd().resolve())
+    """))
+    env = os.environ | {"PATH": f"{venv / 'bin'}:{os.environ['PATH']}"}
+    env.pop("PYTHONPATH", None)
+
+    for checkout in (ROOT, other):
+        result = subprocess.run(["pytest", "-q", "-c", str(checkout / "pyproject.toml"), str(probe)], cwd=checkout,
+                                env=env, text=True, capture_output=True, check=False)
+        assert result.returncode == 0, result.stdout + result.stderr

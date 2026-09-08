@@ -219,11 +219,13 @@ To smoke-test a fresh host, run the first bootstrap command, verify
 `claude --version`, and `nc --home /root/.neocortex health`; log in, then enable
 the timer and inspect `systemctl status neocortex.timer`.
 
-`nc run` drains the queue and exits, so it is a natural oneshot unit:
+`nc run` drains the queue and exits, so it is a natural oneshot unit. Bootstrap
+installs the service and timer units; do not enable the timer directly with
+`systemctl`. After the vendor-login and STOP checks above, activate it only
+through:
 
 ```bash
-cp deploy/neocortex.{service,timer} /etc/systemd/system/
-systemctl enable --now neocortex.timer
+sudo scripts/bootstrap.sh --enable-timer
 journalctl -u neocortex -f
 ```
 
@@ -244,6 +246,10 @@ ruff check .
 
 These are the canonical project checks. The arbiter runs them from each task
 worktree when listed as `$ pytest -q` and `$ ruff check .` acceptance criteria.
+The repository-root [AGENTS.md](AGENTS.md) is the worktree contract for agents:
+it specifies the guaranteed tools and interpreter, these exact checks, the
+arbiter's worktree-root execution, the service PATH, and the prohibition on
+worker package installation or writes outside the assigned worktree.
 
 ## Proposal approval
 

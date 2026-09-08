@@ -47,7 +47,7 @@ echo version
         # The production default is the fixed PATH in neocortex.service.  The
         # isolated test substitutes its temporary service bin, ensuring that
         # bootstrap cannot accidentally validate the invoking shell PATH.
-        "SERVICE_PATH": str(bin_dir),
+        "SERVICE_PATH": f"{tmp_path / 'runner' / '.venv' / 'bin'}:{bin_dir}",
         "BOOTSTRAP_SKIP_ROOT_CHECK": "1",
         "BOOTSTRAP_PREFIX": str(tmp_path / "runner"),
         "NC_HOME": str(tmp_path / "home"),
@@ -72,6 +72,8 @@ def prepared_runner(tmp_path: Path, env: dict[str, str]) -> None:
     site_packages = venv / "lib/python3.13/site-packages"
     (site_packages / "__editable__.neocortex-0.1.0.pth").write_text(f"{runner}\n")
     stub(venv / "bin", "nc", 'exec "$(dirname "$0")/python" -m nc.cli "$@"')
+    stub(venv / "bin", "pytest", 'exec "$(dirname "$0")/python" -m pytest "$@"')
+    stub(venv / "bin", "ruff", 'exec "$(dirname "$0")/python" -m ruff "$@"')
 
 
 def test_bootstrap_rerun_preserves_config_and_does_not_reinstall(tmp_path):
@@ -193,7 +195,8 @@ def test_bootstrap_repairs_runner_missing_editable_install(tmp_path):
     (venv_bin / "python").symlink_to(shutil.which("python3.13") or shutil.which("python3"))
 
     # This Python 3.13 environment can import pytest and ruff, but deliberately
-    # lacks nc. The venv stub makes the repair observable without network use.
+    # lacks nc and its service-PATH launchers. The venv stub makes the repair
+    # observable without network use.
     bin_dir = Path(env["PATH"].split(":", 1)[0])
     stub(bin_dir, "python3.13", f'''
 echo "python3.13 $*" >> "{log}"
@@ -202,7 +205,7 @@ if [ "${{1:-}}" = -m ] && [ "${{2:-}}" = venv ]; then
     mkdir -p "$venv/bin" "$venv/lib/python3.13/site-packages"
     ln -s /usr/bin/python3.13 "$venv/bin/python"
     printf '%s\\n' 'home = /usr/bin' 'include-system-site-packages = true' > "$venv/pyvenv.cfg"
-    printf '%s\\n' '#!/bin/sh' 'echo "pip $*" >> "{log}"' 'if [ "$1" = install ] && [ "$2" = -e ]; then echo "$3" > "$(dirname "$0")/../lib/python3.13/site-packages/__editable__.neocortex-0.1.0.pth"; printf "%s\\n" "#!/bin/sh" "exec \\\"$(dirname \"$0\")/python\\\" -m nc.cli \\\"\\$@\\\"" > "$(dirname "$0")/nc"; chmod +x "$(dirname "$0")/nc"; fi' > "$venv/bin/pip"
+    printf '%s\\n' '#!/bin/sh' 'echo "pip $*" >> "{log}"' 'if [ "$1" = install ] && [ "$2" = -e ]; then echo "$3" > "$(dirname "$0")/../lib/python3.13/site-packages/__editable__.neocortex-0.1.0.pth"; for tool in nc pytest ruff; do printf "%s\\n" "#!/bin/sh" "exit 0" > "$(dirname "$0")/$tool"; chmod +x "$(dirname "$0")/$tool"; done; printf "%s\\n" "#!/bin/sh" "mkdir -p \\\"\\$NC_HOME\\\"" "if [ \\\"\\${{1:-}}\\\" = init ]; then printf \\\"{{}}\\\" > \\\"\\$NC_HOME/config.json\\\"; fi" > "$(dirname "$0")/nc"; fi' > "$venv/bin/pip"
     chmod +x "$venv/bin/pip"
 fi
 ''')
@@ -214,6 +217,30 @@ fi
     assert "python3.13 -m venv" in calls
     assert "pip install -e" in calls
     assert (Path(env["NC_HOME"]) / "config.json").exists()
+
+
+def test_bootstrap_repairs_runner_missing_console_launcher(tmp_path):
+    env, log = environment(tmp_path)
+    prepared_runner(tmp_path, env)
+    runner = Path(env["BOOTSTRAP_PREFIX"])
+    (runner / ".venv/bin/pytest").unlink()
+    bin_dir = Path(env["PATH"].split(":", 1)[0])
+    stub(bin_dir, "python3.13", f'''
+if [ "${{1:-}}" = -m ] && [ "${{2:-}}" = venv ]; then
+    venv="$3"
+    mkdir -p "$venv/bin" "$venv/lib/python3.13/site-packages"
+    ln -s /usr/bin/python3.13 "$venv/bin/python"
+    printf '%s\\n' 'home = /usr/bin' 'include-system-site-packages = true' > "$venv/pyvenv.cfg"
+    printf '%s\\n' '#!/bin/sh' 'echo "pip $*" >> "{log}"' 'if [ "$1" = install ] && [ "$2" = -e ]; then echo "$3" > "$(dirname "$0")/../lib/python3.13/site-packages/__editable__.neocortex-0.1.0.pth"; for tool in nc pytest ruff; do printf "%s\\n" "#!/bin/sh" "exit 0" > "$(dirname "$0")/$tool"; chmod +x "$(dirname "$0")/$tool"; done; fi' > "$venv/bin/pip"
+    chmod +x "$venv/bin/pip"
+fi
+''')
+
+    result = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert "pip install -e" in log.read_text()
+    assert (runner / ".venv/bin/pytest").is_file()
 
 
 def test_bare_pytest_prefers_each_checkout_over_runner_editable_install(tmp_path):

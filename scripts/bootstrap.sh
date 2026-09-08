@@ -88,7 +88,13 @@ runner_install_is_valid() {
     # directory on sys.path, which would make a missing editable install look
     # healthy.  An import from / with PYTHONPATH removed must resolve nc back
     # into this checkout through the venv's editable-install metadata.
+    # The service invokes these through SERVICE_PATH, not by absolute path.
+    # Check both the runner launchers and their discoverability so a venv with
+    # importable modules but missing console scripts is repaired on rerun.
     [ -x "$RUNNER/.venv/bin/python" ] && [ -x "$RUNNER/.venv/bin/nc" ] &&
+       [ -x "$RUNNER/.venv/bin/pytest" ] && [ -x "$RUNNER/.venv/bin/ruff" ] &&
+       service_command python && service_command nc &&
+       service_command pytest && service_command ruff &&
        (cd / && env -u PYTHONPATH "$RUNNER/.venv/bin/python" -c '
 import nc
 import pathlib

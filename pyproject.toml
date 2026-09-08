@@ -9,7 +9,8 @@ dependencies = []
 nc = "nc.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+# Exact pin makes pip's isolated editable-build environment reproducible.
+requires = ["setuptools==75.8.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

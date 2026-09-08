@@ -228,3 +228,67 @@ def test_restore_rejects_boolean_manifest_version_metadata(tmp_path, field, valu
 
     with pytest.raises(SnapshotError, match="manifest types"):
         restore(snapshot, tmp_path / "restored")
+
+
+def test_incremental_snapshots_reuse_blocks_and_restore_identical_rows(tmp_path):
+    home = tmp_path / "home"
+    state = State(home / "state.db")
+    state.db.execute("CREATE TABLE backup_payload(id INTEGER PRIMARY KEY, value BLOB)")
+    state.db.execute("INSERT INTO backup_payload(value) VALUES(zeroblob(?))", (3 * 1024 * 1024,))
+    state.db.commit()
+    before = [tuple(row) for row in state.db.execute("SELECT * FROM backup_payload")]
+    store = tmp_path / "store"
+    first = backup(home, store, incremental=True)
+    state.db.execute("CREATE TABLE small_change(value TEXT)")
+    state.db.execute("INSERT INTO small_change VALUES('changed')")
+    state.db.commit()
+    second = backup(home, store, incremental=True)
+    state.db.close()
+
+    first_manifest = json.loads((first / "manifest.json").read_text())
+    second_manifest = json.loads((second / "manifest.json").read_text())
+    assert first_manifest["new_bytes"] == first_manifest["logical_bytes"]
+    assert 0 < second_manifest["reused_bytes"] < second_manifest["logical_bytes"]
+    assert second_manifest["new_bytes"] + second_manifest["reused_bytes"] == second_manifest["logical_bytes"]
+
+    restored = tmp_path / "restored"
+    restore(second, restored)
+    db = sqlite3.connect(restored / "state.db")
+    assert [tuple(row) for row in db.execute("SELECT * FROM backup_payload")] == before
+    assert db.execute("SELECT value FROM small_change").fetchone()[0] == "changed"
+    db.close()
+
+
+def test_incremental_restore_rejects_missing_or_corrupt_shared_block(tmp_path):
+    home = tmp_path / "home"
+    State(home / "state.db").db.close()
+    snapshot = backup(home, tmp_path / "store", incremental=True)
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    block = next(iter(manifest["files"]["state.db"]["blocks"]))["sha256"]
+    path = tmp_path / "store" / "blocks" / block
+    path.unlink()
+    with pytest.raises(SnapshotError, match="shared block"):
+        restore(snapshot, tmp_path / "missing")
+
+    snapshot = backup(home, tmp_path / "store", incremental=True)
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    path = tmp_path / "store" / "blocks" / manifest["files"]["state.db"]["blocks"][0]["sha256"]
+    path.write_bytes(b"corrupt")
+    with pytest.raises(SnapshotError, match="shared block"):
+        restore(snapshot, tmp_path / "corrupt")
+
+
+def test_incremental_failure_before_manifest_does_not_prune_snapshot(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    State(home / "state.db").db.close()
+    store = tmp_path / "store"
+    previous = backup(home, store, incremental=True, retain=1)
+
+    def interrupted(*_args, **_kwargs):
+        raise OSError("simulated full disk")
+
+    monkeypatch.setattr(snapshot_module, "_atomic_manifest", interrupted)
+    with pytest.raises(OSError, match="full disk"):
+        backup(home, store, incremental=True, retain=1)
+    assert (previous / "manifest.json").exists()
+    assert restore(previous, tmp_path / "restored")

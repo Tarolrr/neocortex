@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -28,6 +29,8 @@ CONFIG = "config.json"
 BACKUP_TIMEOUT_S = 5.0
 BLOCK_SIZE = 1024 * 1024
 DEFAULT_RETENTION = 96
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_SOURCE_ID = re.compile(r"[0-9a-f]{24}\Z")
 
 
 class SnapshotError(ValueError):
@@ -199,16 +202,106 @@ def _copy_blocks(path: Path, blocks_dir: Path) -> tuple[list[dict[str, object]],
     return blocks, new, reused
 
 
+def _is_digest(value: object) -> bool:
+    return isinstance(value, str) and bool(_DIGEST.fullmatch(value))
+
+
+def _is_source_id(value: object) -> bool:
+    return isinstance(value, str) and bool(_SOURCE_ID.fullmatch(value))
+
+
+def _incremental_manifest(snapshot: Path, *, source: str | None = None) -> dict[str, object] | None:
+    """Read a fully-published v2 manifest without dereferencing store links."""
+    manifest_path = snapshot / MANIFEST
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError):
+        return None
+    required = {"format", "format_version", "application_version", "sqlite_user_version",
+                "schema_sha256", "source", "files", "logical_bytes", "new_bytes", "reused_bytes"}
+    if not isinstance(manifest, dict) or set(manifest) != required:
+        return None
+    if (manifest.get("format") != FORMAT or manifest.get("format_version") != INCREMENTAL_FORMAT_VERSION
+            or not isinstance(manifest.get("application_version"), str)
+            or type(manifest.get("sqlite_user_version")) is not int
+            or not _is_digest(manifest.get("schema_sha256"))
+            or not _is_source_id(manifest.get("source"))
+            or (source is not None and manifest["source"] != source)):
+        return None
+    files = manifest.get("files")
+    if not isinstance(files, dict) or set(files) not in ({DATABASE}, {DATABASE, CONFIG}):
+        return None
+    logical = 0
+    for name, entry in files.items():
+        if name not in (DATABASE, CONFIG) or not isinstance(entry, dict):
+            return None
+        checksum, size, pieces = entry.get("sha256"), entry.get("size"), entry.get("blocks")
+        if not _is_digest(checksum) or type(size) is not int or size < 0 or not isinstance(pieces, list):
+            return None
+        total = 0
+        for piece in pieces:
+            if (not isinstance(piece, dict) or set(piece) != {"sha256", "size"}
+                    or not _is_digest(piece.get("sha256")) or type(piece.get("size")) is not int
+                    or piece["size"] <= 0):
+                return None
+            total += piece["size"]
+        if total != size:
+            return None
+        logical += size
+    if (type(manifest.get("logical_bytes")) is not int or type(manifest.get("new_bytes")) is not int
+            or type(manifest.get("reused_bytes")) is not int or manifest["logical_bytes"] != logical
+            or manifest["new_bytes"] < 0 or manifest["reused_bytes"] < 0
+            or manifest["new_bytes"] + manifest["reused_bytes"] != logical):
+        return None
+    return manifest
+
+
+def _atomic_manifest(path: Path, manifest: dict[str, object]) -> None:
+    """Publish a manifest only after its complete bytes are durable."""
+    fd, temporary = tempfile.mkstemp(prefix=".manifest-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(manifest, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
 def _incremental_backup(home: Path, store: Path, retain: int) -> Path:
     """Publish a manifest last; blocks are content addressed and immutable."""
-    store.mkdir(parents=True, exist_ok=True); os.chmod(store, 0o700)
-    if store.is_symlink() or not store.is_dir(): raise SnapshotError("incremental destination must be a directory")
+    if store.is_symlink():
+        raise SnapshotError("incremental destination must be a directory")
+    store.mkdir(parents=True, exist_ok=True)
+    if not store.is_dir(): raise SnapshotError("incremental destination must be a directory")
+    os.chmod(store, 0o700)
     lock = store / ".lock"
+    if lock.is_symlink():
+        raise SnapshotError("incremental store lock is unsafe")
     with lock.open("a+") as guard:
         os.chmod(lock, 0o600); fcntl.flock(guard, fcntl.LOCK_EX)
-        blocks_dir = store / "blocks"; blocks_dir.mkdir(exist_ok=True); os.chmod(blocks_dir, 0o700)
+        blocks_dir = store / "blocks"
+        if blocks_dir.is_symlink(): raise SnapshotError("shared block store is unsafe")
+        blocks_dir.mkdir(exist_ok=True)
+        if not blocks_dir.is_dir(): raise SnapshotError("shared block store is unsafe")
+        os.chmod(blocks_dir, 0o700)
         source = _source_id(home); snapshots = store / "snapshots" / source
-        snapshots.mkdir(parents=True, exist_ok=True); os.chmod(snapshots, 0o700)
+        if (store / "snapshots").is_symlink() or snapshots.is_symlink():
+            raise SnapshotError("snapshot namespace is unsafe")
+        snapshots.mkdir(parents=True, exist_ok=True)
+        if not snapshots.is_dir(): raise SnapshotError("snapshot namespace is unsafe")
+        os.chmod(snapshots, 0o700)
         stage = _temporary_sibling(store / "stage")
         try:
             db, config = _stage_database(home, stage)
@@ -228,8 +321,7 @@ def _incremental_backup(home: Path, store: Path, retain: int) -> Path:
             leaf = snapshots / f"{time.time_ns():020d}"
             leaf.mkdir(mode=0o700)
             manifest_path = leaf / MANIFEST
-            manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
-            os.chmod(manifest_path, 0o600)  # manifest is intentionally the last publication
+            _atomic_manifest(manifest_path, manifest)  # intentionally the last publication
             _prune_store(store, source, retain)
             return leaf
         finally:
@@ -238,19 +330,27 @@ def _incremental_backup(home: Path, store: Path, retain: int) -> Path:
 
 def _prune_store(store: Path, source: str, retain: int) -> None:
     directory = store / "snapshots" / source
-    recognized = [p for p in directory.iterdir() if p.is_dir() and not p.is_symlink() and (p / MANIFEST).is_file()]
+    recognized = [p for p in directory.iterdir() if p.is_dir() and not p.is_symlink()
+                  and _incremental_manifest(p, source=source) is not None]
     recognized.sort(key=lambda p: p.name, reverse=True)
     for old in recognized[retain:]: shutil.rmtree(old)
     referenced: set[str] = set()
-    for manifest in (store / "snapshots").glob("*/*/manifest.json"):
-        if manifest.is_symlink(): continue
-        try:
-            data = json.loads(manifest.read_text())
-            if data.get("format_version") == INCREMENTAL_FORMAT_VERSION:
-                for f in data.get("files", {}).values(): referenced.update(b["sha256"] for b in f.get("blocks", []))
-        except (OSError, ValueError, AttributeError): continue
+    namespace = store / "snapshots"
+    if namespace.is_symlink() or not namespace.is_dir():
+        raise SnapshotError("snapshot namespace is unsafe")
+    for owner in namespace.iterdir():
+        if not owner.is_dir() or owner.is_symlink() or not _is_source_id(owner.name):
+            continue
+        for snapshot in owner.iterdir():
+            if not snapshot.is_dir() or snapshot.is_symlink():
+                continue
+            data = _incremental_manifest(snapshot, source=owner.name)
+            if data is not None:
+                for f in data["files"].values():
+                    referenced.update(b["sha256"] for b in f["blocks"])
     for block in (store / "blocks").iterdir():
-        if block.is_file() and not block.is_symlink() and block.name not in referenced:
+        if (block.is_file() and not block.is_symlink() and _is_digest(block.name)
+                and block.name not in referenced):
             block.unlink()
 
 
@@ -258,13 +358,8 @@ def _materialize_incremental(snapshot: Path, output: Path) -> None:
     """Check every shared block and make a private v1-shaped staging copy."""
     if not snapshot.is_dir() or snapshot.is_symlink() or len(snapshot.parents) < 3:
         raise SnapshotError("incremental snapshot must be a directory")
-    try:
-        manifest = json.loads((snapshot / MANIFEST).read_text())
-    except (OSError, ValueError) as exc:
-        raise SnapshotError("invalid snapshot manifest") from exc
-    required = {"format", "format_version", "application_version", "sqlite_user_version",
-                "schema_sha256", "source", "files", "logical_bytes", "new_bytes", "reused_bytes"}
-    if not isinstance(manifest, dict) or set(manifest) != required or manifest.get("format") != FORMAT or manifest.get("format_version") != INCREMENTAL_FORMAT_VERSION:
+    manifest = _incremental_manifest(snapshot)
+    if manifest is None:
         raise SnapshotError("unsupported incremental snapshot manifest")
     files = manifest["files"]
     if not isinstance(files, dict) or set(files) not in ({DATABASE}, {DATABASE, CONFIG}):

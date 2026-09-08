@@ -2,9 +2,11 @@
 Description=Check Neocortex durable backup requests every minute
 
 [Timer]
-OnBootSec=1min
-OnUnitInactiveSec=60s
-AccuracySec=15s
+# Calendar scheduling is independent of worker duration.  With the negligible
+# accuracy window, a request committed just after a tick is picked up by the
+# next minute tick (no later than 60 seconds).
+OnCalendar=*-*-* *:*:00
+AccuracySec=1us
 Persistent=true
 Unit=neocortex-backup.service
 

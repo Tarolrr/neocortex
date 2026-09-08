@@ -75,9 +75,10 @@ explicitly run `nc resume` only when recovery is complete.
 Unattended backup is deliberately off after bootstrap. Select and mount a
 destination yourself (credentials and mount configuration remain outside this
 repository), then set `backup_destination` and optionally `backup_retain` in
-`$NC_HOME/config.json`. The directory must already exist, must not be a
-symlink, and must report a different device from `NC_HOME`; the worker refuses
-to create a fallback directory if the mount is absent. A different device ID
+`$NC_HOME/config.json`. The directory must already exist, be **outside
+`NC_HOME`** (including after canonicalizing paths), must not be a symlink, and
+must report a different device from `NC_HOME`; the worker refuses to create a
+fallback directory if the mount is absent. A different device ID
 is only a useful guardrail: it cannot prove physical independence (for example,
 two devices may share a controller or failure domain).
 

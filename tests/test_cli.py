@@ -479,3 +479,9 @@ def test_cli_import_preserves_partial_success_output(gc_project, tmp_path, capsy
         main(["--home", str(cfg.home), "task", "--file", str(specs)])
     tid = state.one("SELECT id FROM task WHERE title='first'")["id"]
     assert capsys.readouterr().out == tid + "\n"
+
+
+def test_feedback_cli_marks_a_durable_backup_request(gc_project):
+    cfg, state, _ = gc_project
+    assert main(["--home", str(cfg.home), "feedback", "remember this", "--project", "demo"]) == 0
+    assert state.one("SELECT dirty_generation FROM backup_state")[0] == 1

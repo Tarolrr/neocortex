@@ -21,10 +21,15 @@ class BackupConfigurationError(ValueError):
     pass
 
 
+def _device(path: Path) -> int:
+    return path.stat().st_dev
+
+
 def validate_destination(home: Path, destination: Path | None) -> Path:
     """Refuse implicit directories and the source device for automation."""
     if destination is None:
         raise BackupConfigurationError("automated backup destination is not configured")
+    home = Path(home).resolve(strict=True)
     destination = Path(destination)
     if not destination.is_dir():
         raise BackupConfigurationError(
@@ -32,7 +37,12 @@ def validate_destination(home: Path, destination: Path | None) -> Path:
         )
     if destination.is_symlink():
         raise BackupConfigurationError("backup destination must not be a symlink")
-    if home.stat().st_dev == destination.stat().st_dev:
+    # Resolve before comparing containment: a bind mount below NC_HOME can
+    # have another device number, but is still a source-tree destination.
+    destination = destination.resolve(strict=True)
+    if destination == home or destination.is_relative_to(home):
+        raise BackupConfigurationError("backup destination must be outside NC_HOME")
+    if _device(home) == _device(destination):
         raise BackupConfigurationError("backup destination is on the same device as NC_HOME")
     return destination
 

@@ -8,6 +8,10 @@ SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 APT_GET=${APT_GET:-apt-get}
 SYSTEMCTL=${SYSTEMCTL:-systemctl}
 OS_RELEASE=${OS_RELEASE:-/etc/os-release}
+# Current Armbian images retain the Debian identity in /etc/os-release.  Their
+# Armbian release is recorded separately here (and may also be exposed as
+# ARMBIAN_PRETTY_NAME in os-release).
+ARMBIAN_RELEASE=${ARMBIAN_RELEASE:-/etc/armbian-release}
 SOURCE_REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CODEX_VERSION=${CODEX_VERSION:-0.86.0}
 CLAUDE_VERSION=${CLAUDE_VERSION:-2.1.76}
@@ -33,18 +37,33 @@ validate_host() {
     [ -r "$OS_RELEASE" ] || fail "cannot read $OS_RELEASE"
     # shellcheck disable=SC1090
     . "$OS_RELEASE"
-    case "${ID:-}" in
-        debian)
-            [ "${VERSION_CODENAME:-}" = trixie ] || fail "unsupported Debian release ${VERSION_CODENAME:-unknown}; supported: Debian 13 (trixie)"
-            ;;
-        armbian)
-            # Armbian publishes its release family in VERSION_ID (for example
-            # 25.11.1), while VERSION_CODENAME names the Debian base.
-            case "${VERSION_ID:-}" in 25|25.*) ;; *) fail "unsupported Armbian release ${VERSION_ID:-unknown}; supported: Armbian 25 Trixie" ;; esac
-            [ "${VERSION_CODENAME:-}" = trixie ] || fail "unsupported Armbian base ${VERSION_CODENAME:-unknown}; supported: Armbian 25 Trixie"
-            ;;
-        *) fail "unsupported OS ID ${ID:-unknown}; supported: Debian 13 (trixie) and Armbian 25 Trixie" ;;
-    esac
+    armbian_version=
+    armbian_codename=${VERSION_CODENAME:-}
+    if [ "${ID:-}" = armbian ]; then
+        # Compatibility with older images that used ID=armbian.
+        armbian_version=${VERSION_ID:-}
+    elif [ -n "${ARMBIAN_PRETTY_NAME:-}" ]; then
+        # Newer images use ID=debian and VERSION_ID=13, but retain this field.
+        case "$ARMBIAN_PRETTY_NAME" in
+            Armbian\ *) armbian_version=${ARMBIAN_PRETTY_NAME#Armbian }; armbian_version=${armbian_version%% *} ;;
+        esac
+    fi
+    if [ -r "$ARMBIAN_RELEASE" ]; then
+        # Do not source this host metadata: extract only the documented fields.
+        release_version=$(sed -n 's/^VERSION=//p' "$ARMBIAN_RELEASE" | sed -n '1p' | tr -d '"')
+        release_codename=$(sed -n 's/^DISTRIBUTION_CODENAME=//p' "$ARMBIAN_RELEASE" | sed -n '1p' | tr -d '"')
+        [ -z "$armbian_version" ] || [ -z "$release_version" ] || [ "$armbian_version" = "$release_version" ] || fail "conflicting Armbian release metadata"
+        [ -z "$armbian_codename" ] || [ -z "$release_codename" ] || [ "$armbian_codename" = "$release_codename" ] || fail "conflicting Armbian base metadata"
+        [ -n "$release_version" ] && armbian_version=$release_version
+        [ -n "$release_codename" ] && armbian_codename=$release_codename
+    fi
+    if [ -n "$armbian_version" ]; then
+        case "$armbian_version" in 25|25.*) ;; *) fail "unsupported Armbian release $armbian_version; supported: Armbian 25 Trixie" ;; esac
+        [ "$armbian_codename" = trixie ] || fail "unsupported Armbian base ${armbian_codename:-unknown}; supported: Armbian 25 Trixie"
+    else
+        [ "${ID:-}" = debian ] || fail "unsupported OS ID ${ID:-unknown}; supported: Debian 13 (trixie) and Armbian 25 Trixie"
+        [ "${VERSION_CODENAME:-}" = trixie ] || fail "unsupported Debian release ${VERSION_CODENAME:-unknown}; supported: Debian 13 (trixie)"
+    fi
     case "$(dpkg --print-architecture)" in amd64|arm64) ;; *) fail "unsupported architecture; supported: amd64 and arm64" ;; esac
     [ -f "$SOURCE_REPO/pyproject.toml" ] || fail "source checkout lacks pyproject.toml: $SOURCE_REPO"
     if [ "${BOOTSTRAP_SKIP_ROOT_CHECK:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then

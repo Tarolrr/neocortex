@@ -193,6 +193,9 @@ sudo scripts/bootstrap.sh
 ```
 
 The script refuses other releases and architectures before it changes the host.
+Armbian 25 is detected from its `ARMBIAN_PRETTY_NAME` metadata or
+`/etc/armbian-release` (`VERSION` and `DISTRIBUTION_CODENAME`); its Debian-base
+`ID=debian` and `VERSION_ID=13` alone are intentionally not treated as Armbian.
 It installs only missing Debian packages, creates `/opt/neocortex-runner` with a
 Python 3.13 virtual environment and editable install, preserves an existing
 runner checkout and `$NC_HOME` state/configuration, and installs units without

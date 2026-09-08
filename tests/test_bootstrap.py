@@ -53,6 +53,9 @@ echo version
         "NC_HOME": str(tmp_path / "home"),
         "SYSTEMD_DIR": str(tmp_path / "units"),
         "OS_RELEASE": str(os_release),
+        # Prevent the test runner's real host metadata from affecting a
+        # simulated Debian host.
+        "ARMBIAN_RELEASE": str(tmp_path / "missing-armbian-release"),
     }
     return env, log
 
@@ -109,8 +112,11 @@ def test_bootstrap_rejects_unsupported_host_before_commands(tmp_path):
 def test_bootstrap_rejects_non_25_armbian_before_commands(tmp_path):
     env, log = environment(tmp_path)
     Path(env["OS_RELEASE"]).write_text(
-        "ID=armbian\nVERSION_ID=24.8.1\nVERSION_CODENAME=trixie\n"
+        "ID=debian\nVERSION_ID=13\nVERSION_CODENAME=trixie\n"
     )
+    release = tmp_path / "armbian-release"
+    release.write_text("VERSION=24.8.1\nDISTRIBUTION_CODENAME=trixie\n")
+    env["ARMBIAN_RELEASE"] = str(release)
 
     result = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=False)
 
@@ -119,16 +125,34 @@ def test_bootstrap_rejects_non_25_armbian_before_commands(tmp_path):
     assert not log.exists()
 
 
-def test_bootstrap_accepts_armbian_25_os_release_fields(tmp_path):
+def test_bootstrap_accepts_actual_armbian_25_metadata(tmp_path):
     env, _ = environment(tmp_path)
     prepared_runner(tmp_path, env)
     Path(env["OS_RELEASE"]).write_text(
-        "ID=armbian\nVERSION_ID=25.11.1\nVERSION_CODENAME=trixie\n"
+        "ID=debian\nVERSION_ID=13\nVERSION_CODENAME=trixie\n"
     )
+    release = tmp_path / "armbian-release"
+    release.write_text("VERSION=25.11.1\nDISTRIBUTION_CODENAME=trixie\n")
+    env["ARMBIAN_RELEASE"] = str(release)
 
     result = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=False)
 
     assert result.returncode == 0, result.stderr
+
+
+def test_bootstrap_rejects_armbian_pretty_name_without_release_file(tmp_path):
+    env, log = environment(tmp_path)
+    Path(env["OS_RELEASE"]).write_text(
+        'ID=debian\nVERSION_ID=13\nVERSION_CODENAME=trixie\n'
+        'ARMBIAN_PRETTY_NAME="Armbian 24.8.1 Trixie"\n'
+    )
+    env["ARMBIAN_RELEASE"] = str(tmp_path / "missing-armbian-release")
+
+    result = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 1
+    assert "unsupported Armbian release 24.8.1" in result.stderr
+    assert not log.exists()
 
 
 def test_enable_timer_requires_clis_on_service_path(tmp_path):

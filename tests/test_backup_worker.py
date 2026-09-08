@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 
 from nc.backup_worker import BackupConfigurationError, run_once, status, validate_destination
@@ -18,15 +16,14 @@ def test_feedback_marks_generation_and_rollback_does_not(tmp_path):
     assert state.one("SELECT dirty_generation FROM backup_state")[0] == 0
     state.planner_feedback("p", "save this", "model")
     assert state.one("SELECT dirty_generation FROM backup_state")[0] == 1
-    with pytest.raises(RuntimeError):
-        with state.db:
-            state._backup_dirty()
-            raise RuntimeError("abort")
+    with pytest.raises(RuntimeError), state.db:
+        state._backup_dirty()
+        raise RuntimeError("abort")
     assert state.one("SELECT dirty_generation FROM backup_state")[0] == 1
 
 
 def test_same_device_is_refused_and_status_is_unhealthy(tmp_path):
-    home, _state = _state(tmp_path)
+    home, _ = _state(tmp_path)
     with pytest.raises(BackupConfigurationError):
         validate_destination(home, home)
     result, healthy = status(home, home)

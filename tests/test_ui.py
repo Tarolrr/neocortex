@@ -1,4 +1,5 @@
 import http.client
+import json
 import re
 import socket
 import subprocess
@@ -7,7 +8,7 @@ import urllib.parse
 
 import pytest
 
-from nc import protocol
+from nc import arbiter, protocol
 from nc.config import Config
 from nc.state import State
 from nc.ui import Handler, make_server
@@ -115,6 +116,99 @@ def test_post_security_and_success(browser):
     assert list(state.db.iterdump()) == before
     assert request(f"/t/{tid}/cancel", "POST", form, valid)[0] == 303
     assert state.one("SELECT status FROM task WHERE id=?", (tid,))["status"] == "cancelled"
+
+
+def test_runs_inspection_and_recovery_require_csrf(browser):
+    _, state, tid, server, request = browser
+    state.add_agent("interrupted", "worker", "one", tid, "model")
+    run = state.start_run("interrupted", tid, "worker", "model", "log")
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?", (run,))
+    status, headers, body = request("/runs")
+    assert status == 200 and f"#{run}" in body
+    status, headers, body = request(f"/runs/{run}")
+    assert status == 200
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    valid = {"Cookie": headers["Set-Cookie"].split(";")[0],
+             "Origin": f"http://127.0.0.1:{server.server_port}"}
+    form = {"csrf_token": token, "reason": "verified quiescence",
+            "acknowledge_quiescence": "1"}
+    assert request(f"/runs/{run}/recover", "POST", form)[0] == 403
+    assert request(f"/runs/{run}/recover", "POST", form, valid)[0] == 303
+    assert state.one("SELECT outcome FROM run WHERE id=?", (run,))["outcome"] == "INTERRUPTED"
+    # Both an unknown ID and a stale/finished form target are read-only 404s.
+    assert request("/runs/999999")[0] == 404
+    assert request(f"/runs/{run}")[0] == 404
+
+
+def test_selected_run_recovery_is_atomic_and_stale_or_duplicate_submissions_are_read_only(browser):
+    """The browser list submits one mixed selection to the shared operation."""
+    cfg, state, tid, server, request = browser
+    # Recovery must be an evidence-only operation even when the affected task
+    # has a real worktree.  Keep a Git/worktree snapshot beside the complete
+    # SQLite dump used below.
+    repo = cfg.home.parent / "recovery-repo"
+    repo.mkdir()
+    arbiter.git(repo, "init", "-b", "main")
+    arbiter.git(repo, "config", "user.email", "test@example.invalid")
+    arbiter.git(repo, "config", "user.name", "test")
+    arbiter.git(repo, "commit", "--allow-empty", "-m", "seed")
+    state.x("UPDATE project SET repo_path=? WHERE id='one'", (str(repo),))
+    worktree, _ = arbiter.ensure_worktree(repo, cfg.work_dir, tid)
+    state.add_agent("legacy", "worker", "one", tid, "model")
+    state.add_agent("live", "planner", "one", None, "model")
+    legacy = state.start_run("legacy", tid, "worker", "model", "log")
+    live = state.start_run("live", None, "planner", "model", "log")
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?", (legacy,))
+    _, headers, body = request("/runs")
+    assert 'action="/runs/recover"' in body
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    valid = {"Cookie": headers["Set-Cookie"].split(";", 1)[0],
+             "Origin": f"http://127.0.0.1:{server.server_port}"}
+    mixed = {"csrf_token": token, f"run_id_{legacy}": "1", f"run_id_{live}": "1",
+             "reason": "checked", "acknowledge_quiescence": "1"}
+    before = list(state.db.iterdump())
+    git_before = (arbiter.git(repo, "status", "--porcelain"),
+                  arbiter.git(repo, "worktree", "list", "--porcelain"), worktree.exists())
+    status, _, _ = request("/runs/recover", "POST", mixed, valid)
+    assert status == 303
+    assert list(state.db.iterdump()) == before
+    assert (arbiter.git(repo, "status", "--porcelain"),
+            arbiter.git(repo, "worktree", "list", "--porcelain"), worktree.exists()) == git_before
+    assert state.one("SELECT ended_at FROM run WHERE id=?", (legacy,))[0] is None
+
+    recovered = {"csrf_token": token, f"run_id_{legacy}": "1",
+                 "reason": "checked", "acknowledge_quiescence": "1"}
+    assert request("/runs/recover", "POST", recovered, valid)[0] == 303
+    before_stale = list(state.db.iterdump())
+    # A repeat is stale, and a tampered duplicate reaches the same public
+    # endpoint.  Neither can alter any database business state.
+    assert request("/runs/recover", "POST", recovered, valid)[0] == 303
+    assert request("/runs/recover", "POST",
+                   {"csrf_token": token, "run_ids": f"{live},{live}", "reason": "x"}, valid)[0] == 303
+    assert list(state.db.iterdump()) == before_stale
+
+
+def test_selected_run_recovery_reports_database_contention_without_writes(browser):
+    _, state, tid, server, request = browser
+    state.add_agent("legacy", "worker", "one", tid, "model")
+    run = state.start_run("legacy", tid, "worker", "model", "log")
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?", (run,))
+    _, headers, body = request("/runs")
+    token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+    before = list(state.db.iterdump())
+    state.db.execute("BEGIN IMMEDIATE")
+    try:
+        status, response_headers, body = request("/runs/recover", "POST", {
+            "csrf_token": token, f"run_id_{run}": "1", "reason": "checked",
+            "acknowledge_quiescence": "1",
+        }, {"Cookie": headers["Set-Cookie"].split(";", 1)[0],
+            "Origin": f"http://127.0.0.1:{server.server_port}"})
+        assert status == 503
+        assert response_headers["Retry-After"] == "1"
+        assert "database is busy" in body
+    finally:
+        state.db.rollback()
+    assert list(state.db.iterdump()) == before
 
 
 def test_busy_database_returns_retryable_error(browser):
@@ -336,7 +430,14 @@ def test_feedback_proposal_decisions_and_answers(browser):
                         "Origin": f"http://127.0.0.1:{server.server_port}"})
 
     feedback = "/p/one/feedback"
-    assert post(feedback, feedback, {"text": "Plan <script>x</script>"})[0] == 303
+    assert post(feedback, feedback, {"text": "Plan <script>x</script>", "task": tid})[0] == 303
+    body = request(feedback)[2]
+    assert "Delivery means the planner received" in body
+    assert f'href="/t/{tid}"' in body
+    assert "waiting for planner" in body
+    assert post(feedback, "/p/one/plan", {"note": "Plan the boundary"})[0] == 303
+    assert any(json.loads(row['payload']).get('request') == 'plan'
+               for row in state.inbox('planner-one'))
     assert not state.q("SELECT * FROM run")
     spec = [{"project": "one", "title": "Proposed", "objective": "x", "acceptance": []}]
     pid = state.add_proposal("one", "planner", "<script>rationale</script>", spec)

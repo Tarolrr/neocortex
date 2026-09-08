@@ -65,6 +65,7 @@ def _nav(active: str) -> str:
     items = [
         ("projects", "/projects", "Projects"),
         ("inbox", "/inbox", "Inbox"),
+        ("runs", "/runs", "Unfinished runs"),
     ]
     current = ' aria-current="page"'
     links = "".join(
@@ -307,6 +308,33 @@ def _task_detail_page(state: State, cfg: Config, task: dict, csrf: str,
     return _page(f"{task['id']}", "projects", body)
 
 
+def _runs_page(rows: list[dict], csrf: str, flash: str, error: str) -> str:
+    entries = "".join(
+        f'<li><label><input type="checkbox" name="run_id_{r["id"]}" value="1"> '
+        f'#{r["id"]} agent={_e(r["agent_id"])} task={_e(r["task_or_role"])} '
+        f'role={_e(r["role"])} started={_e(r["started_at"])} '
+        f'ownership: {_e(r["ownership"])} '
+        f'<a href="/runs/{r["id"]}">recover individually</a></label></li>' for r in rows
+    ) or "<li>(none)</li>"
+    body = f"""{_flash('ok', flash)}{_flash('error', error)}
+<h2>Unfinished run records</h2><p>An unfinished record is not proof of a live process. Verify scheduler and adapter descendants before recovering uncertain legacy ownership; inactive systemd alone is insufficient.</p>
+<form method="post" action="/runs/recover">{_csrf_field(csrf)}
+<ul>{entries}</ul>
+<div class="field"><label for="reason">Recovery reason</label><input id="reason" name="reason" required></div>
+<div class="field checkbox"><input id="quiescent" name="acknowledge_quiescence" value="1" type="checkbox"><label for="quiescent">I verified scheduler and adapter processes are quiescent</label></div>
+<button type="submit">Record interruption for selected runs</button></form>"""
+    return _page("Unfinished runs", "runs", body)
+
+
+def _recover_run_page(row: dict, csrf: str, flash: str, error: str) -> str:
+    body = f"""{_flash('ok', flash)}{_flash('error', error)}<h2>Recover run #{row['id']}</h2>
+<p>agent={_e(row['agent_id'])}; task={_e(row['task_or_role'])}; ownership: {_e(row['ownership'])}</p>
+<form method="post" action="/runs/{row['id']}/recover">{_csrf_field(csrf)}
+<div class="field"><label for="reason">Recovery reason</label><input id="reason" name="reason" required></div>
+<div class="field checkbox"><input id="quiescent" name="acknowledge_quiescence" value="1" type="checkbox"><label for="quiescent">I verified scheduler and adapter processes are quiescent</label></div><button type="submit">Record interruption</button></form>"""
+    return _page("Recover run", "runs", body)
+
+
 # --- proposals ----------------------------------------------------------
 
 def _proposal_list_page(state: State, project: dict, flash: str, error: str) -> str:
@@ -331,7 +359,7 @@ def _proposal_detail_page(state: State, detail: dict, csrf: str, error: str, fla
     findings = "".join(f"<li>{_e(f)}</li>" for f in detail["findings"])
     revisions = "".join(
         f"<li>revision via feedback: {_e(r['feedback'].get('text', ''))}"
-        + (f" (replaced by #{r['replacement_id']})</li>" if r["replacement_id"]
+        + (f' (replaced by <a href="/proposals/{r["replacement_id"]}">#{r["replacement_id"]}</a>)</li>' if r["replacement_id"]
            else " (pending)</li>")
         for r in detail["revisions"]
     )
@@ -377,11 +405,46 @@ def _proposal_detail_page(state: State, detail: dict, csrf: str, error: str, fla
 
 # --- feedback -------------------------------------------------------------
 
-def _feedback_page(project: dict, csrf: str, flash: str, error: str) -> str:
+def _feedback_target(project: dict, item: dict) -> str:
+    target = item["target"]
+    if target["kind"] == "task":
+        return f'<a href="/t/{_segment(target["id"])}">task {_e(target["id"])}</a>'
+    if target["kind"] == "proposal":
+        link = f'<a href="/proposals/{target["id"]}">proposal #{target["id"]}</a>'
+        if target.get("replacement_id"):
+            link += f' → <a href="/proposals/{target["replacement_id"]}">replacement #{target["replacement_id"]}</a>'
+        return link
+    return f'<a href="/p/{_segment(project["id"])}/tasks">project {_e(project["id"])}</a>'
+
+
+def _project_question_item(project: dict, item: dict, csrf: str) -> str:
+    if item["task_id"]:
+        source = _feedback_target(project, {"target": {"kind": "task", "id": item["task_id"]}})
+    else:
+        source = "project planner"
+    action = _answer_form(item, csrf) if item["answerable"] else '<span class="muted">answered</span>'
+    return (f'<li>#{item["id"]} from {_e(item["sender"])} ({source})'
+            f'<p>{_e(item["text"])}</p>{action}</li>')
+
+
+def _feedback_page(state: State, project: dict, csrf: str, flash: str, error: str) -> str:
+    history = operations.feedback_history(state, project["id"])
+    feedback_items = "".join(
+        f'<li>#{item["id"]} {"plan request" if item["payload"].get("request") == "plan" else "feedback"} '
+        f'to {_feedback_target(project, item)} — '
+        f'<strong>{"delivered to planner" if item["delivered"] else "waiting for planner"}</strong>'
+        f'<pre>{_e(item["payload"].get("text", ""))}</pre></li>'
+        for item in history
+    ) or "<li>(no feedback yet)</li>"
+    questions = operations.project_owner_questions(state, project["id"])
+    question_items = "".join(_project_question_item(project, item, csrf) for item in questions)
+    question_items = question_items or "<li>(no owner questions)</li>"
     body = f"""
 {_flash('ok', flash)}{_flash('error', error)}
 <h2>Feedback / plan for {_e(project["title"])}</h2>
 <p><a href="/p/{_segment(project["id"])}/tasks">back to tasks</a></p>
+<p>Delivery means the planner received the message; it does not mean work was implemented.
+Planning remains a proposal for owner approval.</p>
 <form method="post" action="/p/{_segment(project["id"])}/feedback">
 {_csrf_field(csrf)}
 <div class="field"><label for="text">Message to the project planner</label>
@@ -390,8 +453,19 @@ def _feedback_page(project: dict, csrf: str, flash: str, error: str) -> str:
 <input id="task" name="task"></div>
 <div class="field"><label for="proposal">Attach to proposal id (optional, revises it)</label>
 <input id="proposal" name="proposal" type="number"></div>
+<p class="muted">Submitting feedback for a pending proposal immediately supersedes it before
+the planner prepares a replacement. Inspect it first; original and replacement details remain linked.</p>
 <button type="submit">Send feedback</button>
-</form>"""
+</form>
+<h3>Request a planning pass</h3>
+<form method="post" action="/p/{_segment(project["id"])}/plan">
+{_csrf_field(csrf)}
+<div class="field"><label for="note">Planning note (optional)</label>
+<textarea id="note" name="note" rows="3"></textarea></div>
+<button type="submit">Request planning</button>
+</form>
+<h3>Feedback history</h3><ul class="list">{feedback_items}</ul>
+<h3>Owner questions for this project</h3><ul class="list">{question_items}</ul>"""
     return _page("Feedback", "projects", body)
 
 
@@ -554,6 +628,68 @@ def _view_task(h: Handler, state, params, query):
     ))
 
 
+@route("GET", r"^/runs$")
+def _view_runs(h: Handler, state, params, query):
+    h.send_html(HTTPStatus.OK, _runs_page(operations.unfinished_runs(state), h.csrf_token,
+                                           query.get("ok", ""), query.get("error", "")))
+
+
+@route("GET", r"^/runs/(?P<run_id>[0-9]+)$")
+def _view_recover_run(h: Handler, state, params, query):
+    row = next((r for r in operations.unfinished_runs(state) if r["id"] == int(params["run_id"])), None)
+    if row is None:
+        raise LookupError(f"unknown or finished run: {params['run_id']}")
+    h.send_html(HTTPStatus.OK, _recover_run_page(row, h.csrf_token, query.get("ok", ""), query.get("error", "")))
+
+
+@route("POST", r"^/runs/(?P<run_id>[0-9]+)/recover$")
+def _post_recover_run(h: Handler, state, params, query, form):
+    run_id = int(params["run_id"])
+    try:
+        operations.recover_runs(state, [run_id], form.get("reason", ""),
+                                form.get("acknowledge_quiescence") == "1")
+    except (ValueError, LookupError) as exc:
+        h.redirect(f"/runs/{run_id}", error=str(exc))
+        return
+    h.redirect("/runs", ok=f"recovered run ID: {run_id}")
+
+
+def _selected_run_ids(form: dict[str, str]) -> list[int]:
+    """Read the selected rows from the list form without weakening its validation.
+
+    Named checkboxes retain every selected ID despite the deliberately simple
+    one-value form parser.  ``run_ids`` is also accepted as a comma-separated
+    value for scripted browser submissions; it makes duplicate/stale requests
+    reach the same shared operation and validation as the CLI.
+    """
+    selected = []
+    for name, value in form.items():
+        match = re.fullmatch(r"run_id_([1-9][0-9]*)", name)
+        if match and value == "1":
+            selected.append(int(match.group(1)))
+    supplied = form.get("run_ids", "")
+    if supplied:
+        try:
+            selected.extend(int(value) for value in supplied.split(","))
+        except ValueError as exc:
+            raise ValueError("run IDs must be comma-separated positive integers") from exc
+    return selected
+
+
+@route("POST", r"^/runs/recover$")
+def _post_recover_selected_runs(h: Handler, state, params, query, form):
+    try:
+        rows = operations.recover_runs(
+            state, _selected_run_ids(form), form.get("reason", ""),
+            form.get("acknowledge_quiescence") == "1",
+        )
+    except (ValueError, LookupError) as exc:
+        h.redirect("/runs", error=str(exc))
+        return
+    h.redirect("/runs", ok="recovered interrupted run IDs: " +
+               ", ".join(str(row["id"]) for row in rows))
+
+
 @route("POST", r"^/t/(?P<task_id>[^/]+)/cancel$")
 def _post_cancel(h: Handler, state, params, query, form):
     task_id = params["task_id"]
@@ -641,7 +777,7 @@ def _post_reject(h: Handler, state, params, query, form):
 def _view_feedback(h: Handler, state, params, query):
     project = _require_project(state, params["project"])
     h.send_html(HTTPStatus.OK, _feedback_page(
-        project, h.csrf_token, query.get("ok", ""), query.get("error", ""),
+        state, project, h.csrf_token, query.get("ok", ""), query.get("error", ""),
     ))
 
 
@@ -665,6 +801,19 @@ def _post_feedback(h: Handler, state, params, query, form):
         return
     h.redirect(f"/p/{_segment(project['id'])}/feedback",
               ok=f"queued feedback #{message_id} for {agent_id}")
+
+
+@route("POST", r"^/p/(?P<project>[^/]+)/plan$")
+def _post_plan(h: Handler, state, params, query, form):
+    project = _require_project(state, params["project"])
+    try:
+        agent_id, message_id = operations.request_plan(state, h.cfg, project["id"],
+                                                       form.get("note") or None)
+    except (ValueError, LookupError) as exc:
+        h.redirect(f"/p/{_segment(project['id'])}/feedback", error=str(exc))
+        return
+    h.redirect(f"/p/{_segment(project['id'])}/feedback",
+              ok=f"queued planning request #{message_id} for {agent_id}")
 
 
 @route("GET", r"^/inbox$")

@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from . import arbiter, protocol, roles
-from .adapters import Adapter
+from .adapters import Adapter, adapter_ownership
 from .config import Config
 from .proposals import check_proposal
 from .state import State
@@ -159,7 +159,8 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
     run_session = getattr(adapter, "run_planner", adapter.run)
     tokens = None
     try:
-        result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
+        with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
+            result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
         tokens = result.tokens
         if result.exit_code != 0 or result.timed_out:
             raise ValueError(f"session exited {result.exit_code}; timed_out={result.timed_out}")
@@ -208,14 +209,23 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
 
     model = agent["model"]
     run_id = state.start_run(agent["id"], agent["task_id"], agent["role"], model, str(log_path))
-    result = adapter.run(brief, cwd, model, log_path, cfg.turn_timeout_s)
-    outcome = protocol.read_outcome(outcome_path)
-
-    if outcome.kind == protocol.NO_OUTCOME and result.timed_out:
-        outcome.summary = f"turn timed out after {cfg.turn_timeout_s}s without an outcome file"
-
-    state.end_run(run_id, outcome.kind, outcome.summary, result.tokens)
-    state.mark_delivered(inbox_ids)
+    tokens = None
+    try:
+        with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
+            result = adapter.run(brief, cwd, model, log_path, cfg.turn_timeout_s)
+        tokens = result.tokens
+        outcome = protocol.read_outcome(outcome_path)
+        if outcome.kind == protocol.NO_OUTCOME and result.timed_out:
+            outcome.summary = f"turn timed out after {cfg.turn_timeout_s}s without an outcome file"
+    except Exception as exc:
+        logging.getLogger(__name__).exception("%s session failed", agent["role"])
+        outcome = protocol.Outcome(kind=protocol.FAIL,
+                                   summary=f"{agent['role']} session failure: {exc}")
+    # Session exceptions are evidence too.  Do not deliver inbox messages: a
+    # retry must retain feedback/questions that were never successfully used.
+    state.end_run(run_id, outcome.kind, outcome.summary, tokens)
+    if outcome.kind != protocol.FAIL:
+        state.mark_delivered(inbox_ids)
     state.set_agent(agent["id"], turns=agent["turns"] + 1,
                     memo=outcome.memo or agent["memo"])
     return outcome
@@ -260,7 +270,8 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
         brief = build_plan_critic_brief(state, proposal, outcome_path)
         (run_dir / "brief.md").write_text(brief)
         # No unrestricted fallback: this role requires the restricted adapter path.
-        result = adapter.run_planner(brief, run_dir, model, log_path, cfg.turn_timeout_s)
+        with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
+            result = adapter.run_planner(brief, run_dir, model, log_path, cfg.turn_timeout_s)
         tokens = result.tokens
         outcome = protocol.read_outcome(outcome_path)
         recommendation = outcome.raw.get("recommendation")

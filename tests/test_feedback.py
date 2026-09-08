@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from nc import operations, protocol
 from nc.cli import main
 from nc.config import Config
 from nc.state import State
@@ -139,3 +140,33 @@ def test_proposal_selector_conflict(project):
     with pytest.raises(ValueError, match='mutually exclusive'):
         state.planner_feedback(None, 'Revise', 'model', 'task', 1)
     assert list(state.db.iterdump()) == before
+
+
+def test_full_feedback_history_targets_delivery_and_answer_claim(project):
+    cfg, state = project
+    task = state.add_task('demo', 'Task', 'Objective', [])
+    assert invoke(cfg, 'feedback', 'Project context') == 0
+    assert invoke(cfg, 'feedback', 'Task context', '--task', task) == 0
+    proposal = state.add_proposal('demo', 'planner', 'Draft', [])
+    assert invoke(cfg, 'feedback', 'Revise draft', '--proposal', str(proposal)) == 0
+    planner = state.one("SELECT id FROM agent WHERE role='planner'")[0]
+    messages = state.inbox(planner)
+    state.mark_delivered([messages[0]['id']])
+
+    history = operations.feedback_history(state, 'demo')
+    assert [entry['payload']['text'] for entry in history] == [
+        'Project context', 'Task context', 'Revise draft',
+    ]
+    assert [entry['target']['kind'] for entry in history] == ['project', 'task', 'proposal']
+    assert history[0]['delivered'] == 1 and history[1]['delivered'] == 0
+    assert history[2]['target']['id'] == proposal
+
+    state.add_agent('worker-question', 'worker', 'demo', task, 'model')
+    question = state.send(protocol.QUESTION, 'worker-question', 'owner',
+                          {'question': 'Which scope?'}, task)
+    related = operations.project_owner_questions(state, 'demo')
+    assert related[-1]['id'] == question and related[-1]['answerable']
+    operations.answer_message(state, question, 'Only the UI')
+    with pytest.raises(ValueError, match='not a currently answerable'):
+        operations.answer_message(state, question, 'Duplicate')
+    assert len(state.q('SELECT * FROM message WHERE in_reply_to=?', (question,))) == 1

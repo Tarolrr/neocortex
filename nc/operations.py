@@ -39,6 +39,207 @@ def age(ts: float) -> str:
     return f"{delta // 86400}d"
 
 
+def _owner_status(row: dict) -> str:
+    """Return evidence, not a guess based on task/service state."""
+    pid, started = row.get("owner_pid"), row.get("owner_start")
+    if pid is None or not started:
+        return "uncertain (legacy ownership evidence is absent)"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        owner_gone = "owner process is gone"
+    except PermissionError:
+        return "uncertain (owner process cannot be inspected)"
+    else:
+        current = State._process_start(int(pid))
+        if current is None:
+            return "uncertain (owner process identity cannot be inspected)"
+        if current == started:
+            return "live scheduler owner process"
+        owner_gone = "owner PID was reused; recorded owner is gone"
+    cgroup = row.get("adapter_cgroup")
+    if row.get("ownership_version", 0) >= 2:
+        if not cgroup:
+            return "uncertain (adapter cgroup ownership evidence is absent; " + owner_gone + ")"
+        members = _adapter_cgroup_members(str(cgroup))
+        if members is None:
+            return "uncertain (adapter cgroup cannot be inspected)"
+        if members:
+            return ("live adapter process or descendant "
+                    f"(cgroup {cgroup}: {', '.join(map(str, members))})")
+        return "scheduler and recorded adapter cgroup are gone"
+    pgid = row.get("adapter_pgid")
+    if pgid is None:
+        # A scheduler exit does not prove that its separately-sessioned adapter
+        # exited. Rows from before adapter ownership recording need the
+        # documented, explicit quiescence acknowledgement.
+        return "uncertain (adapter ownership evidence is absent; " + owner_gone + ")"
+    members = _adapter_group_members(int(pgid))
+    if members is None:
+        return "uncertain (adapter process group cannot be inspected)"
+    if members:
+        return f"live adapter process or descendant (pgrp {pgid}: {', '.join(map(str, members))})"
+    return "scheduler and recorded adapter process group are gone"
+
+
+def _adapter_cgroup_members(cgroup: str) -> list[int] | None:
+    """Read a dedicated adapter cgroup; empty is the only absence evidence."""
+    if not cgroup.startswith("/") or Path(cgroup).name.startswith("neocortex-run-") is False:
+        return None
+    try:
+        pids = (Path("/sys/fs/cgroup") / cgroup.lstrip("/") / "cgroup.procs").read_text().split()
+        members = []
+        for text_pid in pids:
+            pid = int(text_pid)
+            try:
+                # A zombie is still briefly listed by cgroup v2, but cannot
+                # execute or own adapter work.  Its eventual reaping is not a
+                # reason to block a safe recovery indefinitely.
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[0]
+            except FileNotFoundError:
+                continue
+            except (PermissionError, OSError, IndexError):
+                return None
+            if state != "Z":
+                members.append(pid)
+        return sorted(members)
+    except (FileNotFoundError, PermissionError, OSError, ValueError):
+        # A removed empty cgroup is absence; failures inspecting an extant one
+        # are uncertainty.  cgroup directories are removed only once empty.
+        path = Path("/sys/fs/cgroup") / cgroup.lstrip("/")
+        try:
+            return [] if not path.exists() else None
+        except OSError:
+            return None
+
+
+def _adapter_group_members(pgid: int) -> list[int] | None:
+    """Return live members of an adapter's isolated POSIX process group.
+
+    ``start_new_session`` makes the adapter PID its group leader.  Its children
+    normally inherit that group, so this catches adapter descendants after a
+    scheduler crash.  An uninspectable /proc is uncertainty, never absence.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    members: list[int] = []
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            bits = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
+            if int(bits[2]) == pgid:  # field 5 / pgrp
+                members.append(int(entry.name))
+        except FileNotFoundError:
+            # A process exiting during the scan cannot remain a live member.
+            continue
+        except (PermissionError, OSError):
+            # Denied or failed inspection makes absence unknowable.
+            return None
+        except (IndexError, ValueError):
+            # Malformed proc data is also not evidence that the group is empty.
+            return None
+    return sorted(members)
+
+
+def unfinished_blockers(state: State) -> str:
+    """Precise, cross-project lifecycle diagnostic shared by owner actions."""
+    rows = unfinished_runs(state)
+    return "; ".join(
+        f"#{r['id']} agent={r['agent_id']} task={r['task_or_role']} role={r['role']} "
+        f"started_at={r['started_at']:.6f} ownership={r['ownership']}" for r in rows
+    )
+
+
+def unfinished_runs(state: State) -> list[dict]:
+    """Read-only cross-project inspection of records that block owner actions."""
+    rows = state.q(
+        "SELECT r.*, a.project_id, a.task_id AS agent_task_id FROM run r "
+        "JOIN agent a ON a.id=r.agent_id WHERE r.ended_at IS NULL ORDER BY r.id"
+    )
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["ownership"] = _owner_status(item)
+        item["task_or_role"] = item["task_id"] or f"taskless {item['role']}"
+        result.append(item)
+    return result
+
+
+def recover_runs(state: State, run_ids: list[int], reason: str,
+                 acknowledge_quiescence: bool = False) -> list[dict]:
+    """Explicitly close selected interrupted records, without replaying an outcome.
+
+    The lifecycle lock excludes scheduler registration and final outcome writes.
+    All selection checks happen again under one immediate transaction, so a
+    duplicate/stale form cannot partially recover a mixed selection.
+    """
+    if not run_ids:
+        raise ValueError("at least one run ID is required")
+    if len(set(run_ids)) != len(run_ids) or any(type(i) is not int or i < 1 for i in run_ids):
+        raise ValueError("run IDs must be distinct positive integers")
+    if not reason or not reason.strip():
+        raise ValueError("a recovery reason is required")
+    with lifecycle_lock(state), state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        marks = ",".join("?" for _ in run_ids)
+        rows = [dict(r) for r in state.q(
+            f"SELECT * FROM run WHERE id IN ({marks}) ORDER BY id", run_ids)]
+        found = {r["id"] for r in rows}
+        missing = sorted(set(run_ids) - found)
+        if missing:
+            raise LookupError("unknown run IDs: " + ", ".join(map(str, missing)))
+        finished = [r["id"] for r in rows if r["ended_at"] is not None]
+        if finished:
+            raise ValueError("runs are already finished: " + ", ".join(map(str, finished)))
+        legacy_uncertain, ambiguous, live = [], [], []
+        for row in rows:
+            ownership = _owner_status(row)
+            if ownership.startswith("live "):
+                live.append(row["id"])
+            elif ownership.startswith("uncertain"):
+                # Only pre-ownership-schema rows are legacy.  A current row
+                # that lost its owner or adapter evidence may have started an
+                # untracked process and must never be overridden by an
+                # acknowledgement.
+                if row.get("ownership_version", 0) == 0:
+                    legacy_uncertain.append(row["id"])
+                else:
+                    ambiguous.append(row["id"])
+        if live:
+            raise ValueError("refusing recovery; live ownership for run IDs: " +
+                             ", ".join(map(str, live)))
+        if ambiguous:
+            raise ValueError("refusing recovery; ambiguous new ownership for run IDs: " +
+                             ", ".join(map(str, ambiguous)))
+        if legacy_uncertain and not acknowledge_quiescence:
+            raise ValueError("legacy ownership is uncertain for run IDs: " + ", ".join(map(str, legacy_uncertain)) +
+                             "; verify scheduler and adapter descendants are quiescent, then acknowledge")
+        now = time.time()
+        for row in rows:
+            # ``detail`` is the session's contemporaneous evidence.  In
+            # particular it may be a deliberately long adapter traceback.
+            # Recovery is an owner audit event, not a new session result, so
+            # keep that evidence byte-for-byte and put the recovery facts in
+            # their additive columns rather than squeezing them into detail.
+            detail = row["detail"]
+            changed = state.db.execute(
+                "UPDATE run SET outcome='INTERRUPTED', detail=?, ended_at=?, interrupted_at=?, "
+                "recovered_at=?, recovery_reason=? WHERE id=? AND ended_at IS NULL",
+                (detail, now, now, now, reason.strip(), row["id"]),
+            ).rowcount
+            if not changed:
+                raise ValueError(f"run {row['id']} changed before recovery; retry inspection")
+            state.db.execute("UPDATE agent SET state='blocked', updated_at=? WHERE id=?",
+                             (now, row["agent_id"]))
+        return rows
+
+
 # --- projects -------------------------------------------------------------
 
 def projects(state: State) -> list[dict]:
@@ -246,7 +447,8 @@ def requeue_task(cfg: Config, state: State, task_id: str, fresh: bool = False,
         if task["status"] == "done":
             raise ValueError(f"{task_id} is already accepted; use rollback instead")
         if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
-            raise ValueError("An active run must finish before changing task lifecycle")
+            raise ValueError("unfinished run records block task lifecycle (not proof of active run): " +
+                             unfinished_blockers(state))
         project = get_project(state, task["project_id"])
         repo = Path(project["repo_path"])
         with repository_lock(repo):
@@ -289,7 +491,8 @@ def rollback_task(state: State, task_id: str, expected_commit: str | None = None
         if task is None or not task["merge_commit"]:
             raise LookupError(f"{task_id} has no recorded merge commit")
         if state.one("SELECT 1 FROM run WHERE ended_at IS NULL"):
-            raise ValueError("An active run must finish before changing task lifecycle")
+            raise ValueError("unfinished run records block task lifecycle (not proof of active run): " +
+                             unfinished_blockers(state))
         project = get_project(state, task["project_id"])
         repo = Path(project["repo_path"])
         if task["status"] != "done":
@@ -380,6 +583,59 @@ def submit_feedback(state: State, cfg: Config, project: str | None, text: str,
     return state.planner_feedback(project, text, cfg.model_for("planner"), task, proposal)
 
 
+def request_plan(state: State, cfg: Config, project: str, note: str | None = None) -> tuple[str, int]:
+    """Queue an explicit planning request without running a planner session."""
+    return state.planner_feedback(project, note or "Request a planning pass.",
+                                  cfg.model_for("planner"), plan_request=True)
+
+
+def feedback_history(state: State, project_id: str) -> list[dict]:
+    """Full owner-feedback history for a project, including consumed messages.
+
+    ``delivered`` only records that the planner consumed the message.  It is
+    deliberately not inferred from proposal or task state: a planner may ask a
+    question, propose work, or decide no implementation is appropriate.
+    """
+    get_project(state, project_id)
+    rows = state.q(
+        "SELECT m.* FROM message m JOIN agent a ON a.id=m.recipient"
+        " WHERE m.kind=? AND a.project_id=? ORDER BY m.id",
+        (protocol.FEEDBACK, project_id),
+    )
+    history = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = json.loads(item["payload"])
+        revision = state.one("SELECT original_id, replacement_id FROM proposal_revision"
+                             " WHERE feedback_id=?", (item["id"],))
+        if revision:
+            item["target"] = {"kind": "proposal", "id": revision["original_id"],
+                              "replacement_id": revision["replacement_id"]}
+        elif item["task_id"]:
+            item["target"] = {"kind": "task", "id": item["task_id"]}
+        else:
+            item["target"] = {"kind": "project", "id": project_id}
+        history.append(item)
+    return history
+
+
+def project_owner_questions(state: State, project_id: str,
+                            include_delivered: bool = True) -> list[dict]:
+    """Questions to the owner from this project's workers and taskless planner."""
+    get_project(state, project_id)
+    sql = ("SELECT m.* FROM message m JOIN agent a ON a.id=m.sender"
+           " WHERE m.kind=? AND m.recipient='owner' AND a.project_id=?")
+    if not include_delivered:
+        sql += " AND m.delivered=0"
+    result = []
+    for row in state.q(sql + " ORDER BY m.id", (protocol.QUESTION, project_id)):
+        item = dict(row)
+        item["text"] = json.loads(item["payload"]).get("question", "")
+        item["answerable"] = answerable_question(state, item)
+        result.append(item)
+    return result
+
+
 # --- inbox / answers -------------------------------------------------------
 
 def inbox(state: State, include_delivered: bool = False) -> list[dict]:
@@ -426,6 +682,12 @@ def answer_message(state: State, message_id: int, text: str) -> dict:
             raise ValueError("message is not a currently answerable owner question")
         agent_id = question["sender"]
         now = time.time()
+        # Claim the question before inserting its answer.  The predicate makes
+        # duplicate submits fail even if a caller holds a stale question row.
+        if not state.db.execute(
+            "UPDATE message SET delivered=1 WHERE id=? AND delivered=0", (question["id"],),
+        ).rowcount:
+            raise ValueError("message is not a currently answerable owner question")
         from . import protocol
         state.db.execute(
             "INSERT INTO message(kind,sender,recipient,payload,task_id,in_reply_to,created_at)"
@@ -433,7 +695,6 @@ def answer_message(state: State, message_id: int, text: str) -> dict:
             (protocol.ANSWER, agent_id, json.dumps({"answer": text}),
              question["task_id"], question["id"], now),
         )
-        state.db.execute("UPDATE message SET delivered=1 WHERE id=?", (question["id"],))
         state.db.execute("UPDATE agent SET state='runnable', updated_at=? WHERE id=?",
                          (now, agent_id))
         if question["task_id"]:

@@ -70,6 +70,39 @@ integrity-checked snapshot with a versioned manifest. `restore` verifies that
 manifest before it creates a fresh home and always creates `STOP`; inspect and
 explicitly run `nc resume` only when recovery is complete.
 
+### Optional unattended backups
+
+Unattended backup is deliberately off after bootstrap. Select and mount a
+destination yourself (credentials and mount configuration remain outside this
+repository), then set `backup_destination` and optionally `backup_retain` in
+`$NC_HOME/config.json`. The directory must already exist, must not be a
+symlink, and must report a different device from `NC_HOME`; the worker refuses
+to create a fallback directory if the mount is absent. A different device ID
+is only a useful guardrail: it cannot prove physical independence (for example,
+two devices may share a controller or failure domain).
+
+Install `deploy/neocortex-backup.service` and
+`deploy/neocortex-backup.timer` using your normal owner-managed systemd
+procedure, then explicitly enable `neocortex-backup.timer`. It polls at most
+once per 60 seconds and coalesces all committed owner feedback, proposal
+creation/decision/revision, and accepted-task events into one incremental,
+verified store snapshot. It does not run agents and ignores queue/STOP state.
+It also takes a recovery-point snapshot at least every 15 minutes (systemd's
+`Persistent=true` catches a missed timer run). Thus an outage can leave recent
+state unprotected for the outage plus the polling interval; foreground work is
+never rolled back. Monitor `nc backup-status`: it is nonzero for missing,
+unknown, failed, or older-than-30-minute backups. Errors are logged to the
+journal even if SQLite is unavailable.
+
+Retention is the configured number of successful incremental manifests
+(default 96); capacity planning must include the retained unique blocks.
+Periodically restore a recent snapshot into a **temporary empty home**, inspect
+`nc feedback` history and proposal/revision lineage there, and discard that
+temporary home after the drill. Do not restore over a live source. SSH or
+object-storage replication of completed stores, and SQLite replication, are
+reasonable alternatives where their operational guarantees fit better; they
+are not implemented by this runner.
+
 This is database consistency, not a cross-resource checkpoint. Git history,
 runtime logs and checks, worktrees, and uncommitted changes are outside the
 snapshot. Before resuming, stop scheduler, timer, and UI writers; recover Git

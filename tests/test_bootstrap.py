@@ -97,6 +97,17 @@ def test_bootstrap_rerun_preserves_config_and_does_not_reinstall(tmp_path):
     assert log.read_text() == first_calls  # rerun made no package/vendor/unit calls
 
 
+def test_bootstrap_emits_fresh_host_login_guidance(tmp_path):
+    env, _ = environment(tmp_path)
+    prepared_runner(tmp_path, env)
+
+    result = subprocess.run([str(SCRIPT)], env=env, text=True, capture_output=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert "run 'codex login' and 'claude auth login'" in result.stdout
+    assert "then " + str(SCRIPT) + " --enable-timer" in result.stdout
+
+
 def test_bootstrap_rejects_unsupported_host_before_commands(tmp_path):
     env, log = environment(tmp_path)
     unsupported = Path(env["OS_RELEASE"])

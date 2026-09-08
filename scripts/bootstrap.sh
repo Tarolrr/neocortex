@@ -154,9 +154,9 @@ install_units() {
     if [ "$ENABLE_TIMER" = true ]; then
         [ ! -e "$NC_HOME/STOP" ] || fail "STOP exists; run nc resume before enabling the timer"
         service_command codex || fail "codex is unavailable on the service PATH; run codex login first"
-        service_command claude || fail "claude is unavailable on the service PATH; run claude login first"
+        service_command claude || fail "claude is unavailable on the service PATH; run claude auth login first"
         service_run codex login status >/dev/null 2>&1 || fail "codex is not logged in; run codex login first"
-        service_run claude auth status >/dev/null 2>&1 || fail "claude is not logged in; run claude login first"
+        service_run claude auth status >/dev/null 2>&1 || fail "claude is not logged in; run claude auth login first"
         "$SYSTEMCTL" enable --now neocortex.timer
     fi
 }
@@ -169,4 +169,4 @@ install_runner
 mkdir -p "$NC_HOME"
 if [ ! -f "$NC_HOME/config.json" ]; then "$RUNNER/.venv/bin/nc" init; else "$RUNNER/.venv/bin/nc" health >/dev/null; fi
 install_units
-echo "bootstrap: ready; run 'codex login' and 'claude login', then $0 --enable-timer"
+echo "bootstrap: ready; run 'codex login' and 'claude auth login', then $0 --enable-timer"

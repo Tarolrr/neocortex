@@ -207,7 +207,7 @@ Log in after bootstrap (credentials are never supplied to the script):
 
 ```bash
 codex login
-claude login
+claude auth login
 sudo scripts/bootstrap.sh --enable-timer
 ```
 

@@ -534,6 +534,44 @@ def test_configured_host_allows_same_origin_mutation(browser):
         thread.join(timeout=3)
 
 
+def _raw_http(server, request: bytes) -> bytes:
+    """Send headers that http.client deliberately normalizes away."""
+    with socket.create_connection(server.server_address, timeout=3) as connection:
+        connection.sendall(request)
+        chunks = []
+        while chunk := connection.recv(4096):
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def test_raw_duplicate_and_malformed_host_or_origin_headers_are_rejected(browser):
+    _, _, tid, server, _ = browser
+    port = server.server_port
+    duplicate_host = _raw_http(server, (
+        f"GET /projects HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        f"Host: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    ).encode())
+    malformed_host = _raw_http(server, b"GET /projects HTTP/1.1\r\n"
+                               b"Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+    duplicate_origin = _raw_http(server, (
+        f"POST /t/{tid}/cancel HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        f"Origin: http://127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n"
+        "Content-Length: 0\r\nConnection: close\r\n\r\n"
+    ).encode())
+    malformed_origin = _raw_http(server, (
+        f"POST /t/{tid}/cancel HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        "Origin: https://127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    ).encode())
+    for response, status, message in (
+        (duplicate_host, b"400 Bad Request", b"invalid or missing Host header"),
+        (malformed_host, b"400 Bad Request", b"invalid or missing Host header"),
+        (duplicate_origin, b"403 Forbidden", b"invalid or missing Origin header"),
+        (malformed_origin, b"403 Forbidden", b"invalid or missing Origin header"),
+    ):
+        assert response.startswith(b"HTTP/1.0 " + status)
+        assert message in response
+
+
 @pytest.mark.parametrize("host,allowed,error", [
     ("0.0.0.0", (), "requires at least one"),
     ("[::1]", (), "IPv6 is unsupported"),
@@ -549,6 +587,50 @@ def test_ui_host_configuration_rejects_unsafe_values(tmp_path, host, allowed, er
 def test_ui_rejects_invalid_ports(tmp_path, port):
     with pytest.raises(ValueError, match="0 through 65535"):
         make_server(Config.load(tmp_path), port)
+
+
+def test_make_server_uses_ipv4_resolution_for_a_resolvable_network_hostname(tmp_path, monkeypatch):
+    from nc import ui
+
+    calls = []
+
+    class FakeServer:
+        def __init__(self, address, handler):
+            calls.append((address, handler))
+            self.server_port = 41234
+
+    monkeypatch.setattr(ui.socket, "getaddrinfo", lambda *args: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.55", args[1])),
+    ])
+    monkeypatch.setattr(ui, "Server", FakeServer)
+    server = ui.make_server(Config.load(tmp_path), 0, host="console.example.test",
+                            allowed_hosts=("console.example.test",))
+    assert calls == [(("192.0.2.55", 0), Handler)]
+    assert server.allowed_hosts == {"console.example.test:41234"}
+
+
+def test_cli_ui_reports_resolver_and_bind_failures_concisely(tmp_path, monkeypatch, capsys):
+    from nc import cli, ui
+
+    original_getaddrinfo = socket.getaddrinfo
+
+    def cannot_resolve(*args):
+        raise socket.gaierror("name lookup failed")
+
+    monkeypatch.setattr(ui.socket, "getaddrinfo", cannot_resolve)
+    assert cli.main(["ui", "--home", str(tmp_path), "--host", "console.example.test"]) == 2
+    assert capsys.readouterr().err == (
+        "nc ui: cannot resolve UI host 'console.example.test': name lookup failed\n"
+    )
+
+    class BindFailure:
+        def __init__(self, address, handler):
+            raise OSError("Address already in use")
+
+    monkeypatch.setattr(ui.socket, "getaddrinfo", original_getaddrinfo)
+    monkeypatch.setattr(ui, "Server", BindFailure)
+    assert cli.main(["ui", "--home", str(tmp_path), "--port", "8765"]) == 2
+    assert capsys.readouterr().err == "nc ui: Address already in use\n"
 
 
 def test_ui_service_template_matches_documented_cli():

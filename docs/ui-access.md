@@ -2,24 +2,77 @@
 
 Initialize an isolated home with `nc --home /path/to/home init`, register projects
 using the CLI, then run `nc ui --home /path/to/home --port 8765`. `NC_HOME` is used
-when `--home` is omitted. Open http://127.0.0.1:8765 and select a project.
-Stop the foreground server with Ctrl+C. Assets ship with the Python package;
-there is no frontend build or external asset service.
+when `--home` is omitted. Its default bind is `127.0.0.1`; open
+http://127.0.0.1:8765 and select a project. Port `0` is permitted for an
+ephemeral local test port. Stop the foreground server with Ctrl+C. Assets ship
+with the Python package; there is no frontend build or external asset service.
 
-The server binds only to IPv4 loopback. For a remote host, run the UI there and
-forward the same port from your laptop:
+For remote access, keep the default loopback bind and forward the same port from
+your laptop:
 
 ```sh
 ssh -N -L 8765:127.0.0.1:8765 user@host
 ```
 
 Then open http://127.0.0.1:8765 locally. Use the same local and remote port so
-Host and Origin validation succeeds. Do not publish the port through a reverse
-proxy. This console trusts local users; it is not a multi-user authentication
-service. Session cookies and CSRF tokens last until the server stops. Mutations
-require POST, a session token, and matching Host/Origin. GET pages use independent
-SQLite connections without schema initialization. Busy writes return HTTP 503
-with a retry hint.
+Host and Origin validation succeeds. This remains the default remote-access
+method.
+
+For an owner-controlled trusted network only, bind an explicit IPv4 address or
+resolvable IPv4 hostname and authorize the exact browser hostname/address:
+
+```sh
+nc ui --host 192.0.2.10 --port 8765 --allowed-host 192.0.2.10
+```
+
+`--allowed-host` is repeatable. Each value is an exact concrete browser hostname
+or IPv4 literal: no scheme, path, port, wildcard, or IPv6 syntax. IPv6 is not
+supported and is rejected clearly. Requests must use exactly one `Host` header
+with one configured value and the actual listening port; `Origin` must likewise
+be exactly `http://HOST:PORT`. `localhost` and `127.0.0.1` remain accepted for
+the default local server, and a concrete `--host` is accepted automatically.
+`--host 0.0.0.0` requires at least one explicit `--allowed-host`; it is a bind
+address, not a browser destination. Forwarded headers are never trusted.
+
+Host and Origin checks, session cookies, and CSRF tokens protect browser request
+shape; they do not authenticate clients or restrict who can connect. The UI has
+no authentication or TLS, and network clients can exercise owner actions. Use
+only an owner-controlled trusted network or an SSH tunnel. Public hosting and
+reverse-proxy support are not implemented. Session cookies and CSRF tokens last
+until the server stops. Mutations require POST, a session token, and matching
+Host/Origin. GET pages use independent SQLite connections without schema
+initialization. Busy writes return HTTP 503 with a retry hint.
+
+## Optional systemd UI service
+
+`deploy/neocortex-ui.service` is deliberately independent of the queue timer,
+so it remains available while `STOP` pauses agent work. Install it using your
+normal owner-managed procedure, then enable and start it:
+
+```sh
+sudo install -m 0644 deploy/neocortex-ui.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now neocortex-ui.service
+systemctl status neocortex-ui.service
+journalctl -u neocortex-ui.service -f
+```
+
+It defaults to `NC_HOME=/root/.neocortex` and `127.0.0.1:8765`. Customize the
+home, bind, port, and allowed hosts with an override (repeat `--allowed-host`
+as needed):
+
+```ini
+# sudo systemctl edit neocortex-ui.service
+[Service]
+Environment=NC_HOME=/srv/neocortex
+ExecStart=
+ExecStart=/opt/neocortex-runner/.venv/bin/nc ui --host 192.0.2.10 --port 8765 --allowed-host 192.0.2.10
+```
+
+After changing it, run `sudo systemctl daemon-reload` and
+`sudo systemctl restart neocortex-ui.service`. To stop and remove automatic
+startup, run `sudo systemctl disable --now neocortex-ui.service`. This task does
+not install, enable, restart, or otherwise alter live services.
 
 # Phase-one action mapping
 
@@ -95,8 +148,8 @@ For an exhausted task such as T024, use an owner reason and a larger budget, for
 example `nc requeue neocortex-T024 --budget 8 --reason "continue after reviewed interruption"`.
 Recovery itself never does this. UI deployment templates and the deployment
 runbook remain queued in T027 behind T026/T024; this document only describes the
-current loopback UI and SSH forwarding access, and makes no claim about host
-settings already installed.
+current UI deployment is documented above; it does not imply any host settings
+are already installed.
 
 To check packaging in a disposable environment, build and install a wheel, then
 run that environment's Python with `-I scripts/check_installed_ui.py`. The check

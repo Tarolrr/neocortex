@@ -79,18 +79,24 @@ Crash sequences: pre-commit leaves pending; post-commit/pre-response retry finds
 
 Session-classification (consistent exit/timeout treatment) and local plan-review deferral are immediately actionable but separate; neither is implemented here. Envelope/runtime migration needs a later proposal.
 
-This is an unexecuted stopped-system owner/agent runbook for that later proposal:
+This is an unexecuted stopped-system owner/agent runbook for that later proposal.  It
+must be run by the deployment owner (root, or an account with passwordless/suitable
+`sudo` authority for these units and write access to `NC_DB`) during a maintenance
+window.  Stop both timers *and* any already-started services before touching the
+database: stopping a timer prevents the next activation but does not stop a service
+that it has already activated.
 
 ```sh
 NC_DB="${NC_HOME:-/root/.neocortex}/state.db"
 test -f "$NC_DB" && sqlite3 "$NC_DB" 'PRAGMA integrity_check; PRAGMA foreign_key_check;'
-systemctl stop neocortex-scheduler neocortex-ui neocortex-backup
+sudo systemctl stop neocortex.timer neocortex-backup.timer
+sudo systemctl stop neocortex.service neocortex-backup.service
 sqlite3 "$NC_DB" ".backup '${NC_DB}.pre-envelope-$(date -u +%Y%m%dT%H%M%SZ).sqlite'"
 sqlite3 "$NC_DB" 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA integrity_check;'
 sqlite3 "$NC_DB" 'SELECT "message",count(*) FROM message UNION ALL SELECT "run",count(*) FROM run UNION ALL SELECT "incident",count(*) FROM incident UNION ALL SELECT "proposal",count(*) FROM proposal UNION ALL SELECT "plan_review",count(*) FROM plan_review UNION ALL SELECT "proposal_revision",count(*) FROM proposal_revision;'
 sqlite3 "$NC_DB" 'SELECT original_id,feedback_id,planner_id,replacement_id FROM proposal_revision ORDER BY original_id;'
 ```
 
-In one `BEGIN IMMEDIATE` transaction, future additive DDL creates `exchange_envelope(id TEXT PRIMARY KEY,legacy_table TEXT,legacy_id INTEGER,schema INTEGER NOT NULL,correlation TEXT NOT NULL,UNIQUE(legacy_table,legacy_id))`, `exchange_receipt(envelope_id TEXT PRIMARY KEY,applied_at REAL NOT NULL,result TEXT NOT NULL)`, and `execution_attempt(id TEXT PRIMARY KEY,logical_work_id TEXT NOT NULL,attempt_no INTEGER NOT NULL,status TEXT NOT NULL,run_id INTEGER,UNIQUE(logical_work_id,attempt_no))`. Backfill schema-0 envelopes for legacy message/run IDs and review work/spec hashes, never rewriting legacy IDs, payloads, delivered flags, proposals, or revision links. Commit only after checks; otherwise rollback.
+In one `BEGIN IMMEDIATE` transaction, future additive DDL creates `exchange_envelope(id TEXT PRIMARY KEY,legacy_table TEXT,legacy_id INTEGER,schema INTEGER NOT NULL,correlation TEXT NOT NULL,UNIQUE(legacy_table,legacy_id))`, `exchange_receipt(envelope_id TEXT PRIMARY KEY,applied_at REAL NOT NULL,result TEXT NOT NULL)`, and `execution_attempt(id TEXT PRIMARY KEY,logical_work_id TEXT NOT NULL,attempt_no INTEGER NOT NULL,status TEXT NOT NULL,run_id INTEGER,UNIQUE(logical_work_id,attempt_no))`. Backfill schema-0 envelopes only for legacy routed message/fact rows (initially `message` IDs); run records stay runs, and plan-review work stays in its dedicated logical-work/review records, linked by correlation when a routed fact refers to either. Never rewrite legacy IDs, payloads, delivered flags, proposals, or revision links. Commit only after checks; otherwise rollback.
 
-Restart gates: both PRAGMAs pass; six baseline counts and saved revision tuples are unchanged; envelope count equals chosen population; no duplicate legacy map. Enable dual read/write behind a flag, smoke-read, start services one at a time. Rollback: stop writers, disable flag, move failed DB aside, restore exact recorded backup with `sqlite3 "$NC_DB" ".restore 'BACKUP_PATH'"`, rerun PRAGMAs/counts, then restart. IDs/history are preserved; this document does not authorize migration.
+Restart gates: both PRAGMAs pass; six baseline counts and saved revision tuples are unchanged; envelope count equals the chosen routed-message/fact population; no duplicate legacy map. Enable dual read/write behind a flag, smoke-read, then resume normal scheduling with `sudo systemctl start neocortex.service neocortex-backup.service` followed by `sudo systemctl start neocortex.timer neocortex-backup.timer`. Rollback: stop the same timers and services, disable flag, move failed DB aside, restore exact recorded backup with `sqlite3 "$NC_DB" ".restore 'BACKUP_PATH'"`, rerun PRAGMAs/counts, then start those same services followed by timers. IDs/history are preserved; this document does not authorize migration.

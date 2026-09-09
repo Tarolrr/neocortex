@@ -567,7 +567,11 @@ def cmd_status(args) -> int:
 
 def cmd_ui(args) -> int:
     from .ui import serve
-    serve(Config.load(args.home), args.port)
+    try:
+        serve(Config.load(args.home), args.port, args.host, tuple(args.allowed_host))
+    except (OSError, ValueError) as exc:
+        print(f"nc ui: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -577,9 +581,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("ui", help="serve the local owner browser interface")
+    sp = sub.add_parser("ui", help="serve the owner browser interface")
     sp.add_argument("--home", type=Path, default=argparse.SUPPRESS)
     sp.add_argument("--port", type=int, default=8765)
+    sp.add_argument("--host", default="127.0.0.1",
+                    help="IPv4 address or resolvable hostname to bind (default: 127.0.0.1)")
+    sp.add_argument("--allowed-host", action="append", default=[], metavar="HOST",
+                    help="browser hostname or IPv4 address allowed in Host headers (repeatable)")
     sp.set_defaults(func=cmd_ui)
 
     sub.add_parser("init").set_defaults(func=cmd_init)

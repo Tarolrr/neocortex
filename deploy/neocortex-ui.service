@@ -1,0 +1,15 @@
+[Unit]
+Description=Neocortex owner browser UI
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/neocortex-runner
+Environment=NC_HOME=/root/.neocortex
+Environment=PATH=/opt/neocortex-runner/.venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/neocortex-runner/.venv/bin/nc ui --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

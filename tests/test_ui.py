@@ -5,6 +5,7 @@ import socket
 import subprocess
 import threading
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
@@ -463,7 +464,7 @@ def test_feedback_proposal_decisions_and_answers(browser):
     assert state.one("SELECT delivered FROM message WHERE id=?", (mid,))[0] == 1
 
 
-def test_cli_ui_explicit_home_port_and_shutdown(tmp_path, monkeypatch):
+def test_cli_ui_explicit_home_port_and_shutdown(tmp_path, monkeypatch, capsys):
     from nc import cli, ui
 
     monkeypatch.setenv("NC_HOME", str(tmp_path / "unused"))
@@ -486,7 +487,157 @@ def test_cli_ui_explicit_home_port_and_shutdown(tmp_path, monkeypatch):
     monkeypatch.setattr(ui, "make_server", make)
     assert cli.main(["ui", "--home", str(home), "--port", "0"]) == 0
     assert servers[0].socket.fileno() == -1
+    assert f"serving on 127.0.0.1:{servers[0].server_port}" in capsys.readouterr().out
     assert not (tmp_path / "unused").exists()
+
+
+def test_cli_ui_forwards_explicit_host_options(tmp_path, monkeypatch):
+    from nc import cli, ui
+
+    calls = []
+    monkeypatch.setattr(ui, "serve", lambda *args: calls.append(args))
+    assert cli.main(["ui", "--home", str(tmp_path), "--host", "0.0.0.0",
+                     "--port", "0", "--allowed-host", "owner.test"]) == 0
+    assert calls[0][1:] == (0, "0.0.0.0", ("owner.test",))
+
+
+def test_configured_host_allows_same_origin_mutation(browser):
+    _, state, tid, _, _ = browser
+    server = make_server(Config.load(), 0, host="127.0.0.1", allowed_hosts=("owner.test",))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def request(path, method="GET", form=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+        body = urllib.parse.urlencode(form or {}) if method == "POST" else None
+        merged = {"Host": f"owner.test:{server.server_port}", "Connection": "close"}
+        if method == "POST":
+            merged["Content-Type"] = "application/x-www-form-urlencoded"
+        merged.update(headers or {})
+        conn.request(method, path, body=body, headers=merged)
+        response = conn.getresponse()
+        result = response.status, dict(response.getheaders()), response.read().decode()
+        conn.close()
+        return result
+
+    try:
+        _, headers, body = request(f"/t/{tid}")
+        token = re.search(r'name="csrf_token" value="([^"]+)"', body)[1]
+        valid = {"Cookie": headers["Set-Cookie"].split(";", 1)[0],
+                 "Origin": f"http://owner.test:{server.server_port}"}
+        assert request(f"/t/{tid}/cancel", "POST", {"csrf_token": token, "reason": "ok"}, valid)[0] == 303
+        assert state.one("SELECT status FROM task WHERE id=?", (tid,))["status"] == "cancelled"
+        assert request("/projects", headers={"Host": f"evil.test:{server.server_port}"})[0] == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def _raw_http(server, request: bytes) -> bytes:
+    """Send headers that http.client deliberately normalizes away."""
+    with socket.create_connection(server.server_address, timeout=3) as connection:
+        connection.sendall(request)
+        chunks = []
+        while chunk := connection.recv(4096):
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def test_raw_duplicate_and_malformed_host_or_origin_headers_are_rejected(browser):
+    _, _, tid, server, _ = browser
+    port = server.server_port
+    duplicate_host = _raw_http(server, (
+        f"GET /projects HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        f"Host: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    ).encode())
+    malformed_host = _raw_http(server, b"GET /projects HTTP/1.1\r\n"
+                               b"Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+    duplicate_origin = _raw_http(server, (
+        f"POST /t/{tid}/cancel HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        f"Origin: http://127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n"
+        "Content-Length: 0\r\nConnection: close\r\n\r\n"
+    ).encode())
+    malformed_origin = _raw_http(server, (
+        f"POST /t/{tid}/cancel HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        "Origin: https://127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    ).encode())
+    for response, status, message in (
+        (duplicate_host, b"400 Bad Request", b"invalid or missing Host header"),
+        (malformed_host, b"400 Bad Request", b"invalid or missing Host header"),
+        (duplicate_origin, b"403 Forbidden", b"invalid or missing Origin header"),
+        (malformed_origin, b"403 Forbidden", b"invalid or missing Origin header"),
+    ):
+        assert response.startswith(b"HTTP/1.0 " + status)
+        assert message in response
+
+
+@pytest.mark.parametrize("host,allowed,error", [
+    ("0.0.0.0", (), "requires at least one"),
+    ("[::1]", (), "IPv6 is unsupported"),
+    ("127.0.0.1", ("https://evil.test",), "without scheme"),
+    ("127.0.0.1", ("0.0.0.0",), "concrete"),
+])
+def test_ui_host_configuration_rejects_unsafe_values(tmp_path, host, allowed, error):
+    with pytest.raises(ValueError, match=error):
+        make_server(Config.load(tmp_path), 0, host=host, allowed_hosts=allowed)
+
+
+@pytest.mark.parametrize("port", [-1, 65536])
+def test_ui_rejects_invalid_ports(tmp_path, port):
+    with pytest.raises(ValueError, match="0 through 65535"):
+        make_server(Config.load(tmp_path), port)
+
+
+def test_make_server_uses_ipv4_resolution_for_a_resolvable_network_hostname(tmp_path, monkeypatch):
+    from nc import ui
+
+    calls = []
+
+    class FakeServer:
+        def __init__(self, address, handler):
+            calls.append((address, handler))
+            self.server_port = 41234
+
+    monkeypatch.setattr(ui.socket, "getaddrinfo", lambda *args: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.55", args[1])),
+    ])
+    monkeypatch.setattr(ui, "Server", FakeServer)
+    server = ui.make_server(Config.load(tmp_path), 0, host="console.example.test",
+                            allowed_hosts=("console.example.test",))
+    assert calls == [(("192.0.2.55", 0), Handler)]
+    assert server.allowed_hosts == {"console.example.test:41234"}
+
+
+def test_cli_ui_reports_resolver_and_bind_failures_concisely(tmp_path, monkeypatch, capsys):
+    from nc import cli, ui
+
+    original_getaddrinfo = socket.getaddrinfo
+
+    def cannot_resolve(*args):
+        raise socket.gaierror("name lookup failed")
+
+    monkeypatch.setattr(ui.socket, "getaddrinfo", cannot_resolve)
+    assert cli.main(["ui", "--home", str(tmp_path), "--host", "console.example.test"]) == 2
+    assert capsys.readouterr().err == (
+        "nc ui: cannot resolve UI host 'console.example.test': name lookup failed\n"
+    )
+
+    class BindFailure:
+        def __init__(self, address, handler):
+            raise OSError("Address already in use")
+
+    monkeypatch.setattr(ui.socket, "getaddrinfo", original_getaddrinfo)
+    monkeypatch.setattr(ui, "Server", BindFailure)
+    assert cli.main(["ui", "--home", str(tmp_path), "--port", "8765"]) == 2
+    assert capsys.readouterr().err == "nc ui: Address already in use\n"
+
+
+def test_ui_service_template_matches_documented_cli():
+    unit = (Path(__file__).parents[1] / "deploy" / "neocortex-ui.service").read_text()
+    assert "Type=simple" in unit
+    assert "ExecStart=/opt/neocortex-runner/.venv/bin/nc ui --host 127.0.0.1 --port 8765" in unit
+    assert "Restart=on-failure" in unit and "WantedBy=multi-user.target" in unit
 
 
 @pytest.mark.parametrize("action", ["fresh", "rollback"])

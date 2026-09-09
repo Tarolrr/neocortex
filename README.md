@@ -478,3 +478,9 @@ receive revision requests. If planning asks a question, answer with `nc answer`;
 after a failed session, `nc plan PROJECT` retries with the revision context intact.
 
 Local browser console: see [UI access and action mapping](docs/ui-access.md).
+It binds to `127.0.0.1:8765` by default; SSH forwarding is the default remote
+access method. A trusted-network bind requires an explicit `--host` and matching
+`--allowed-host`; the UI provides neither authentication nor TLS, so it is not
+for public hosting or an untrusted reverse proxy. The optional
+`deploy/neocortex-ui.service` is documented there and runs independently of the
+queue timer and `STOP` state.

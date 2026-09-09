@@ -1,4 +1,4 @@
-"""Local browser UI: a loopback-only, server-rendered owner console.
+"""Server-rendered owner browser console.
 
 Phase one deliberately stays small:
 
@@ -10,7 +10,8 @@ Phase one deliberately stays small:
   an image/link embedded on some other site) cannot drive a change here.
 - Every request opens and closes its own `State` (its own SQLite connection);
   nothing is held across requests. See `docs/ui-access.md` for local and
-  SSH-tunnel access, and `docs/follow-ups.md` for what phase one defers
+  SSH-tunnel and explicitly configured trusted-network access, and
+  `docs/follow-ups.md` for what phase one defers
   (scheduler administration, incidents, project administration).
 
 This module never shells out and never starts an agent turn or session: it
@@ -22,10 +23,12 @@ from __future__ import annotations
 
 import html
 import http.server
+import ipaddress
 import json
 import logging
 import re
 import secrets
+import socket
 import sqlite3
 import subprocess
 import urllib.parse
@@ -509,8 +512,39 @@ def _is_contention(exc: sqlite3.OperationalError) -> bool:
     return "locked" in str(exc).lower() or "busy" in str(exc).lower()
 
 
-def _allowed_hosts(port: int) -> set[str]:
-    return {f"127.0.0.1:{port}", f"localhost:{port}"}
+_HOSTNAME_RE = re.compile(
+    r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
+)
+
+
+def _concrete_host(value: str, option: str) -> str:
+    """Validate a browser Host name, deliberately excluding IPv6 for now."""
+    if not value or value != value.strip() or "://" in value or any(c in value for c in "/@?#"):
+        raise ValueError(f"{option} must be a hostname or IPv4 address without scheme, path, or port")
+    if any(c in value for c in ":[]"):
+        raise ValueError(f"{option}: IPv6 is unsupported")
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError:
+        if not _HOSTNAME_RE.fullmatch(value):
+            raise ValueError(f"{option} must be a hostname or IPv4 address without scheme, path, or port")
+        return value
+    if parsed.version != 4:
+        raise ValueError(f"{option}: IPv6 is unsupported")
+    if parsed.is_unspecified:
+        raise ValueError(f"{option} must be a concrete browser hostname or IPv4 address")
+    return value
+
+
+def _validate_port(port: int) -> int:
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+        raise ValueError("port must be an integer from 0 through 65535")
+    return port
+
+
+def _allowed_hosts(port: int, configured: tuple[str, ...] = ()) -> set[str]:
+    return {f"{host}:{port}" for host in configured}
 
 
 Route = tuple[str, re.Pattern, Callable]
@@ -988,7 +1022,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if len(self.headers.get_all("Host", [])) != 1:
             return False
         host = self.headers.get("Host", "")
-        return host in _allowed_hosts(self.server.server_port)  # type: ignore[attr-defined]
+        return host in self.server.allowed_hosts  # type: ignore[attr-defined]
 
     def _valid_origin(self) -> bool:
         if len(self.headers.get_all("Origin", [])) != 1:
@@ -1070,20 +1104,54 @@ class Server(http.server.HTTPServer):
     cfg: Config
     sessions: dict[str, str]
     db_timeout: float
+    allowed_hosts: set[str]
 
 
-def make_server(cfg: Config, port: int, db_timeout: float = REQUEST_TIMEOUT_S) -> Server:
-    """Bind loopback-only; nothing here ever listens on a non-loopback address."""
-    server = Server(("127.0.0.1", port), Handler)
+def make_server(
+    cfg: Config, port: int, db_timeout: float = REQUEST_TIMEOUT_S,
+    host: str = "127.0.0.1", allowed_hosts: tuple[str, ...] = (),
+) -> Server:
+    """Create an IPv4 server; network exposure is explicit and host-restricted.
+
+    ``db_timeout`` remains the third positional argument for existing callers.
+    IPv6 is rejected rather than falling through to an unintended address family.
+    """
+    port = _validate_port(port)
+    bind_host = _concrete_host(host, "--host") if host != "0.0.0.0" else host
+    configured = tuple(_concrete_host(value, "--allowed-host") for value in allowed_hosts)
+    if bind_host == "0.0.0.0" and not configured:
+        raise ValueError("--host 0.0.0.0 requires at least one --allowed-host")
+    # Resolve before constructing HTTPServer so hostname failures are concise and
+    # never allow IPv6 to be selected by the platform resolver.
+    try:
+        resolved = socket.getaddrinfo(bind_host, port, socket.AF_INET, socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise OSError(f"cannot resolve UI host {bind_host!r}: {exc}") from exc
+    if not resolved:
+        raise OSError(f"cannot resolve UI host {bind_host!r}")
+    server = Server((resolved[0][4][0], port), Handler)
     server.cfg = cfg
     server.sessions = {}
     server.db_timeout = db_timeout
+    access_hosts = (("127.0.0.1", "localhost", *configured) if bind_host == "127.0.0.1"
+                    else configured + (() if bind_host == "0.0.0.0" else (bind_host,)))
+    server.allowed_hosts = _allowed_hosts(server.server_port, access_hosts)
     return server
 
 
-def serve(cfg: Config, port: int) -> None:
-    httpd = make_server(cfg, port)
-    print(f"serving http://127.0.0.1:{httpd.server_port} (loopback only; Ctrl+C to stop)")
+def serve(
+    cfg: Config, port: int, host: str = "127.0.0.1", allowed_hosts: tuple[str, ...] = (),
+) -> None:
+    # Keep the historic two-argument construction path intact for embedders
+    # which wrap ``make_server`` to run a short-lived local server in tests.
+    httpd = (make_server(cfg, port) if host == "127.0.0.1" and not allowed_hosts
+             else make_server(cfg, port, host=host, allowed_hosts=allowed_hosts))
+    destinations = sorted(http_host.rsplit(":", 1)[0] for http_host in httpd.allowed_hosts)
+    print(
+        f"serving on {host}:{httpd.server_port}; browser Host values: "
+        f"{', '.join(destinations)} (Ctrl+C to stop)",
+        flush=True,
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

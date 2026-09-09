@@ -230,8 +230,7 @@ def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
     # Keep the disposable checkout on the project's filesystem rather than
     # shared /tmp, which can be unavailable even when the runner is healthy.
     scratch: Path | None = None
-    added = False
-    results: list[CheckResult] | None = None
+    results: list[CheckResult] = []
     try:
         # `worktree add` requires a nonexistent destination.  Treat failures
         # allocating or clearing that destination as a normal readiness
@@ -244,18 +243,20 @@ def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
                                   env=env)
         names = branches.stdout.splitlines()
         if branches.returncode:
-            return [CheckResult(test_cmd, False, branches.stderr.strip())]
+            results.append(CheckResult(test_cmd, False, branches.stderr.strip()))
+            return results
         base = "main" if "main" in names else "master" if "master" in names else subprocess.run(
             [git_path, "branch", "--show-current"], cwd=repo, capture_output=True, text=True,
             timeout=300, check=False, env=env).stdout.strip()
         if not base:
-            return [CheckResult(test_cmd, False, "cannot detect a base branch")]
+            results.append(CheckResult(test_cmd, False, "cannot detect a base branch"))
+            return results
         proc = subprocess.run([git_path, "worktree", "add", "--detach", str(scratch), base],
                               cwd=repo, capture_output=True, text=True, timeout=300,
                               check=False, env=env)
         if proc.returncode:
-            return [CheckResult(test_cmd, False, proc.stderr.strip())]
-        added = True
+            results.append(CheckResult(test_cmd, False, proc.stderr.strip()))
+            return results
         results = run_checks(scratch, [test_cmd], timeout_s, env)
         # A source checkout of Neocortex must import itself, not an unrelated
         # installed copy.  Other projects do not have this package contract.
@@ -271,11 +272,16 @@ def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
                                            f"timed out after {timeout_s}s"))
         return results
     except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
-        return [CheckResult(test_cmd, False, str(exc))]
+        results.append(CheckResult(test_cmd, False, str(exc)))
+        return results
     finally:
-        if scratch is not None and added:
+        # `git worktree add` can create a checkout or registration before it
+        # reports a failure/timeout.  The mkdtemp directory itself can also
+        # survive a failed rmdir.  Clean the exact allocated path regardless
+        # of which setup step completed.
+        if scratch is not None:
             cleanup_error = _remove_readiness_worktree(repo, scratch, git_path, env)
-            if cleanup_error and results is not None:
+            if cleanup_error:
                 results.append(CheckResult("readiness scratch cleanup", False, cleanup_error))
 
 

@@ -107,6 +107,27 @@ def test_readiness_reports_scratch_setup_errors(tmp_path, monkeypatch, failure):
     assert "nc-readiness-" not in listing
 
 
+def test_readiness_cleans_partial_worktree_add_failure(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    original_run = arbiter.subprocess.run
+
+    def add_then_report_failure(args, *args_, **kwargs):
+        result = original_run(args, *args_, **kwargs)
+        if args[1:3] == ["worktree", "add"]:
+            return subprocess.CompletedProcess(args, 1, result.stdout, "simulated add failure")
+        return result
+
+    monkeypatch.setattr(arbiter.subprocess, "run", add_then_report_failure)
+
+    result = arbiter.readiness_check(repo, "true", timeout_s=5)[0]
+
+    assert not result.ok
+    assert not list(repo.parent.glob("nc-readiness-*"))
+    listing = original_run(["git", "worktree", "list", "--porcelain"], cwd=repo,
+                           capture_output=True, text=True, check=True).stdout
+    assert "nc-readiness-" not in listing
+
+
 @pytest.mark.parametrize("mode", ["failure", "timeout"])
 def test_readiness_removes_only_its_registration_when_worktree_remove_fails(tmp_path, monkeypatch, mode):
     repo = _repo(tmp_path)

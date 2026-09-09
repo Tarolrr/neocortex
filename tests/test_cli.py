@@ -482,12 +482,15 @@ def test_cli_import_preserves_partial_success_output(gc_project, tmp_path, capsy
     assert capsys.readouterr().out == tid + "\n"
 
 
-def test_run_readiness_failure_is_deduplicated_and_leaves_task_queued(gc_project, monkeypatch):
+def test_run_readiness_failure_is_deduplicated_despite_variable_output_and_leaves_task_queued(
+        gc_project, monkeypatch):
     cfg, state, _ = gc_project
     task = state.add_task("demo", "queued", "objective", [])
     scheduler = __import__("nc.scheduler", fromlist=["Scheduler"]).Scheduler(cfg, state)
     monkeypatch.setattr(scheduler, "preflight", lambda: (True, "model ok"))
-    monkeypatch.setattr(scheduler, "readiness", lambda: (False, "missing pytest"))
+    details = iter(("project demo: test failed after 0.12s in /tmp/one",
+                    "project demo: test failed after 0.43s in /tmp/two"))
+    monkeypatch.setattr(scheduler, "readiness", lambda: (False, next(details)))
 
     assert scheduler.run() is False
     assert scheduler.run() is False

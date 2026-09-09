@@ -85,9 +85,14 @@ class Scheduler:
         return True, "\n".join(reports + ["configured project test commands passed"])
 
     def _host_environment_incident(self, detail: str) -> None:
-        """One open incident per identical host failure, across timer restarts."""
+        """Keep one unresolved host-readiness incident across timer restarts.
+
+        Readiness detail includes command output from a disposable worktree.
+        That output can legitimately contain unstable values (durations and
+        temporary paths), so it must not be used as the deduplication key.
+        """
         if self.state.one("SELECT id FROM incident WHERE kind='host_environment'"
-                          " AND detail=? AND resolved=0", (detail,)) is None:
+                          " AND resolved=0") is None:
             self.state.incident("host_environment", detail)
 
     @staticmethod

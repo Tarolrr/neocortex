@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from . import arbiter, protocol, roles
-from .adapters import Adapter, adapter_ownership
+from .adapters import Adapter, HostAssessment, adapter_ownership, assess_session
 from .config import Config
 from .proposals import check_proposal
 from .state import State
@@ -142,6 +142,20 @@ def _planner_specs(outcome: protocol.Outcome, project_id: str) -> list[dict]:
     return specs
 
 
+def _record_host(state: State, run_id: int, result, assessment: HostAssessment) -> None:
+    state.record_host_assessment(
+        run_id, exit_code=result.exit_code, timed_out=result.timed_out,
+        category=assessment.category, diagnostic=assessment.diagnostic,
+        assessment=assessment.status,
+    )
+
+
+def _host_failure(role: str, assessment: HostAssessment) -> protocol.Outcome:
+    detail = f" ({assessment.diagnostic})" if assessment.diagnostic else ""
+    return protocol.Outcome(kind=protocol.FAIL,
+                            summary=f"{role} host session failed: {assessment.category}{detail}")
+
+
 def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
                      adapter: Adapter) -> protocol.Outcome:
     """Run a project session; only the host records the pending proposal."""
@@ -158,16 +172,27 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
             (time.time(), agent["project_id"]))
     run_session = getattr(adapter, "run_planner", adapter.run)
     tokens = None
+    host_ok = False
     try:
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
         tokens = result.tokens
-        if result.exit_code != 0 or result.timed_out:
-            raise ValueError(f"session exited {result.exit_code}; timed_out={result.timed_out}")
         outcome = protocol.read_outcome(outcome_path)
+        assessment = assess_session(result, adapter.name)
+        _record_host(state, run_id, result, assessment)
+        if assessment.failed:
+            # Keep parsed outcome in the run for diagnosis, but never let it
+            # create a proposal/question or consume planner context.
+            state.end_run(run_id, outcome.kind, outcome.summary, tokens)
+            return _host_failure("Planner", assessment)
+        host_ok = True
     except Exception as exc:
         logging.getLogger(__name__).exception("Planner session failed")
         outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Planner session failure: {exc}")
+        if not host_ok:
+            state.record_host_assessment(run_id, exit_code=None, timed_out=False,
+                                         category="local_error", diagnostic=str(exc),
+                                         assessment="FAILED")
     try:
         if outcome.kind == protocol.DONE:
             specs = _planner_specs(outcome, agent["project_id"])
@@ -210,17 +235,28 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
     model = agent["model"]
     run_id = state.start_run(agent["id"], agent["task_id"], agent["role"], model, str(log_path))
     tokens = None
+    host_ok = False
     try:
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = adapter.run(brief, cwd, model, log_path, cfg.turn_timeout_s)
         tokens = result.tokens
         outcome = protocol.read_outcome(outcome_path)
-        if outcome.kind == protocol.NO_OUTCOME and result.timed_out:
-            outcome.summary = f"turn timed out after {cfg.turn_timeout_s}s without an outcome file"
+        assessment = assess_session(result, adapter.name)
+        _record_host(state, run_id, result, assessment)
+        if assessment.failed:
+            # Persist what the agent wrote separately, then return a host
+            # failure so scheduler handlers cannot apply it.
+            state.end_run(run_id, outcome.kind, outcome.summary, tokens)
+            return _host_failure(agent["role"], assessment)
+        host_ok = True
     except Exception as exc:
         logging.getLogger(__name__).exception("%s session failed", agent["role"])
         outcome = protocol.Outcome(kind=protocol.FAIL,
                                    summary=f"{agent['role']} session failure: {exc}")
+        if not host_ok:
+            state.record_host_assessment(run_id, exit_code=None, timed_out=False,
+                                         category="local_error", diagnostic=str(exc),
+                                         assessment="FAILED")
     # Session exceptions are evidence too.  Do not deliver inbox messages: a
     # retry must retain feedback/questions that were never successfully used.
     state.end_run(run_id, outcome.kind, outcome.summary, tokens)
@@ -274,6 +310,13 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
             result = adapter.run_planner(brief, run_dir, model, log_path, cfg.turn_timeout_s)
         tokens = result.tokens
         outcome = protocol.read_outcome(outcome_path)
+        assessment = assess_session(result, adapter.name)
+        _record_host(state, run_id, result, assessment)
+        if assessment.failed:
+            state.x("UPDATE plan_review SET status='failed', recommendation=? WHERE id=?",
+                    (f"host session failed: {assessment.category}", review_id))
+            state.end_run(run_id, outcome.kind, outcome.summary, tokens)
+            return _host_failure("Plan review", assessment)
         recommendation = outcome.raw.get("recommendation")
         if outcome.kind != protocol.DONE or not isinstance(recommendation, str):
             raise ValueError("plan critic requires DONE with a recommendation")
@@ -287,6 +330,12 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
     except Exception as exc:
         logging.getLogger(__name__).exception("Plan review %s failed", review_id)
         outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Plan review unavailable: {exc}")
+        # A launcher/read/validation failure has no SessionResult evidence.
+        # Do not overwrite structured evidence recorded above.
+        if state.one("SELECT host_assessment FROM run WHERE id=?", (run_id,))["host_assessment"] is None:
+            state.record_host_assessment(run_id, exit_code=None, timed_out=False,
+                                         category="local_error", diagnostic=str(exc),
+                                         assessment="FAILED")
         state.x("UPDATE plan_review SET status='failed', recommendation=? WHERE id=?",
                 (outcome.summary, review_id))
     state.end_run(run_id, outcome.kind, outcome.summary, tokens)

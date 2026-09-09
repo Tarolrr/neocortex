@@ -1152,6 +1152,53 @@ def test_session_exception_finalizes_planner_and_plan_critic_with_context(setup)
     assert "critic exploded" in run["detail"]
 
 
+@pytest.mark.parametrize("role", ["worker", "critic"])
+def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role):
+    """Synthetic terminal evidence must beat a valid agent-authored DONE."""
+    cfg, state, repo = setup
+    task = state.add_task("neocortex", "host evidence", "objective", [])
+    state.set_task(task, status="in_review" if role == "critic" else "in_progress")
+    agent_id = state.add_agent(f"{role}-host", role, "neocortex", task, "model")
+    state.set_agent(agent_id, memo="keep")
+    state.send("feedback", "owner", agent_id, {"text": "keep inbox"}, task)
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "verdict": "pass", "memo": "lose"})])
+    original = adapter.run
+
+    def terminal_error(*args):
+        result = original(*args)
+        result.terminal_category = "overloaded"
+        return result
+
+    adapter.run = terminal_error
+    agent = state.one("SELECT * FROM agent WHERE id=?", (agent_id,))
+    outcome = turn.run_turn(state, cfg, adapter, agent, repo, "main")
+    run = state.one("SELECT * FROM run WHERE agent_id=?", (agent_id,))
+    assert outcome.kind == protocol.FAIL
+    assert run["outcome"] == protocol.DONE and run["host_assessment"] == "FAILED"
+    assert state.one("SELECT memo FROM agent WHERE id=?", (agent_id,))[0] == "keep"
+    assert state.inbox(agent_id)
+
+
+def test_plan_critic_terminal_error_with_zero_exit_cannot_complete_review(setup):
+    cfg, state, _repo = setup
+    proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "recommendation": "yes", "findings": []})])
+    adapter.run_planner = adapter.run
+    original = adapter.run_planner
+
+    def terminal_error(*args):
+        result = original(*args)
+        result.terminal_category = "transient"
+        return result
+
+    adapter.run_planner = terminal_error
+    outcome = turn.run_plan_critic_turn(
+        state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter,
+    )
+    review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+    assert outcome.kind == protocol.FAIL and review["status"] == "failed"
+
+
 @pytest.mark.parametrize('role', ['worker', 'critic', 'capacity'])
 def test_revision_respects_other_work(setup, role):
     cfg, state, _ = setup

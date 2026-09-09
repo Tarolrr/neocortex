@@ -262,7 +262,11 @@ def cmd_why(args) -> int:
             duration += " elapsed"
         print(f"  #{run['id']} agent={run['agent_id']} role={run['role']} "
               f"outcome={run['outcome'] or 'running'} duration={duration} "
-              f"log={run['log_path'] or '(none)'}")
+              f"log={run['log_path'] or '(none)'} "
+              f"host={run['host_assessment'] or 'legacy/unknown'}"
+              f"/{run['terminal_category'] or 'unknown'} "
+              f"exit={run['exit_code'] if run['exit_code'] is not None else 'unknown'} "
+              f"timeout={run['timed_out'] if run['timed_out'] is not None else 'unknown'}")
     if not task["runs"]:
         print("  (none)")
 
@@ -558,6 +562,7 @@ def cmd_status(args) -> int:
         print("\nlast runs:")
         for row in runs:
             print(f"  {row['agent_id']:<28} {row['outcome'] or 'running':<10} "
+                  f"host={row['host_assessment'] or 'legacy/unknown'} "
                   f"{_age(row['started_at'])} ago  {(row['detail'] or '')[:60]}")
     incidents = state.open_incidents()
     if incidents:

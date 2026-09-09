@@ -79,6 +79,81 @@ class SessionResult:
     log_path: Path
     tokens: int | None
     timed_out: bool
+    # Adapters with a structured terminal event may set this.  A log scrape is
+    # intentionally only used for a non-zero process exit: normal CLI output
+    # can contain quoted provider errors from prompts, tools, or summaries.
+    terminal_category: str | None = None
+    terminal_diagnostic: str = ""
+
+
+@dataclass(frozen=True)
+class HostAssessment:
+    """Independent evidence about the CLI process, not an agent decision."""
+
+    status: str                    # SUCCESS|FAILED
+    category: str                  # none|host_timeout|...|unknown
+    diagnostic: str = ""
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "FAILED"
+
+
+_TERMINAL_CATEGORIES = {
+    "subscription_limit", "throttled", "overloaded", "transient",
+    "authentication", "permission", "invalid_request", "billing_credits",
+    "local_error", "host_timeout", "protocol", "unknown",
+}
+
+
+def _sanitize_diagnostic(text: str) -> str:
+    """Keep a short printable terminal excerpt suitable for SQLite/UI."""
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    return " ".join(text.split())[:1000]
+
+
+def _fallback_terminal(adapter: str, log_path: Path) -> tuple[str, str]:
+    """Classify only narrow, terminal-looking CLI diagnostics after bad exit."""
+    try:
+        text = log_path.read_text(errors="replace")[-16000:]
+    except OSError:
+        return "unknown", "terminal diagnostic unavailable"
+    # These phrases are vendor CLI/API diagnostics, not broad natural-language
+    # matches.  This fallback is deliberately unavailable on successful exits.
+    rules = (
+        ("subscription_limit", r"(usage limit|rate limit resets|resets at)"),
+        ("throttled", r"rate_limit(?:ed)?|\btoo many requests\b"),
+        ("overloaded", r"\b(overloaded|capacity|server_error)\b"),
+        ("authentication", r"\b(unauthorized|authentication|not logged in|invalid api key)\b"),
+        ("permission", r"\b(forbidden|permission denied)\b"),
+        ("invalid_request", r"\b(invalid_request|invalid model|model_not_found)\b"),
+        ("billing_credits", r"\b(insufficient_quota|billing.*credit|credit balance)\b"),
+        ("transient", r"\b(connection reset|network error|temporarily unavailable|timeout)\b"),
+    )
+    # The adapter name is retained as provenance even though both current CLIs
+    # use the same conservative patterns.
+    for category, pattern in rules:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            line = text[max(0, text.rfind("\n", 0, match.start()) + 1):
+                        text.find("\n", match.end()) if text.find("\n", match.end()) >= 0 else len(text)]
+            return category, _sanitize_diagnostic(f"{adapter}: {line}")
+    return "unknown", _sanitize_diagnostic(text.splitlines()[-1] if text.splitlines() else "")
+
+
+def assess_session(result: SessionResult, adapter: str) -> HostAssessment:
+    """Apply host evidence precedence before an outcome can have effects."""
+    if result.timed_out:
+        return HostAssessment("FAILED", "host_timeout", "host timeout")
+    terminal_category = getattr(result, "terminal_category", None)
+    if terminal_category:
+        category = terminal_category if terminal_category in _TERMINAL_CATEGORIES else "unknown"
+        return HostAssessment("FAILED", category,
+                              _sanitize_diagnostic(getattr(result, "terminal_diagnostic", "")))
+    if result.exit_code != 0:
+        category, diagnostic = _fallback_terminal(adapter, result.log_path)
+        return HostAssessment("FAILED", category, diagnostic or f"CLI exited {result.exit_code}")
+    return HostAssessment("SUCCESS", "none", "")
 
 
 class Adapter:

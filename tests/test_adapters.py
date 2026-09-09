@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from nc.adapters import _run, adapter_ownership, parse_tokens
+from nc.adapters import SessionResult, _run, adapter_ownership, assess_session, parse_tokens
 
 
 def test_real_codex_usage(tmp_path, monkeypatch):
@@ -55,6 +55,26 @@ def test_registration_failure_kills_and_reaps_untracked_adapter(tmp_path):
 ])
 def test_parse_tokens(text, expected):
     assert parse_tokens(text) == expected
+
+
+@pytest.mark.parametrize(("exit_code", "timed_out", "category", "log", "expected"), [
+    (1, False, None, "Error: rate_limit_exceeded", "throttled"),
+    (1, False, None, "Error: insufficient_quota", "billing_credits"),
+    (1, False, None, "Error: permission denied", "permission"),
+    (1, False, None, "nonsense", "unknown"),
+    (0, False, None, 'agent quoted "rate_limit_exceeded" while explaining a fix', "none"),
+    (0, True, None, "", "host_timeout"),
+    (0, False, "overloaded", "", "overloaded"),
+])
+def test_host_assessment_uses_terminal_evidence_not_successful_output(
+        tmp_path, exit_code, timed_out, category, log, expected):
+    """Synthetic fixtures; no provider/session is contacted."""
+    path = tmp_path / "session.log"
+    path.write_text(log)
+    result = SessionResult(exit_code, path, None, timed_out, category)
+    assessment = assess_session(result, "codex")
+    assert assessment.category == expected
+    assert assessment.failed is (expected != "none")
 
 
 @pytest.mark.parametrize("binary", ["/usr/bin/claude", None])

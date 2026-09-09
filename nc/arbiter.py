@@ -8,8 +8,11 @@ the agent that wrote the code must not make them.
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import signal
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,18 +93,36 @@ def parse_acceptance(acceptance: list[str]) -> tuple[list[str], list[str]]:
 
 
 def run_checks(cwd: Path, commands: list[str], timeout_s: int = 900) -> list[CheckResult]:
+    """Run each check in its own process group with a private TMPDIR.
+
+    Checks such as `pytest -q` leave numbered directories under the shared
+    temp dir and only prune them when they exit cleanly; a killed run keeps
+    its lock forever. Owning the temp dir lets us delete it unconditionally,
+    and killing the whole group makes sure no orphan keeps writing into it.
+    """
     results = []
     for command in commands:
-        try:
-            proc = subprocess.run(
-                command, cwd=cwd, shell=True, capture_output=True, text=True,
-                timeout=timeout_s, check=False,
+        with tempfile.TemporaryDirectory(prefix="nc-check-") as tmp:
+            env = {**os.environ, "TMPDIR": tmp, "TMP": tmp, "TEMP": tmp}
+            proc = subprocess.Popen(
+                command, cwd=cwd, shell=True, env=env, start_new_session=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             )
-            results.append(CheckResult(command, proc.returncode == 0,
-                                       (proc.stdout + proc.stderr)))
-        except subprocess.TimeoutExpired:
-            results.append(CheckResult(command, False, f"timed out after {timeout_s}s"))
+            try:
+                output, _ = proc.communicate(timeout=timeout_s)
+                results.append(CheckResult(command, proc.returncode == 0, output))
+            except subprocess.TimeoutExpired:
+                _kill_group(proc)
+                results.append(CheckResult(command, False, f"timed out after {timeout_s}s"))
     return results
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.communicate()
 
 
 def integrate(repo: Path, branch: str, task_id: str) -> str:

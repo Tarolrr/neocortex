@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from nc.adapters import SessionResult, _run, adapter_ownership, assess_session, parse_tokens
+from nc.adapters import (
+    SessionResult,
+    _run,
+    adapter_ownership,
+    assess_session,
+    parse_tokens,
+    sanitize_diagnostic,
+)
 
 
 def test_real_codex_usage(tmp_path, monkeypatch):
@@ -57,24 +64,52 @@ def test_parse_tokens(text, expected):
     assert parse_tokens(text) == expected
 
 
-@pytest.mark.parametrize(("exit_code", "timed_out", "category", "log", "expected"), [
-    (1, False, None, "Error: rate_limit_exceeded", "throttled"),
-    (1, False, None, "Error: insufficient_quota", "billing_credits"),
-    (1, False, None, "Error: permission denied", "permission"),
-    (1, False, None, "nonsense", "unknown"),
-    (0, False, None, 'agent quoted "rate_limit_exceeded" while explaining a fix', "none"),
-    (0, True, None, "", "host_timeout"),
-    (0, False, "overloaded", "", "overloaded"),
+@pytest.mark.parametrize(("adapter", "line", "expected"), [
+    ("codex", "Codex API Error: rate_limit_exceeded", "throttled"),
+    ("claude", "Claude API Error: insufficient_quota", "billing_credits"),
+    ("codex", "Codex API Error: permission_denied", "permission"),
+    ("claude", "Claude API Error: authentication_error", "authentication"),
+    ("codex", "Codex API Error: invalid_model", "invalid_request"),
+    ("claude", "Claude API Error: temporarily_unavailable", "transient"),
+    ("codex", "Codex API Error: overloaded", "overloaded"),
+    ("claude", "Claude API Error: usage_limit", "subscription_limit"),
 ])
-def test_host_assessment_uses_terminal_evidence_not_successful_output(
-        tmp_path, exit_code, timed_out, category, log, expected):
-    """Synthetic fixtures; no provider/session is contacted."""
+def test_adapter_specific_final_terminal_fixture(tmp_path, adapter, line, expected):
+    """Synthetic fixtures; these envelopes are deliberately not live evidence."""
     path = tmp_path / "session.log"
-    path.write_text(log)
-    result = SessionResult(exit_code, path, None, timed_out, category)
-    assessment = assess_session(result, "codex")
+    path.write_text("ordinary output\n" + line + "\n")
+    assessment = assess_session(SessionResult(1, path, None, False), adapter)
     assert assessment.category == expected
-    assert assessment.failed is (expected != "none")
+    assert assessment.failed
+
+
+@pytest.mark.parametrize("adapter", ["codex", "claude"])
+def test_fallback_never_searches_prompt_or_truncated_streams(tmp_path, adapter):
+    path = tmp_path / "session.log"
+    path.write_text('prompt says "rate_limit_exceeded"\n' * 1000 +
+                    'agent quoted "Codex API Error: permission_denied"\n')
+    assessment = assess_session(SessionResult(1, path, None, False), adapter)
+    assert assessment.category == "unknown"
+
+
+@pytest.mark.parametrize(("exit_code", "timed_out", "category", "expected"), [
+    (1, False, None, "unknown"), (0, True, None, "host_timeout"),
+    (0, False, "overloaded", "overloaded"), (0, False, None, "none"),
+])
+def test_host_assessment_precedence(tmp_path, exit_code, timed_out, category, expected):
+    path = tmp_path / "session.log"
+    path.write_text("agent recovered from rate_limit_exceeded\n")
+    assessment = assess_session(SessionResult(exit_code, path, None, timed_out, category), "codex")
+    assert assessment.category == expected
+
+
+def test_diagnostic_redacts_credentials_and_is_bounded():
+    diagnostic = sanitize_diagnostic(
+        "Bearer abcdefghijklmnop API_KEY=super-secret sk-abcdefghijklmnop password: hunter2")
+    assert "abcdefghijklmnop" not in diagnostic
+    assert "super-secret" not in diagnostic
+    assert "hunter2" not in diagnostic
+    assert "[REDACTED]" in diagnostic
 
 
 @pytest.mark.parametrize("binary", ["/usr/bin/claude", None])

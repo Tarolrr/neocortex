@@ -9,7 +9,13 @@ import time
 from pathlib import Path
 
 from . import arbiter, protocol, roles
-from .adapters import Adapter, HostAssessment, adapter_ownership, assess_session
+from .adapters import (
+    Adapter,
+    HostAssessment,
+    adapter_ownership,
+    assess_session,
+    sanitize_diagnostic,
+)
 from .config import Config
 from .proposals import check_proposal
 from .state import State
@@ -172,26 +178,26 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
             (time.time(), agent["project_id"]))
     run_session = getattr(adapter, "run_planner", adapter.run)
     tokens = None
-    host_ok = False
+    result_recorded = False
     try:
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
         tokens = result.tokens
-        outcome = protocol.read_outcome(outcome_path)
         assessment = assess_session(result, adapter.name)
         _record_host(state, run_id, result, assessment)
+        result_recorded = True
+        outcome = protocol.read_outcome(outcome_path)
         if assessment.failed:
             # Keep parsed outcome in the run for diagnosis, but never let it
             # create a proposal/question or consume planner context.
             state.end_run(run_id, outcome.kind, outcome.summary, tokens)
             return _host_failure("Planner", assessment)
-        host_ok = True
     except Exception as exc:
         logging.getLogger(__name__).exception("Planner session failed")
         outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Planner session failure: {exc}")
-        if not host_ok:
+        if not result_recorded:
             state.record_host_assessment(run_id, exit_code=None, timed_out=False,
-                                         category="local_error", diagnostic=str(exc),
+                                         category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
                                          assessment="FAILED")
     try:
         if outcome.kind == protocol.DONE:
@@ -235,27 +241,27 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
     model = agent["model"]
     run_id = state.start_run(agent["id"], agent["task_id"], agent["role"], model, str(log_path))
     tokens = None
-    host_ok = False
+    result_recorded = False
     try:
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = adapter.run(brief, cwd, model, log_path, cfg.turn_timeout_s)
         tokens = result.tokens
-        outcome = protocol.read_outcome(outcome_path)
         assessment = assess_session(result, adapter.name)
         _record_host(state, run_id, result, assessment)
+        result_recorded = True
+        outcome = protocol.read_outcome(outcome_path)
         if assessment.failed:
             # Persist what the agent wrote separately, then return a host
             # failure so scheduler handlers cannot apply it.
             state.end_run(run_id, outcome.kind, outcome.summary, tokens)
             return _host_failure(agent["role"], assessment)
-        host_ok = True
     except Exception as exc:
         logging.getLogger(__name__).exception("%s session failed", agent["role"])
         outcome = protocol.Outcome(kind=protocol.FAIL,
                                    summary=f"{agent['role']} session failure: {exc}")
-        if not host_ok:
+        if not result_recorded:
             state.record_host_assessment(run_id, exit_code=None, timed_out=False,
-                                         category="local_error", diagnostic=str(exc),
+                                         category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
                                          assessment="FAILED")
     # Session exceptions are evidence too.  Do not deliver inbox messages: a
     # retry must retain feedback/questions that were never successfully used.
@@ -301,6 +307,7 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
     log_path = run_dir / "session.log"
     run_id = state.start_run(agent_id, None, "plan_critic", model, str(log_path))
     tokens = None
+    result_recorded = False
     try:
         outcome_path = run_dir / "outcome.json"
         brief = build_plan_critic_brief(state, proposal, outcome_path)
@@ -309,9 +316,10 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = adapter.run_planner(brief, run_dir, model, log_path, cfg.turn_timeout_s)
         tokens = result.tokens
-        outcome = protocol.read_outcome(outcome_path)
         assessment = assess_session(result, adapter.name)
         _record_host(state, run_id, result, assessment)
+        result_recorded = True
+        outcome = protocol.read_outcome(outcome_path)
         if assessment.failed:
             state.x("UPDATE plan_review SET status='failed', recommendation=? WHERE id=?",
                     (f"host session failed: {assessment.category}", review_id))
@@ -332,9 +340,9 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
         outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Plan review unavailable: {exc}")
         # A launcher/read/validation failure has no SessionResult evidence.
         # Do not overwrite structured evidence recorded above.
-        if state.one("SELECT host_assessment FROM run WHERE id=?", (run_id,))["host_assessment"] is None:
+        if not result_recorded:
             state.record_host_assessment(run_id, exit_code=None, timed_out=False,
-                                         category="local_error", diagnostic=str(exc),
+                                         category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
                                          assessment="FAILED")
         state.x("UPDATE plan_review SET status='failed', recommendation=? WHERE id=?",
                 (outcome.summary, review_id))

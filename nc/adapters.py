@@ -106,39 +106,54 @@ _TERMINAL_CATEGORIES = {
 }
 
 
-def _sanitize_diagnostic(text: str) -> str:
+def sanitize_diagnostic(text: str) -> str:
     """Keep a short printable terminal excerpt suitable for SQLite/UI."""
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    # Logs are untrusted and frequently include command-line configuration.
+    # Do this before bounding it: a short prefix must never make a credential
+    # visible in the run list or the detail view.
+    text = re.sub(r"(?i)\b(bearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
+    text = re.sub(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", text)
+    text = re.sub(
+        r"(?i)\b(api[_ -]?key|access[_ -]?token|authorization|password|secret)"
+        r"\s*([=:])\s*([^\s,;]+)", r"\1\2[REDACTED]", text,
+    )
     return " ".join(text.split())[:1000]
 
 
 def _fallback_terminal(adapter: str, log_path: Path) -> tuple[str, str]:
-    """Classify only narrow, terminal-looking CLI diagnostics after bad exit."""
+    """Classify a final, adapter-owned diagnostic after a bad exit.
+
+    stdout and stderr are deliberately combined by ``_run``.  Consequently a
+    general search is unsafe: prompts, tool output and final prose may contain
+    provider words.  Only a final line in a documented CLI-shaped envelope is
+    considered; all other output is unknown evidence.
+    """
     try:
         text = log_path.read_text(errors="replace")[-16000:]
     except OSError:
         return "unknown", "terminal diagnostic unavailable"
-    # These phrases are vendor CLI/API diagnostics, not broad natural-language
-    # matches.  This fallback is deliberately unavailable on successful exits.
-    rules = (
-        ("subscription_limit", r"(usage limit|rate limit resets|resets at)"),
-        ("throttled", r"rate_limit(?:ed)?|\btoo many requests\b"),
-        ("overloaded", r"\b(overloaded|capacity|server_error)\b"),
-        ("authentication", r"\b(unauthorized|authentication|not logged in|invalid api key)\b"),
-        ("permission", r"\b(forbidden|permission denied)\b"),
-        ("invalid_request", r"\b(invalid_request|invalid model|model_not_found)\b"),
-        ("billing_credits", r"\b(insufficient_quota|billing.*credit|credit balance)\b"),
-        ("transient", r"\b(connection reset|network error|temporarily unavailable|timeout)\b"),
-    )
-    # The adapter name is retained as provenance even though both current CLIs
-    # use the same conservative patterns.
-    for category, pattern in rules:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            line = text[max(0, text.rfind("\n", 0, match.start()) + 1):
-                        text.find("\n", match.end()) if text.find("\n", match.end()) >= 0 else len(text)]
-            return category, _sanitize_diagnostic(f"{adapter}: {line}")
-    return "unknown", _sanitize_diagnostic(text.splitlines()[-1] if text.splitlines() else "")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    line = lines[-1] if lines else ""
+    # These are intentionally distinct.  They are conservative fixture-backed
+    # envelopes, not claims that every version emits every form (see docs).
+    envelopes = {
+        "codex": r"^Codex API Error:\s*(?P<code>[a-z_]+)\s*$",
+        "claude": r"^Claude API Error:\s*(?P<code>[a-z_]+)\s*$",
+    }
+    match = re.match(envelopes.get(adapter, r"(?!x)x"), line, re.IGNORECASE)
+    codes = {
+        "usage_limit": "subscription_limit", "rate_limit_exceeded": "throttled",
+        "overloaded": "overloaded", "server_error": "overloaded",
+        "temporarily_unavailable": "transient", "network_error": "transient",
+        "authentication_error": "authentication", "permission_denied": "permission",
+        "invalid_request": "invalid_request", "invalid_model": "invalid_request",
+        "insufficient_quota": "billing_credits",
+    }
+    if match:
+        return codes.get(match.group("code").lower(), "unknown"), sanitize_diagnostic(
+            f"{adapter}: {line}")
+    return "unknown", sanitize_diagnostic(line)
 
 
 def assess_session(result: SessionResult, adapter: str) -> HostAssessment:
@@ -149,7 +164,7 @@ def assess_session(result: SessionResult, adapter: str) -> HostAssessment:
     if terminal_category:
         category = terminal_category if terminal_category in _TERMINAL_CATEGORIES else "unknown"
         return HostAssessment("FAILED", category,
-                              _sanitize_diagnostic(getattr(result, "terminal_diagnostic", "")))
+                              sanitize_diagnostic(getattr(result, "terminal_diagnostic", "")))
     if result.exit_code != 0:
         category, diagnostic = _fallback_terminal(adapter, result.log_path)
         return HostAssessment("FAILED", category, diagnostic or f"CLI exited {result.exit_code}")

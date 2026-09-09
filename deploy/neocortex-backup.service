@@ -1,0 +1,10 @@
+[Unit]
+Description=Publish pending Neocortex durable backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/neocortex-runner
+Environment=NC_HOME=/root/.neocortex
+Environment=PATH=/opt/neocortex-runner/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/neocortex-runner/.venv/bin/nc backup-worker
+TimeoutStartSec=600

@@ -11,7 +11,7 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
-from . import arbiter, operations, protocol
+from . import arbiter, backup_worker, operations, protocol
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_identity, repository_lock
 from .scheduler import Scheduler
@@ -65,6 +65,23 @@ def cmd_restore(args) -> int:
         return 1
     print(f"restored stopped home: {home}")
     return 0
+
+
+def cmd_backup_worker(args) -> int:
+    cfg = Config.load(args.home)
+    # A timer should be quiet when nothing is pending; failures are journalled
+    # by the worker and intentionally do not affect the agent queue.
+    destination = Path(cfg.backup_destination) if cfg.backup_destination else None
+    backup_worker.run_once(cfg.home, destination, retain=cfg.backup_retain)
+    return 0
+
+
+def cmd_backup_status(args) -> int:
+    cfg = Config.load(args.home)
+    destination = Path(cfg.backup_destination) if cfg.backup_destination else None
+    result, healthy = backup_worker.status(cfg.home, destination)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if healthy else 1
 
 
 def cmd_project(args) -> int:
@@ -545,6 +562,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--retain", type=int, default=96,
                     help="successful incremental snapshots to retain (default: 96)")
     sp.set_defaults(func=cmd_backup)
+
+    sub.add_parser("backup-worker", help=argparse.SUPPRESS).set_defaults(func=cmd_backup_worker)
+    sub.add_parser(
+        "backup-status", help="show automated backup freshness and pending work"
+    ).set_defaults(func=cmd_backup_status)
 
     sp = sub.add_parser("restore", help="restore a snapshot into a fresh stopped home")
     sp.add_argument("snapshot", type=Path)

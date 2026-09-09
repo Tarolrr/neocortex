@@ -453,6 +453,9 @@ def test_feedback_proposal_decisions_and_answers(browser):
     page = f"/proposals/{pid}"
     assert post(page, page + "/reject", {"reason": "No thanks"})[0] == 303
     assert state.one("SELECT status FROM proposal WHERE id=?", (pid,))[0] == "rejected"
+    # These owner-facing routes share the durable request transaction; neither
+    # feedback nor either decision relies on the scheduler being alive.
+    assert state.one("SELECT dirty_generation FROM backup_state")[0] == 6
     state.add_agent("worker-test", "worker", "one", tid, "model")
     mid = state.send(protocol.QUESTION, "worker-test", "owner", {"question": "<script>q</script>"}, tid)
     assert "<script>q" not in request("/inbox")[2]

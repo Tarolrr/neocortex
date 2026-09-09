@@ -38,6 +38,10 @@ class Config:
     planner_max_queued: int = 5
     planner_max_pending_proposals: int = 1
     ask_timeout_s: int = 24 * 3600
+    # Opt-in: bootstrap never supplies this.  It must be an existing mounted
+    # directory on another device before the backup timer can operate.
+    backup_destination: str | None = None
+    backup_retain: int = 96
 
     @property
     def db_path(self) -> Path:

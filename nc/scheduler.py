@@ -64,6 +64,37 @@ class Scheduler:
             return False, f"model {model} is not usable (exit {result.exit_code}): {tail}"
         return True, f"model {model} responds, {free_mb} MB free"
 
+    def readiness(self) -> tuple[bool, str]:
+        """Check host tools and each project's base checkout once per invocation."""
+        adapters = {self.cfg.adapter, *self.cfg.adapters.values()}
+        reports, errors, python = arbiter.host_requirements(adapters)
+        if not errors:
+            for project in self.state.q("SELECT id, repo_path, test_cmd FROM project ORDER BY id"):
+                if not project["test_cmd"]:
+                    continue
+                results = arbiter.readiness_check(Path(project["repo_path"]), project["test_cmd"],
+                                                  python=python)
+                failed = [result for result in results if not result.ok]
+                if failed:
+                    errors.append(f"project {project['id']}: " + "; ".join(
+                        result.render() for result in failed))
+        if errors:
+            return False, "\n".join(reports + errors + [
+                "guidance: run scripts/bootstrap.sh on the runner host, then re-run nc doctor",
+            ])
+        return True, "\n".join(reports + ["configured project test commands passed"])
+
+    def _host_environment_incident(self, detail: str) -> None:
+        """Keep one unresolved host-readiness incident across timer restarts.
+
+        Readiness detail includes command output from a disposable worktree.
+        That output can legitimately contain unstable values (durations and
+        temporary paths), so it must not be used as the deduplication key.
+        """
+        if self.state.one("SELECT id FROM incident WHERE kind='host_environment'"
+                          " AND resolved=0") is None:
+            self.state.incident("host_environment", detail)
+
     @staticmethod
     def _free_mb() -> int | None:
         try:
@@ -432,24 +463,30 @@ class Scheduler:
             if inserted:
                 log.warning("%s", detail)
 
-    def run(self, max_turns: int = 0) -> None:
+    def run(self, max_turns: int = 0) -> bool:
         ok, detail = self.preflight()
         if not ok:
             self.state.incident("preflight", detail)
             log.error("preflight failed: %s", detail)
-            return
+            return False
         log.info("preflight ok: %s", detail)
+        ok, detail = self.readiness()
+        if not ok:
+            self._host_environment_incident(detail)
+            log.error("host environment readiness failed: %s", detail)
+            return False
+        log.info("host environment readiness ok: %s", detail)
 
         turns = 0
         while max_turns == 0 or turns < max_turns:
             if (self.cfg.home / "STOP").exists():
                 log.info("stop file present, exiting")
-                return
+                return True
             self._escalate_unanswered_questions()
             result = self.step()
             if result == "idle":
                 log.info("no runnable agents; exiting (idle is a valid outcome)")
-                return
+                return True
             turns += 1
             if self.consecutive_failures >= self.cfg.max_consecutive_failures:
                 self.state.incident(
@@ -463,5 +500,6 @@ class Scheduler:
                 )
                 log.error("circuit breaker tripped after %d failed turns; wrote STOP",
                           self.consecutive_failures)
-                return
+                return True
             time.sleep(1)
+        return True

@@ -10,11 +10,17 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+# Keep this in lockstep with deploy/neocortex.service and bootstrap.sh.  Do
+# not consult the invoking login shell: the scheduler is started by systemd.
+SERVICE_PATH = "/opt/neocortex-runner/.venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+CLEANUP_TIMEOUT_S = 30
 
 
 @dataclass
@@ -92,25 +98,20 @@ def parse_acceptance(acceptance: list[str]) -> tuple[list[str], list[str]]:
     return commands, prose
 
 
-def run_checks(cwd: Path, commands: list[str], timeout_s: int = 900) -> list[CheckResult]:
-    """Run each check in its own process group with a private TMPDIR.
-
-    Checks such as `pytest -q` leave numbered directories under the shared
-    temp dir and only prune them when they exit cleanly; a killed run keeps
-    its lock forever. Owning the temp dir lets us delete it unconditionally,
-    and killing the whole group makes sure no orphan keeps writing into it.
-    """
+def run_checks(cwd: Path, commands: list[str], timeout_s: int = 900,
+               env: dict[str, str] | None = None) -> list[CheckResult]:
+    """Run checks in isolated process groups and disposable temp directories."""
     results = []
     for command in commands:
         with tempfile.TemporaryDirectory(prefix="nc-check-") as tmp:
-            env = {**os.environ, "TMPDIR": tmp, "TMP": tmp, "TEMP": tmp}
-            proc = subprocess.Popen(
-                command, cwd=cwd, shell=True, env=env, start_new_session=True,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            )
+            check_env = dict(os.environ if env is None else env,
+                             TMPDIR=tmp, TMP=tmp, TEMP=tmp)
+            proc = subprocess.Popen(command, cwd=cwd, shell=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, env=check_env, start_new_session=True)
             try:
-                output, _ = proc.communicate(timeout=timeout_s)
-                results.append(CheckResult(command, proc.returncode == 0, output))
+                stdout, _ = proc.communicate(timeout=timeout_s)
+                results.append(CheckResult(command, proc.returncode == 0, stdout))
             except subprocess.TimeoutExpired:
                 _kill_group(proc)
                 results.append(CheckResult(command, False, f"timed out after {timeout_s}s"))
@@ -123,6 +124,166 @@ def _kill_group(proc: subprocess.Popen) -> None:
     except ProcessLookupError:
         pass
     proc.communicate()
+
+
+def host_requirements(adapter_clis: set[str]) -> tuple[list[str], list[str], str | None]:
+    """Resolve runner prerequisites using systemd's PATH, never login PATH."""
+    reports, errors = [f"service PATH: {SERVICE_PATH}"], []
+    resolved: dict[str, str] = {}
+    for name in ("python", "git", "sqlite3", "pytest", "ruff", *sorted(adapter_clis)):
+        path = shutil.which(name, path=SERVICE_PATH)
+        if path is None:
+            errors.append(f"missing {name} on service PATH")
+        else:
+            resolved[name] = path
+            reports.append(f"{name}: {path}")
+    python = resolved.get("python")
+    if python:
+        try:
+            version = subprocess.run([python, "--version"], capture_output=True, text=True,
+                                     timeout=10, check=False,
+                                     env=dict(os.environ, PATH=SERVICE_PATH))
+            text = (version.stdout + version.stderr).strip()
+            reports.append(f"python version: {text}")
+            if version.returncode or not text.startswith("Python 3.13."):
+                errors.append(f"python must be Python 3.13 (found {text or 'unusable'})")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"python cannot be executed: {exc}")
+    return reports, errors, resolved.get("python")
+
+
+def _remove_readiness_worktree(repo: Path, scratch: Path, git_path: str,
+                               env: dict[str, str]) -> str | None:
+    """Remove only ``scratch`` and its registration; never prune the repository.
+
+    ``git worktree prune`` is intentionally unsuitable here: it can alter
+    registrations for unrelated task worktrees.  If git cannot remove this
+    disposable worktree, remove its directory and then only the metadata entry
+    whose ``gitdir`` points at this exact scratch checkout.
+    """
+    remove_error = ""
+    try:
+        cleanup = subprocess.Popen(
+            [git_path, "worktree", "remove", "--force", str(scratch)], cwd=repo,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = cleanup.communicate(timeout=CLEANUP_TIMEOUT_S)
+            if cleanup.returncode:
+                remove_error = (stderr or stdout).strip() or "git worktree remove failed"
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(cleanup.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cleanup.communicate()
+            remove_error = f"git worktree remove timed out after {CLEANUP_TIMEOUT_S}s"
+    except OSError as exc:
+        remove_error = str(exc)
+
+    # A failed git removal leaves the checkout and registration behind.  Both
+    # fallback operations are scoped by the exact scratch path, not a broad
+    # repository prune.
+    try:
+        if scratch.exists():
+            shutil.rmtree(scratch)
+        common = subprocess.run([git_path, "rev-parse", "--git-common-dir"], cwd=repo,
+                                capture_output=True, text=True, timeout=30,
+                                check=False, env=env)
+        if common.returncode:
+            return f"readiness cleanup failed: {remove_error or common.stderr.strip()}"
+        common_dir = Path(common.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = repo / common_dir
+        registrations = common_dir / "worktrees"
+        for entry in registrations.iterdir() if registrations.is_dir() else ():
+            gitdir_file = entry / "gitdir"
+            if not gitdir_file.is_file():
+                continue
+            registered = Path(gitdir_file.read_text().strip()).resolve()
+            if registered == (scratch / ".git").resolve():
+                shutil.rmtree(entry)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"readiness cleanup failed: {remove_error or exc}"
+
+    # Do not claim success until this particular registration is gone.
+    try:
+        listing = subprocess.run([git_path, "worktree", "list", "--porcelain"], cwd=repo,
+                                 capture_output=True, text=True, timeout=30, check=False, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"readiness cleanup failed: {remove_error or exc}"
+    registered_paths = [line[9:] for line in listing.stdout.splitlines()
+                        if line.startswith("worktree ")]
+    if listing.returncode or str(scratch.resolve()) in registered_paths:
+        detail = listing.stderr.strip() or remove_error or "scratch worktree is still registered"
+        return f"readiness cleanup failed: {detail}"
+    return None
+
+
+def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
+                    python: str | None = None) -> list[CheckResult]:
+    """Run a project's configured test command from a detached disposable base tree."""
+    git_path = shutil.which("git", path=SERVICE_PATH)
+    if git_path is None:
+        return [CheckResult(test_cmd, False, "git is missing from service PATH")]
+    env = dict(os.environ, PATH=SERVICE_PATH)
+    # Keep the disposable checkout on the project's filesystem rather than
+    # shared /tmp, which can be unavailable even when the runner is healthy.
+    scratch: Path | None = None
+    results: list[CheckResult] = []
+    try:
+        # `worktree add` requires a nonexistent destination.  Treat failures
+        # allocating or clearing that destination as a normal readiness
+        # failure, rather than leaking an exception into `nc doctor`/`nc run`.
+        scratch = Path(tempfile.mkdtemp(prefix="nc-readiness-", dir=repo.parent))
+        scratch.rmdir()
+        # Resolve the base with the same git executable we just validated.
+        branches = subprocess.run([git_path, "branch", "--format=%(refname:short)"], cwd=repo,
+                                  capture_output=True, text=True, timeout=300, check=False,
+                                  env=env)
+        names = branches.stdout.splitlines()
+        if branches.returncode:
+            results.append(CheckResult(test_cmd, False, branches.stderr.strip()))
+            return results
+        base = "main" if "main" in names else "master" if "master" in names else subprocess.run(
+            [git_path, "branch", "--show-current"], cwd=repo, capture_output=True, text=True,
+            timeout=300, check=False, env=env).stdout.strip()
+        if not base:
+            results.append(CheckResult(test_cmd, False, "cannot detect a base branch"))
+            return results
+        proc = subprocess.run([git_path, "worktree", "add", "--detach", str(scratch), base],
+                              cwd=repo, capture_output=True, text=True, timeout=300,
+                              check=False, env=env)
+        if proc.returncode:
+            results.append(CheckResult(test_cmd, False, proc.stderr.strip()))
+            return results
+        results = run_checks(scratch, [test_cmd], timeout_s, env)
+        # A source checkout of Neocortex must import itself, not an unrelated
+        # installed copy.  Other projects do not have this package contract.
+        if (scratch / "nc").is_dir() and python:
+            code = "import nc; from pathlib import Path; assert Path(nc.__file__).resolve().is_relative_to(Path.cwd().resolve())"
+            try:
+                probe = subprocess.run([python, "-c", code], cwd=scratch, capture_output=True,
+                                       text=True, timeout=timeout_s, check=False, env=env)
+                results.append(CheckResult("worktree-local import nc", probe.returncode == 0,
+                                           probe.stdout + probe.stderr))
+            except subprocess.TimeoutExpired:
+                results.append(CheckResult("worktree-local import nc", False,
+                                           f"timed out after {timeout_s}s"))
+        return results
+    except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+        results.append(CheckResult(test_cmd, False, str(exc)))
+        return results
+    finally:
+        # `git worktree add` can create a checkout or registration before it
+        # reports a failure/timeout.  The mkdtemp directory itself can also
+        # survive a failed rmdir.  Clean the exact allocated path regardless
+        # of which setup step completed.
+        if scratch is not None:
+            cleanup_error = _remove_readiness_worktree(repo, scratch, git_path, env)
+            if cleanup_error:
+                results.append(CheckResult("readiness scratch cleanup", False, cleanup_error))
 
 
 def integrate(repo: Path, branch: str, task_id: str) -> str:

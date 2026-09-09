@@ -444,6 +444,36 @@ def cmd_preflight(args) -> int:
     return 0 if ok else 1
 
 
+def cmd_doctor(args) -> int:
+    """Report host readiness even if opening the state database is impossible."""
+    cfg = Config.load(args.home)
+    adapters = {cfg.adapter, *cfg.adapters.values()}
+    reports, errors, python = arbiter.host_requirements(adapters)
+    try:
+        state = State(cfg.db_path)
+        project = state.one("SELECT id, repo_path, test_cmd FROM project WHERE id=?", (args.project,))
+        if project is None:
+            errors.append(f"unknown project {args.project}")
+        elif project["test_cmd"]:
+            results = arbiter.readiness_check(Path(project["repo_path"]), project["test_cmd"], python=python)
+            reports.extend(result.render() for result in results)
+            errors.extend(f"project {project['id']}: {result.command}" for result in results if not result.ok)
+        else:
+            reports.append(f"project {args.project}: no test_cmd configured")
+        state.db.close()
+    except (OSError, sqlite3.Error) as exc:
+        errors.append(f"state database unavailable: {exc}")
+    for report in reports:
+        print(report)
+    if errors:
+        for error in errors:
+            print("ERROR: " + error, file=sys.stderr)
+        print("guidance: run scripts/bootstrap.sh on the runner host, then re-run nc doctor", file=sys.stderr)
+        return 1
+    print("doctor: ready")
+    return 0
+
+
 def cmd_health(args) -> int:
     cfg, state = _open(args)
     print(f"database: {cfg.db_path}")
@@ -469,8 +499,7 @@ def cmd_step(args) -> int:
 
 def cmd_run(args) -> int:
     cfg, state = _open(args)
-    Scheduler(cfg, state).run(max_turns=args.max_turns)
-    return 0
+    return 0 if Scheduler(cfg, state).run(max_turns=args.max_turns) else 1
 
 
 def cmd_rollback(args) -> int:
@@ -715,6 +744,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_resume)
 
     sub.add_parser("preflight").set_defaults(func=cmd_preflight)
+    sp = sub.add_parser("doctor", help="check service host tools and one project's base checkout")
+    sp.add_argument("--project", required=True)
+    sp.set_defaults(func=cmd_doctor)
     sub.add_parser("health", help="show state database and counts").set_defaults(func=cmd_health)
     sub.add_parser("step", help="run exactly one agent turn").set_defaults(func=cmd_step)
 

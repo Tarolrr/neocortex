@@ -1,9 +1,10 @@
 import multiprocessing
 import shutil
+import sqlite3
 
 import pytest
 
-from nc import arbiter
+from nc import arbiter, cli
 from nc.cli import main
 from nc.config import Config
 from nc.lifecycle import lifecycle_lock
@@ -479,6 +480,39 @@ def test_cli_import_preserves_partial_success_output(gc_project, tmp_path, capsy
         main(["--home", str(cfg.home), "task", "--file", str(specs)])
     tid = state.one("SELECT id FROM task WHERE title='first'")["id"]
     assert capsys.readouterr().out == tid + "\n"
+
+
+def test_run_readiness_failure_is_deduplicated_despite_variable_output_and_leaves_task_queued(
+        gc_project, monkeypatch):
+    cfg, state, _ = gc_project
+    task = state.add_task("demo", "queued", "objective", [])
+    scheduler = __import__("nc.scheduler", fromlist=["Scheduler"]).Scheduler(cfg, state)
+    monkeypatch.setattr(scheduler, "preflight", lambda: (True, "model ok"))
+    details = iter(("project demo: test failed after 0.12s in /tmp/one",
+                    "project demo: test failed after 0.43s in /tmp/two"))
+    monkeypatch.setattr(scheduler, "readiness", lambda: (False, next(details)))
+
+    assert scheduler.run() is False
+    assert scheduler.run() is False
+    row = state.one("SELECT status, attempts FROM task WHERE id=?", (task,))
+    assert tuple(row) == ("queued", 0)
+    assert state.one("SELECT COUNT(*) FROM incident WHERE kind='host_environment'")[0] == 1
+
+
+def test_doctor_reports_host_errors_when_state_database_cannot_open(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli.arbiter, "host_requirements",
+                        lambda adapters: (["python: /runner/python"], [], "/runner/python"))
+
+    def unavailable(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cli, "State", unavailable)
+    assert main(["--home", str(tmp_path / "home"), "doctor", "--project", "demo"]) == 1
+
+    captured = capsys.readouterr()
+    assert "python: /runner/python" in captured.out
+    assert "ERROR: state database unavailable: database is locked" in captured.err
+    assert "bootstrap.sh" in captured.err
 
 
 def test_feedback_cli_marks_a_durable_backup_request(gc_project):

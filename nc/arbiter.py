@@ -160,10 +160,14 @@ def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
     env = dict(os.environ, PATH=SERVICE_PATH)
     # Keep the disposable checkout on the project's filesystem rather than
     # shared /tmp, which can be unavailable even when the runner is healthy.
-    scratch = Path(tempfile.mkdtemp(prefix="nc-readiness-", dir=repo.parent))
-    scratch.rmdir()
+    scratch: Path | None = None
     added = False
     try:
+        # `worktree add` requires a nonexistent destination.  Treat failures
+        # allocating or clearing that destination as a normal readiness
+        # failure, rather than leaking an exception into `nc doctor`/`nc run`.
+        scratch = Path(tempfile.mkdtemp(prefix="nc-readiness-", dir=repo.parent))
+        scratch.rmdir()
         # Resolve the base with the same git executable we just validated.
         branches = subprocess.run([git_path, "branch", "--format=%(refname:short)"], cwd=repo,
                                   capture_output=True, text=True, timeout=300, check=False,
@@ -204,7 +208,7 @@ def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
         # final prune: git only drops a stale registration once its path is
         # gone.  Cleanup is deliberately bounded, just like the diagnostic.
         try:
-            if added or scratch.exists():
+            if scratch is not None and (added or scratch.exists()):
                 cleanup = subprocess.Popen(
                     [git_path, "worktree", "remove", "--force", str(scratch)], cwd=repo,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
@@ -223,7 +227,8 @@ def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
             pass
         # It was never registered, or removal failed.  This must precede
         # prune so a failed/terminated remove cannot strand a registration.
-        shutil.rmtree(scratch, ignore_errors=True)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
         try:
             prune = subprocess.Popen([git_path, "worktree", "prune"], cwd=repo,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

@@ -83,6 +83,29 @@ def test_readiness_reports_failure_and_timeout_and_cleans_worktree(tmp_path, com
         text=True, check=True).stdout
 
 
+@pytest.mark.parametrize("failure", ["allocate", "clear"])
+def test_readiness_reports_scratch_setup_errors(tmp_path, monkeypatch, failure):
+    repo = _repo(tmp_path)
+    if failure == "allocate":
+        def fail_mkdtemp(*_args, **_kwargs):
+            raise OSError("scratch filesystem unavailable")
+
+        monkeypatch.setattr(arbiter.tempfile, "mkdtemp", fail_mkdtemp)
+    else:
+        def fail_rmdir(_self):
+            raise OSError("cannot clear scratch directory")
+
+        monkeypatch.setattr(arbiter.Path, "rmdir", fail_rmdir)
+
+    result = arbiter.readiness_check(repo, "true", timeout_s=5)[0]
+
+    assert not result.ok
+    assert "scratch" in result.output
+    listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo,
+                             capture_output=True, text=True, check=True).stdout
+    assert "nc-readiness-" not in listing
+
+
 @pytest.mark.parametrize("mode", ["failure", "timeout"])
 def test_readiness_prunes_registration_when_worktree_remove_fails(tmp_path, monkeypatch, mode):
     repo = _repo(tmp_path)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 
 import pytest
 
@@ -35,3 +37,21 @@ def test_integrate_leaves_a_clean_repo_after_a_conflict(tmp_path):
     assert not (repo / ".git" / "MERGE_HEAD").exists()
     assert subprocess.run(["git", "status", "--porcelain"], cwd=repo,
                           capture_output=True, text=True, check=True).stdout == ""
+
+
+def test_run_checks_uses_private_tmpdir_and_removes_it(tmp_path):
+    results = arbiter.run_checks(tmp_path, ['echo "$TMPDIR" > marker; touch "$TMPDIR/leftover"'])
+    assert results[0].ok
+    private = (tmp_path / "marker").read_text().strip()
+    assert private != tempfile.gettempdir()
+    assert not os.path.exists(private)
+
+
+def test_run_checks_timeout_kills_process_group(tmp_path):
+    results = arbiter.run_checks(
+        tmp_path, ['sh -c "echo $$ > child.pid; sleep 30" & wait'], timeout_s=1,
+    )
+    assert not results[0].ok and "timed out" in results[0].output
+    pid = int((tmp_path / "child.pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

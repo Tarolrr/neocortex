@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -107,8 +108,11 @@ def test_readiness_reports_scratch_setup_errors(tmp_path, monkeypatch, failure):
 
 
 @pytest.mark.parametrize("mode", ["failure", "timeout"])
-def test_readiness_prunes_registration_when_worktree_remove_fails(tmp_path, monkeypatch, mode):
+def test_readiness_removes_only_its_registration_when_worktree_remove_fails(tmp_path, monkeypatch, mode):
     repo = _repo(tmp_path)
+    other = tmp_path / "unrelated-task"
+    subprocess.run(["git", "worktree", "add", "-b", "nc/unrelated", str(other)],
+                   cwd=repo, check=True, capture_output=True)
     original = arbiter.subprocess.Popen
 
     def broken_remove(args, *args_, **kwargs):
@@ -126,6 +130,33 @@ def test_readiness_prunes_registration_when_worktree_remove_fails(tmp_path, monk
     listing = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo,
                              capture_output=True, text=True, check=True).stdout
     assert "nc-readiness-" not in listing
+    assert f"worktree {other}" in listing
+
+
+def test_readiness_fails_when_remove_and_scoped_registration_cleanup_fail(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    original_popen = arbiter.subprocess.Popen
+    original_rmtree = arbiter.shutil.rmtree
+
+    def broken_remove(args, *args_, **kwargs):
+        if isinstance(args, list) and args[1:3] == ["worktree", "remove"]:
+            return original_popen(["false"], *args_, **kwargs)
+        return original_popen(args, *args_, **kwargs)
+
+    def fail_registration_remove(path, *args, **kwargs):
+        if "worktrees" in Path(path).parts:
+            raise OSError("registration cannot be removed")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(arbiter.subprocess, "Popen", broken_remove)
+    monkeypatch.setattr(arbiter.shutil, "rmtree", fail_registration_remove)
+
+    results = arbiter.readiness_check(repo, "true", timeout_s=5)
+
+    assert results[0].ok
+    assert not results[-1].ok
+    assert results[-1].command == "readiness scratch cleanup"
+    assert "cleanup failed" in results[-1].output
 
 
 def test_readiness_verifies_nc_import_is_from_disposable_worktree(tmp_path):

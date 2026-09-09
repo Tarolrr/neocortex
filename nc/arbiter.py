@@ -151,6 +151,75 @@ def host_requirements(adapter_clis: set[str]) -> tuple[list[str], list[str], str
     return reports, errors, resolved.get("python")
 
 
+def _remove_readiness_worktree(repo: Path, scratch: Path, git_path: str,
+                               env: dict[str, str]) -> str | None:
+    """Remove only ``scratch`` and its registration; never prune the repository.
+
+    ``git worktree prune`` is intentionally unsuitable here: it can alter
+    registrations for unrelated task worktrees.  If git cannot remove this
+    disposable worktree, remove its directory and then only the metadata entry
+    whose ``gitdir`` points at this exact scratch checkout.
+    """
+    remove_error = ""
+    try:
+        cleanup = subprocess.Popen(
+            [git_path, "worktree", "remove", "--force", str(scratch)], cwd=repo,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = cleanup.communicate(timeout=CLEANUP_TIMEOUT_S)
+            if cleanup.returncode:
+                remove_error = (stderr or stdout).strip() or "git worktree remove failed"
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(cleanup.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cleanup.communicate()
+            remove_error = f"git worktree remove timed out after {CLEANUP_TIMEOUT_S}s"
+    except OSError as exc:
+        remove_error = str(exc)
+
+    # A failed git removal leaves the checkout and registration behind.  Both
+    # fallback operations are scoped by the exact scratch path, not a broad
+    # repository prune.
+    try:
+        if scratch.exists():
+            shutil.rmtree(scratch)
+        common = subprocess.run([git_path, "rev-parse", "--git-common-dir"], cwd=repo,
+                                capture_output=True, text=True, timeout=30,
+                                check=False, env=env)
+        if common.returncode:
+            return f"readiness cleanup failed: {remove_error or common.stderr.strip()}"
+        common_dir = Path(common.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = repo / common_dir
+        registrations = common_dir / "worktrees"
+        for entry in registrations.iterdir() if registrations.is_dir() else ():
+            gitdir_file = entry / "gitdir"
+            if not gitdir_file.is_file():
+                continue
+            registered = Path(gitdir_file.read_text().strip()).resolve()
+            if registered == (scratch / ".git").resolve():
+                shutil.rmtree(entry)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"readiness cleanup failed: {remove_error or exc}"
+
+    # Do not claim success until this particular registration is gone.
+    try:
+        listing = subprocess.run([git_path, "worktree", "list", "--porcelain"], cwd=repo,
+                                 capture_output=True, text=True, timeout=30, check=False, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"readiness cleanup failed: {remove_error or exc}"
+    registered_paths = [line[9:] for line in listing.stdout.splitlines()
+                        if line.startswith("worktree ")]
+    if listing.returncode or str(scratch.resolve()) in registered_paths:
+        detail = listing.stderr.strip() or remove_error or "scratch worktree is still registered"
+        return f"readiness cleanup failed: {detail}"
+    return None
+
+
 def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
                     python: str | None = None) -> list[CheckResult]:
     """Run a project's configured test command from a detached disposable base tree."""
@@ -162,6 +231,7 @@ def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
     # shared /tmp, which can be unavailable even when the runner is healthy.
     scratch: Path | None = None
     added = False
+    results: list[CheckResult] | None = None
     try:
         # `worktree add` requires a nonexistent destination.  Treat failures
         # allocating or clearing that destination as a normal readiness
@@ -203,46 +273,10 @@ def readiness_check(repo: Path, test_cmd: str, *, timeout_s: int = 900,
     except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
         return [CheckResult(test_cmd, False, str(exc))]
     finally:
-        # `git worktree remove` can itself get wedged (for example, on a
-        # filesystem hiccup).  In that case remove the checkout before the
-        # final prune: git only drops a stale registration once its path is
-        # gone.  Cleanup is deliberately bounded, just like the diagnostic.
-        try:
-            if scratch is not None and (added or scratch.exists()):
-                cleanup = subprocess.Popen(
-                    [git_path, "worktree", "remove", "--force", str(scratch)], cwd=repo,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-                    start_new_session=True,
-                )
-                try:
-                    cleanup.communicate(timeout=CLEANUP_TIMEOUT_S)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(cleanup.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    cleanup.communicate()
-        except (OSError, subprocess.TimeoutExpired):
-            # Best effort only: never let a diagnostic mask its test result.
-            pass
-        # It was never registered, or removal failed.  This must precede
-        # prune so a failed/terminated remove cannot strand a registration.
-        if scratch is not None:
-            shutil.rmtree(scratch, ignore_errors=True)
-        try:
-            prune = subprocess.Popen([git_path, "worktree", "prune"], cwd=repo,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                     env=env, start_new_session=True)
-            try:
-                prune.communicate(timeout=CLEANUP_TIMEOUT_S)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(prune.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                prune.communicate()
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        if scratch is not None and added:
+            cleanup_error = _remove_readiness_worktree(repo, scratch, git_path, env)
+            if cleanup_error and results is not None:
+                results.append(CheckResult("readiness scratch cleanup", False, cleanup_error))
 
 
 def integrate(repo: Path, branch: str, task_id: str) -> str:

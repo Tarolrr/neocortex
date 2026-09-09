@@ -513,3 +513,9 @@ def test_doctor_reports_host_errors_when_state_database_cannot_open(tmp_path, mo
     assert "python: /runner/python" in captured.out
     assert "ERROR: state database unavailable: database is locked" in captured.err
     assert "bootstrap.sh" in captured.err
+
+
+def test_feedback_cli_marks_a_durable_backup_request(gc_project):
+    cfg, state, _ = gc_project
+    assert main(["--home", str(cfg.home), "feedback", "remember this", "--project", "demo"]) == 0
+    assert state.one("SELECT dirty_generation FROM backup_state")[0] == 1

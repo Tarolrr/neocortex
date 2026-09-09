@@ -11,10 +11,13 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
-from . import arbiter, operations, protocol
+from . import arbiter, backup_worker, operations, protocol
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_identity, repository_lock
 from .scheduler import Scheduler
+from .snapshot import SnapshotError
+from .snapshot import backup as create_backup
+from .snapshot import restore as restore_backup
 from .state import State
 
 
@@ -35,6 +38,50 @@ def cmd_init(args) -> int:
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
     print(f"initialized {cfg.home}")
     return 0
+
+
+def cmd_backup(args) -> int:
+    """Create a verified state-only snapshot without opening State."""
+    try:
+        cfg = Config.load(args.home)
+        destination = create_backup(cfg.home, args.destination, incremental=args.incremental,
+                                    retain=args.retain)
+    except (SnapshotError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"backup created: {destination}")
+    if args.incremental:
+        manifest = json.loads((destination / "manifest.json").read_text())
+        print("logical bytes: {logical_bytes}; newly written bytes: {new_bytes}; "
+              "reused bytes: {reused_bytes}".format(**manifest))
+    return 0
+
+
+def cmd_restore(args) -> int:
+    try:
+        home = restore_backup(args.snapshot, args.home)
+    except (SnapshotError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"restored stopped home: {home}")
+    return 0
+
+
+def cmd_backup_worker(args) -> int:
+    cfg = Config.load(args.home)
+    # A timer should be quiet when nothing is pending; failures are journalled
+    # by the worker and intentionally do not affect the agent queue.
+    destination = Path(cfg.backup_destination) if cfg.backup_destination else None
+    backup_worker.run_once(cfg.home, destination, retain=cfg.backup_retain)
+    return 0
+
+
+def cmd_backup_status(args) -> int:
+    cfg = Config.load(args.home)
+    destination = Path(cfg.backup_destination) if cfg.backup_destination else None
+    result, healthy = backup_worker.status(cfg.home, destination)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if healthy else 1
 
 
 def cmd_project(args) -> int:
@@ -536,6 +583,25 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_ui)
 
     sub.add_parser("init").set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("backup", help="create a verified SQLite state snapshot")
+    sp.add_argument("--destination", required=True, type=Path)
+    sp.add_argument("--incremental", action="store_true",
+                    help="store verified shared blocks under destination")
+    sp.add_argument("--retain", type=int, default=96,
+                    help="successful incremental snapshots to retain (default: 96)")
+    sp.set_defaults(func=cmd_backup)
+
+    sub.add_parser("backup-worker", help=argparse.SUPPRESS).set_defaults(func=cmd_backup_worker)
+    sub.add_parser(
+        "backup-status", help="show automated backup freshness and pending work"
+    ).set_defaults(func=cmd_backup_status)
+
+    sp = sub.add_parser("restore", help="restore a snapshot into a fresh stopped home")
+    sp.add_argument("snapshot", type=Path)
+    sp.add_argument("--home", required=True, type=Path,
+                    help="new empty state directory; restored with STOP present")
+    sp.set_defaults(func=cmd_restore)
 
     sp = sub.add_parser("project", help="register or update a project")
     sp.add_argument("id")

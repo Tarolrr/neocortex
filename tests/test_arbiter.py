@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -227,3 +229,21 @@ def test_host_requirements_reports_missing_python_launcher_and_tools(tmp_path, m
     assert reports == [f"service PATH: {tmp_path}"]
     for name in ("python", "git", "sqlite3", "pytest", "ruff", "adapter"):
         assert f"missing {name} on service PATH" in errors
+
+
+def test_run_checks_uses_private_tmpdir_and_removes_it(tmp_path):
+    results = arbiter.run_checks(tmp_path, ['echo "$TMPDIR" > marker; touch "$TMPDIR/leftover"'])
+    assert results[0].ok
+    private = (tmp_path / "marker").read_text().strip()
+    assert private != tempfile.gettempdir()
+    assert not os.path.exists(private)
+
+
+def test_run_checks_timeout_kills_process_group(tmp_path):
+    results = arbiter.run_checks(
+        tmp_path, ['sh -c "echo $$ > child.pid; sleep 30" & wait'], timeout_s=1,
+    )
+    assert not results[0].ok and "timed out" in results[0].output
+    pid = int((tmp_path / "child.pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

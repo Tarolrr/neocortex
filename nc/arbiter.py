@@ -100,29 +100,30 @@ def parse_acceptance(acceptance: list[str]) -> tuple[list[str], list[str]]:
 
 def run_checks(cwd: Path, commands: list[str], timeout_s: int = 900,
                env: dict[str, str] | None = None) -> list[CheckResult]:
+    """Run checks in isolated process groups and disposable temp directories."""
     results = []
     for command in commands:
-        proc: subprocess.Popen[str] | None = None
-        try:
-            # A shell command may create children.  Give it a process group so
-            # a timeout is truly bounded and does not strand a child in the
-            # disposable readiness worktree.
-            proc = subprocess.Popen(
-                command, cwd=cwd, shell=True, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, env=env, start_new_session=True,
-            )
-            stdout, stderr = proc.communicate(timeout=timeout_s)
-            results.append(CheckResult(command, proc.returncode == 0,
-                                       stdout + stderr))
-        except subprocess.TimeoutExpired:
-            assert proc is not None
+        with tempfile.TemporaryDirectory(prefix="nc-check-") as tmp:
+            check_env = dict(os.environ if env is None else env,
+                             TMPDIR=tmp, TMP=tmp, TEMP=tmp)
+            proc = subprocess.Popen(command, cwd=cwd, shell=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, env=check_env, start_new_session=True)
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.communicate()
-            results.append(CheckResult(command, False, f"timed out after {timeout_s}s"))
+                stdout, _ = proc.communicate(timeout=timeout_s)
+                results.append(CheckResult(command, proc.returncode == 0, stdout))
+            except subprocess.TimeoutExpired:
+                _kill_group(proc)
+                results.append(CheckResult(command, False, f"timed out after {timeout_s}s"))
     return results
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.communicate()
 
 
 def host_requirements(adapter_clis: set[str]) -> tuple[list[str], list[str], str | None]:

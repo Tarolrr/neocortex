@@ -92,6 +92,18 @@ CREATE TABLE IF NOT EXISTS incident (
     resolved   INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
+
+-- This singleton is deliberately separate from incidents: changing backup
+-- observability must not itself ask for another backup.
+CREATE TABLE IF NOT EXISTS backup_state (
+    id INTEGER PRIMARY KEY CHECK (id=1),
+    dirty_generation INTEGER NOT NULL DEFAULT 0,
+    acknowledged_generation INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at REAL,
+    last_success_at REAL,
+    last_error TEXT
+);
+INSERT OR IGNORE INTO backup_state(id) VALUES(1);
 """
 
 
@@ -194,6 +206,16 @@ class State:
             known = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             if column not in known:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+        self.db.execute("""CREATE TABLE IF NOT EXISTS backup_state (
+            id INTEGER PRIMARY KEY CHECK (id=1), dirty_generation INTEGER NOT NULL DEFAULT 0,
+            acknowledged_generation INTEGER NOT NULL DEFAULT 0, last_attempt_at REAL,
+            last_success_at REAL, last_error TEXT)""")
+        self.db.execute("INSERT OR IGNORE INTO backup_state(id) VALUES(1)")
+
+    def _backup_dirty(self) -> None:
+        """Record a durable request in the caller's transaction, never by itself."""
+        self.db.execute("UPDATE backup_state SET dirty_generation=dirty_generation+1 WHERE id=1")
 
     # --- generic helpers -------------------------------------------------
     def q(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
@@ -374,6 +396,7 @@ class State:
                 (project_id, source, rationale, json.dumps(spec, ensure_ascii=False), time.time(),
                  json.dumps(self._proposal_findings(spec))),
             )
+            self._backup_dirty()
             proposal_id = int(cur.lastrowid)
             if revision_id is not None:
                 self.db.execute(
@@ -435,6 +458,7 @@ class State:
                 "UPDATE proposal SET status='approved', decided_at=? WHERE id=?",
                 (time.time(), proposal_id),
             )
+            self._backup_dirty()
         return ids
 
     def reject_proposal(self, proposal_id: int, reason: str) -> None:
@@ -447,6 +471,7 @@ class State:
                 "UPDATE proposal SET status='rejected', decided_at=?, reason=? WHERE id=?",
                 (time.time(), reason, proposal_id),
             )
+            self._backup_dirty()
 
     def _pending_proposal(self, proposal_id: int) -> sqlite3.Row:
         row = self.one("SELECT * FROM proposal WHERE id=?", (proposal_id,))
@@ -462,7 +487,13 @@ class State:
     def set_task(self, task_id: str, **fields: Any) -> None:
         fields["updated_at"] = time.time()
         cols = ", ".join(f"{k}=?" for k in fields)
-        self.x(f"UPDATE task SET {cols} WHERE id=?", (*fields.values(), task_id))
+        with self.db:
+            self.db.execute(f"UPDATE task SET {cols} WHERE id=?", (*fields.values(), task_id))
+            # An accepted task is the event which makes a repository change
+            # owner-visible.  Calls that merely update another task field do not
+            # cause backup churn.
+            if fields.get("status") == "done" or fields.get("merge_commit") is not None:
+                self._backup_dirty()
 
     # --- agents ----------------------------------------------------------
     def add_agent(self, agent_id: str, role: str, project_id: str, task_id: str | None,
@@ -538,6 +569,9 @@ class State:
                     "INSERT INTO proposal_revision(original_id,feedback_id,planner_id)"
                     " VALUES(?,?,?)", (proposal_id, message_id, agent_id),
                 )
+            # Feedback (including a revision request) and its planner wakeup
+            # form one committed owner action.
+            self._backup_dirty()
             return agent_id, message_id
 
     def set_agent(self, agent_id: str, **fields: Any) -> None:

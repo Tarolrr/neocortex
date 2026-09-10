@@ -1127,6 +1127,7 @@ def test_session_exception_finalizes_worker_and_critic_without_consuming_feedbac
     run = state.one("SELECT * FROM run WHERE agent_id=?", (agent,))
     assert outcome.kind == protocol.FAIL
     assert run["outcome"] == protocol.FAIL and "adapter exploded" in run["detail"]
+    assert run["timed_out"] is None and run["exit_code"] is None
     assert json.loads(state.inbox(agent)[0]["payload"]) == {"text": "retain me"}
 
 
@@ -1141,6 +1142,7 @@ def test_session_exception_finalizes_planner_and_plan_critic_with_context(setup)
     run = state.one("SELECT * FROM run WHERE agent_id=? ORDER BY id DESC", (planner,))
     assert outcome.kind == protocol.FAIL and run["outcome"] == protocol.FAIL
     assert "planner exploded" in run["detail"]
+    assert run["timed_out"] is None and run["exit_code"] is None
     assert state.pending_revision(planner) is not None
 
     proposal = state.add_proposal("neocortex", planner, "", [planner_spec()])
@@ -1150,10 +1152,12 @@ def test_session_exception_finalizes_planner_and_plan_critic_with_context(setup)
     run = state.one("SELECT * FROM run WHERE role='plan_critic' ORDER BY id DESC")
     assert outcome.kind == protocol.FAIL and run["outcome"] == protocol.FAIL
     assert "critic exploded" in run["detail"]
+    assert run["timed_out"] is None and run["exit_code"] is None
 
 
 @pytest.mark.parametrize("role", ["worker", "critic"])
-def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role):
+@pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
+def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role, failure):
     """Synthetic terminal evidence must beat a valid agent-authored DONE."""
     cfg, state, repo = setup
     task = state.add_task("neocortex", "host evidence", "objective", [])
@@ -1164,12 +1168,17 @@ def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role):
     adapter = ScriptedAdapter([emit({"outcome": "DONE", "verdict": "pass", "memo": "lose"})])
     original = adapter.run
 
-    def terminal_error(*args):
+    def failed_session(*args):
         result = original(*args)
-        result.terminal_category = "overloaded"
+        if failure == "nonzero":
+            result.exit_code = 1
+        elif failure == "timeout":
+            result.timed_out = True
+        else:
+            result.terminal_category = "overloaded"
         return result
 
-    adapter.run = terminal_error
+    adapter.run = failed_session
     agent = state.one("SELECT * FROM agent WHERE id=?", (agent_id,))
     outcome = turn.run_turn(state, cfg, adapter, agent, repo, "main")
     run = state.one("SELECT * FROM run WHERE agent_id=?", (agent_id,))
@@ -1179,24 +1188,61 @@ def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role):
     assert state.inbox(agent_id)
 
 
-def test_plan_critic_terminal_error_with_zero_exit_cannot_complete_review(setup):
+@pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
+def test_plan_critic_host_failure_with_done_cannot_complete_review(setup, failure):
     cfg, state, _repo = setup
     proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
     adapter = ScriptedAdapter([emit({"outcome": "DONE", "recommendation": "yes", "findings": []})])
     adapter.run_planner = adapter.run
     original = adapter.run_planner
 
-    def terminal_error(*args):
+    def failed_session(*args):
         result = original(*args)
-        result.terminal_category = "transient"
+        if failure == "nonzero":
+            result.exit_code = 1
+        elif failure == "timeout":
+            result.timed_out = True
+        else:
+            result.terminal_category = "transient"
         return result
 
-    adapter.run_planner = terminal_error
+    adapter.run_planner = failed_session
     outcome = turn.run_plan_critic_turn(
         state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter,
     )
     review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
     assert outcome.kind == protocol.FAIL and review["status"] == "failed"
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
+def test_planner_host_failure_with_valid_done_keeps_revision_context(setup, failure):
+    """A planner's valid proposal never consumes feedback after host failure."""
+    cfg, state, _repo = setup
+    original_proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+    planner_id, _ = state.planner_feedback(
+        None, "retain revision feedback", "model", proposal_id=original_proposal,
+    )
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "proposal": [planner_spec()]})])
+    original_run = adapter.run
+
+    def failed_session(*args):
+        result = original_run(*args)
+        if failure == "nonzero":
+            result.exit_code = 1
+        elif failure == "timeout":
+            result.timed_out = True
+        else:
+            result.terminal_category = "transient"
+        return result
+
+    adapter.run = failed_session
+    planner = state.one("SELECT * FROM agent WHERE id=?", (planner_id,))
+    outcome = turn.run_planner_turn(state, cfg, planner, adapter)
+    run = state.one("SELECT * FROM run WHERE agent_id=? ORDER BY id DESC", (planner_id,))
+    assert outcome.kind == protocol.FAIL
+    assert run["outcome"] == protocol.DONE and run["host_assessment"] == "FAILED"
+    assert state.pending_revision(planner_id) is not None
+    assert len(state.q("SELECT * FROM proposal")) == 1
 
 
 @pytest.mark.parametrize('role', ['worker', 'critic', 'capacity'])

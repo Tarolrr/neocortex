@@ -103,6 +103,30 @@ def test_host_assessment_precedence(tmp_path, exit_code, timed_out, category, ex
     assert assessment.category == expected
 
 
+@pytest.mark.parametrize("adapter", ["codex", "claude"])
+def test_successful_retry_output_is_not_terminal_evidence(tmp_path, adapter):
+    """Synthetic recovered stream: only terminal structured evidence can fail a zero exit."""
+    path = tmp_path / "session.log"
+    path.write_text("Codex API Error: rate_limit_exceeded\nretry succeeded\n")
+    assessment = assess_session(SessionResult(0, path, None, False), adapter)
+    assert assessment.status == "SUCCESS"
+
+
+@pytest.mark.parametrize("category", [
+    "subscription_limit", "throttled", "overloaded", "transient",
+    "authentication", "permission", "invalid_request", "billing_credits",
+    "local_error", "protocol", "not-a-provider-category",
+])
+def test_structured_terminal_category_beats_zero_exit(tmp_path, category):
+    """Synthetic structured terminal evidence, including unsupported/unknown evidence."""
+    path = tmp_path / "session.log"
+    assessment = assess_session(
+        SessionResult(0, path, None, False, category, "terminal failure"), "codex",
+    )
+    assert assessment.failed
+    assert assessment.category == (category if category != "not-a-provider-category" else "unknown")
+
+
 def test_diagnostic_redacts_credentials_and_is_bounded():
     diagnostic = sanitize_diagnostic(
         "Bearer abcdefghijklmnop API_KEY=super-secret sk-abcdefghijklmnop password: hunter2")

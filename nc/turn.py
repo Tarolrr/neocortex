@@ -196,7 +196,9 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
         logging.getLogger(__name__).exception("Planner session failed")
         outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Planner session failure: {exc}")
         if not result_recorded:
-            state.record_host_assessment(run_id, exit_code=None, timed_out=False,
+            # The adapter raised before yielding a SessionResult, so timeout
+            # status was never observed.  Keep that evidence explicitly unknown.
+            state.record_host_assessment(run_id, exit_code=None, timed_out=None,
                                          category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
                                          assessment="FAILED")
     try:
@@ -260,7 +262,8 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
         outcome = protocol.Outcome(kind=protocol.FAIL,
                                    summary=f"{agent['role']} session failure: {exc}")
         if not result_recorded:
-            state.record_host_assessment(run_id, exit_code=None, timed_out=False,
+            # No SessionResult was returned: do not invent a completed timeout state.
+            state.record_host_assessment(run_id, exit_code=None, timed_out=None,
                                          category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
                                          assessment="FAILED")
     # Session exceptions are evidence too.  Do not deliver inbox messages: a
@@ -341,7 +344,8 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
         # A launcher/read/validation failure has no SessionResult evidence.
         # Do not overwrite structured evidence recorded above.
         if not result_recorded:
-            state.record_host_assessment(run_id, exit_code=None, timed_out=False,
+            # A launcher/read/validation exception has no timeout observation.
+            state.record_host_assessment(run_id, exit_code=None, timed_out=None,
                                          category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
                                          assessment="FAILED")
         state.x("UPDATE plan_review SET status='failed', recommendation=? WHERE id=?",

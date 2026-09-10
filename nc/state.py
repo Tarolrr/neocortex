@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS run (
     tokens     INTEGER,
     log_path   TEXT,
     started_at REAL NOT NULL,
-    ended_at   REAL
+    ended_at   REAL,
     -- Host evidence is deliberately independent from parsed agent outcome.
     exit_code  INTEGER,
     timed_out  INTEGER,
@@ -673,12 +673,13 @@ class State:
         )
 
     def record_host_assessment(self, run_id: int, *, exit_code: int | None,
-                               timed_out: bool, category: str,
+                               timed_out: bool | None, category: str,
                                diagnostic: str, assessment: str) -> None:
         self.x(
             "UPDATE run SET exit_code=?, timed_out=?, terminal_category=?,"
             " terminal_diagnostic=?, host_assessment=? WHERE id=?",
-            (exit_code, int(timed_out), category, diagnostic[:1000], assessment, run_id),
+            (exit_code, None if timed_out is None else int(timed_out), category,
+             diagnostic[:1000], assessment, run_id),
         )
 
     def incident(self, kind: str, detail: str) -> int:

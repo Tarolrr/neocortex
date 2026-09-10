@@ -95,3 +95,19 @@ def test_runs_and_incidents(tmp_path):
 
     state.incident("preflight", "model unavailable")
     assert len(state.open_incidents()) == 1
+
+
+def test_fresh_run_schema_keeps_host_evidence_columns_separate(tmp_path):
+    state = make_state(tmp_path)
+    columns = {row["name"]: row["type"] for row in state.q("PRAGMA table_info(run)")}
+    assert columns["ended_at"] == "REAL"
+    assert columns["exit_code"] == "INTEGER"
+
+    tid = state.add_task("neocortex", "t", "obj", [])
+    state.add_agent("worker-host", "worker", "neocortex", tid, "m")
+    run_id = state.start_run("worker-host", tid, "worker", "m", "/tmp/log")
+    state.record_host_assessment(run_id, exit_code=None, timed_out=None,
+                                 category="local_error", diagnostic="launcher failed",
+                                 assessment="FAILED")
+    row = state.one("SELECT * FROM run WHERE id=?", (run_id,))
+    assert row["timed_out"] is None and row["exit_code"] is None

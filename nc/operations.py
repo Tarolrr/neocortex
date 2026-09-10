@@ -172,6 +172,12 @@ def unfinished_runs(state: State) -> list[dict]:
     return result
 
 
+def latest_preflight_attempt(state: State) -> dict | None:
+    """Return host-only readiness evidence without creating an incident."""
+    row = state.one("SELECT * FROM preflight_attempt ORDER BY id DESC LIMIT 1")
+    return dict(row) if row is not None else None
+
+
 def recover_runs(state: State, run_ids: list[int], reason: str,
                  acknowledge_quiescence: bool = False) -> list[dict]:
     """Explicitly close selected interrupted records, without replaying an outcome.

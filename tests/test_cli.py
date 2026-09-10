@@ -108,6 +108,17 @@ def test_health_empty_home(tmp_path, capsys):
     ]
 
 
+def test_preflight_last_exposes_host_deferral_diagnostic(gc_project, capsys):
+    cfg, state, _repo = gc_project
+    state.record_preflight_attempt("worker", "codex", "test-model", "throttled",
+                                   "provider retry later", None)
+    assert main(["--home", str(cfg.home), "preflight", "--last"]) == 0
+    output = capsys.readouterr().out
+    assert "role=worker" in output
+    assert "category=throttled" in output
+    assert "provider retry later" in output
+
+
 def test_project_test_cmd_changes_only_named_project(tmp_path, capsys):
     home = tmp_path / "home"
     state = State(Config.load(home).db_path)

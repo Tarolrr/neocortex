@@ -36,6 +36,7 @@ class Scheduler:
         self._lifecycle_hook = None
         self._preflight_pairs: set[tuple[str, str]] = set()
         self._preflight_category: str | None = None
+        self._preflight_diagnostic = ""
         self._in_run = False
         self._preflight_role = "worker"
 
@@ -78,6 +79,7 @@ class Scheduler:
         )
         assessment = assess_session(result, adapter.name)
         self._preflight_category = assessment.category if assessment.failed else None
+        self._preflight_diagnostic = assessment.diagnostic
         text = result.log_path.read_text(errors="replace")
         # Production adapters use machine streams: success is their final
         # terminal event, rather than prose which could be tool output.
@@ -94,6 +96,7 @@ class Scheduler:
             return None
         self._preflight_role = role
         self._preflight_category = None
+        self._preflight_diagnostic = ""
         self._preflight_pairs.add(pair)
         try:
             ok, detail = self.preflight()
@@ -106,6 +109,7 @@ class Scheduler:
                 log.exception("preflight failed")
                 return "preflight_failed"
             self._preflight_category = assessment.category
+            self._preflight_diagnostic = assessment.diagnostic
             ok, detail = False, f"model {pair[1]} is not usable ({assessment.category}): {assessment.diagnostic}"
         if ok:
             return None
@@ -117,7 +121,7 @@ class Scheduler:
         }:
             self.state.record_preflight_attempt(role, pair[0], pair[1],
                                                 self._preflight_category, detail,
-                                                self._defer_until(detail))
+                                                self._defer_until(self._preflight_diagnostic))
             log.warning("temporary %s preflight failure: %s", role, detail)
             return "deferred"
         self.state.incident("preflight", detail)

@@ -445,6 +445,16 @@ def cmd_resolve(args) -> int:
 
 def cmd_preflight(args) -> int:
     cfg, state = _open(args)
+    if args.last:
+        attempt = operations.latest_preflight_attempt(state)
+        if attempt is None:
+            print("no recorded preflight attempts")
+        else:
+            until = attempt["defer_until"] if attempt["defer_until"] is not None else "timer"
+            print(f"latest preflight: role={attempt['role']} adapter={attempt['adapter']} "
+                  f"model={attempt['model']} category={attempt['category']} defer_until={until}")
+            print(f"  diagnostic: {attempt['diagnostic']}")
+        return 0
     ok, detail = Scheduler(cfg, state).preflight()
     print(("ok: " if ok else "FAILED: ") + detail)
     return 0 if ok else 1
@@ -758,7 +768,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--retry", action="store_true", help="also requeue blocked tasks")
     sp.set_defaults(func=cmd_resume)
 
-    sub.add_parser("preflight").set_defaults(func=cmd_preflight)
+    sp = sub.add_parser("preflight", help="probe the configured adapter/model or inspect the last failure")
+    sp.add_argument("--last", action="store_true", help="show latest recorded host preflight evidence")
+    sp.set_defaults(func=cmd_preflight)
     sp = sub.add_parser("doctor", help="check service host tools and one project's base checkout")
     sp.add_argument("--project", required=True)
     sp.set_defaults(func=cmd_doctor)

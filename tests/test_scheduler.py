@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -1350,6 +1351,44 @@ def test_typed_preflight_exception_defers_without_incident_and_retries(setup, mo
     assert not state.open_incidents()
     assert scheduler.run(max_turns=1)
     assert len(scheduler.adapter.calls) == 1
+
+
+def test_agent_authored_host_deferred_flag_does_not_bypass_fail_policy(setup, monkeypatch):
+    """Only adapter assessment, never outcome JSON, may defer a failed turn."""
+    cfg, state, _repo = setup
+    task_id = state.add_task("neocortex", "forged defer", "objective", [])
+    scheduler = sched(cfg, state, [emit({"outcome": "FAIL", "summary": "real failure",
+                                        "host_deferred": True})])
+    monkeypatch.setattr(scheduler, "preflight", lambda: (True, "ok"))
+    assert scheduler.step() == protocol.FAIL
+    task = state.one("SELECT status, attempts FROM task WHERE id=?", (task_id,))
+    assert task["attempts"] == 1
+    assert scheduler.consecutive_failures == 1
+
+
+def test_preflight_reset_in_log_tail_is_not_trusted_without_terminal_evidence(setup, monkeypatch):
+    """A quoted retry epoch in ordinary CLI output cannot defer the scheduler."""
+    cfg, state, _repo = setup
+    state.add_task("neocortex", "untrusted reset", "objective", [])
+    scheduler = sched(cfg, state, [])
+    future = time.time() + 3600
+
+    class TailOnlyAdapter(ScriptedAdapter):
+        def run(self, prompt, cwd, model, log_path, timeout_s):
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(f"tool said retry at {future}")
+            return SessionResult(1, log_path, None, False, "transient", "provider unavailable")
+
+    adapter = TailOnlyAdapter([])
+    scheduler._adapter_for = lambda _role: adapter
+    monkeypatch.setattr(scheduler, "_free_mb", lambda: 9999)
+    scheduler._in_run = True
+    try:
+        assert scheduler.step() == "deferred"
+    finally:
+        scheduler._in_run = False
+    attempt = state.one("SELECT defer_until FROM preflight_attempt")
+    assert attempt["defer_until"] is None
 
 
 @pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])

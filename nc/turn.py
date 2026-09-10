@@ -186,9 +186,9 @@ def _host_failure(role: str, assessment: HostAssessment) -> protocol.Outcome:
         kind=protocol.FAIL,
         summary=f"{role} host session failed: {assessment.category}{detail}",
         # This is deliberately host-owned metadata, not an agent outcome.
-        raw={"host_deferred": assessment.category in {
+        host_deferred=assessment.category in {
             "subscription_limit", "throttled", "overloaded", "transient",
-        }},
+        },
     )
 
 

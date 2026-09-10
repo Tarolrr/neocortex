@@ -94,8 +94,10 @@ ownership action; restoring eligibility changes logical state; accepting work is
 the later arbiter/owner domain action.  None implies another.
 
 Every claim has `work_id`, phase, `attempt_no`, monotonic fence token, status
-(`claimed|running|result_persisted|applied|acknowledged|retryable|blocked|
-cancelled`), and a durable recovery reason/owner action where blocked.  Claim,
+(`claimed|running|result_persisted|applied|acknowledged|interrupted|retryable|
+blocked|cancelled`), and a durable recovery reason/owner action where blocked.
+`interrupted` is terminal for an execution attempt; `retryable` is a logical-work
+state, not a state to which a closed attempt is reopened. Claim,
 agent eligibility and active-fence creation commit together.  Result persistence,
 role-specific application, receipt and acknowledgement are separately
 idempotent transactions keyed by `(work_id, attempt_no, fence)`.  A completion
@@ -136,10 +138,11 @@ no-op: no new attempt, message, wake, or budget charge.
    logical `blocked` with that durable reason and exact owner recovery path;
    do not wake it.  Deliberate cancellation remains cancelled and STOP remains
    stopped.
-4. Otherwise atomically release T008's **interrupted existing attempt** to
-   `retryable`, retain its phase and partial state, clear only that attempt's
-   active fence, and make exactly its worker eligible for a retry claim. Do not
-   create a next attempt here, reset attempts/budget, or discard its branch.
+4. Otherwise leave T008's **interrupted existing attempt** terminally
+   `interrupted`; atomically set its logical work to `retryable`, retain its
+   phase and partial state, clear only that attempt's active fence, and make
+   exactly its worker eligible for a retry claim. Do not create a next attempt
+   here, reset attempts/budget, or discard its branch.
 5. The scheduler, not recovery, may select that retryable work. In one separate
    claim transaction it rechecks STOP/cancellation/owner-block and eligibility,
    creates the next attempt and its new fence, and changes the worker to claimed
@@ -180,9 +183,11 @@ provider retry without duplicating either implementation.
 ### Restart reconciliation and acceptance tests
 
 On startup, enumerate nonterminal fences and reconcile each in one transaction:
-unlaunched claim -> retryable; positively quiesced running attempt -> retryable;
-ambiguous/live ownership -> actionable block; result-persisted -> apply once;
-applied -> acknowledge once.  STOP/cancelled/owner-blocked states win every
+unlaunched claim -> terminal interrupted attempt plus logical work retryable;
+positively quiesced running attempt -> terminal interrupted attempt plus logical
+work retryable; ambiguous/live
+ownership -> actionable block; result-persisted -> apply once; applied ->
+acknowledge once.  STOP/cancelled/owner-blocked states win every
 branch.  Validate injected crashes before launch, during execution, between
 persist/apply/ack, duplicate recovery submission, stale completion, process
 survivor, each of the four roles, and restart after every boundary.  Assertions:

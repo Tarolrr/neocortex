@@ -218,6 +218,23 @@ def _structured_terminal_from_log(adapter: str, log_path: Path) -> tuple[str, st
         return None
 
 
+def has_successful_terminal(adapter: str, log_path: Path) -> bool:
+    """Verify the adapter-owned final success envelope (not prompt prose)."""
+    try:
+        lines = [line.strip() for line in log_path.read_text(errors="replace").splitlines()
+                 if line.strip()]
+        event = json.loads(lines[-1])
+    except (OSError, IndexError, json.JSONDecodeError):
+        return False
+    if not isinstance(event, dict):
+        return False
+    if adapter == "codex":
+        return event.get("type") == "turn.completed"
+    if adapter == "claude":
+        return event.get("type") == "result" and event.get("is_error") is not True
+    return False
+
+
 def _error_text(event: dict[str, object]) -> str:
     """Extract only fields owned by a terminal stream event.
 

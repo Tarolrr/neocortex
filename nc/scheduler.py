@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from . import arbiter, protocol, turn
-from .adapters import Adapter, assess_session, get_adapter
+from .adapters import Adapter, assess_session, get_adapter, has_successful_terminal
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_lock
 from .state import State
@@ -67,10 +67,9 @@ class Scheduler:
         assessment = assess_session(result, adapter.name)
         self._preflight_category = assessment.category if assessment.failed else None
         text = result.log_path.read_text(errors="replace")
-        # The probe's terminal nonblank response is the contract; an arbitrary
-        # OK somewhere in CLI/tool output is not completion evidence.
-        terminal = next((line.strip() for line in reversed(text.splitlines()) if line.strip()), "")
-        if assessment.failed or terminal != "OK":
+        # Production adapters use machine streams: success is their final
+        # terminal event, rather than prose which could be tool output.
+        if assessment.failed or not has_successful_terminal(adapter.name, result.log_path):
             tail = text.strip()[-500:]
             return False, f"model {model} is not usable ({assessment.category}): {tail}"
         return True, f"model {model} responds, {free_mb} MB free"
@@ -532,6 +531,11 @@ class Scheduler:
         self._in_run = True
         try:
             while max_turns == 0 or turns < max_turns:
+                deferred = self.state.one("SELECT MAX(defer_until) AS until FROM run"
+                                          " WHERE defer_until > ?", (time.time(),))
+                if deferred is not None and deferred["until"] is not None:
+                    log.info("provider retry is deferred until %s", deferred["until"])
+                    return True
                 if (self.cfg.home / "STOP").exists():
                     log.info("stop file present, exiting")
                     return True

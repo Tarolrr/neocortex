@@ -223,6 +223,7 @@ class State:
             ("run", "terminal_category", "TEXT"),
             ("run", "terminal_diagnostic", "TEXT"),
             ("run", "host_assessment", "TEXT"),
+            ("run", "defer_until", "REAL"),
         ):
             known = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             if column not in known:

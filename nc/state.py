@@ -181,6 +181,16 @@ class State:
                 replacement_id INTEGER UNIQUE REFERENCES proposal(id)
             )
         """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS plan_review_attempt (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id INTEGER NOT NULL REFERENCES plan_review(id),
+                run_id INTEGER NOT NULL REFERENCES run(id),
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                UNIQUE(run_id)
+            )
+        """)
         for table, column, decl in (
             ("proposal", "findings", "TEXT NOT NULL DEFAULT '[]'"),
             ("project", "mirror", "TEXT"),

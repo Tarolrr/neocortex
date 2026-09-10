@@ -173,8 +173,14 @@ def _record_outcome_read_failure(state: State, run_id: int, result,
 
 def _host_failure(role: str, assessment: HostAssessment) -> protocol.Outcome:
     detail = f" ({assessment.diagnostic})" if assessment.diagnostic else ""
-    return protocol.Outcome(kind=protocol.FAIL,
-                            summary=f"{role} host session failed: {assessment.category}{detail}")
+    return protocol.Outcome(
+        kind=protocol.FAIL,
+        summary=f"{role} host session failed: {assessment.category}{detail}",
+        # This is deliberately host-owned metadata, not an agent outcome.
+        raw={"host_deferred": assessment.category in {
+            "subscription_limit", "throttled", "overloaded", "transient",
+        }},
+    )
 
 
 def _no_outcome(role: str, exc: Exception) -> protocol.Outcome:
@@ -249,14 +255,16 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
         state.mark_delivered(inbox_ids)
     state.end_run(run_id, outcome.kind, outcome.summary, tokens)
     # Do not erase a wake arriving while this session was running.
+    deferred = bool(host_failure and host_failure.deferred)
     state.x(
-        "UPDATE agent SET turns=turns+1, memo=?,"
+        "UPDATE agent SET turns=turns+?, memo=?,"
         " state=CASE WHEN updated_at=? THEN ? ELSE state END WHERE id=?",
         # A parsed file from a failed host session is diagnostic evidence only;
         # it must not replace the planner context needed by a retry.
-        (agent["memo"] if host_failure is not None else outcome.memo or agent["memo"],
+        (0 if deferred else 1,
+         agent["memo"] if host_failure is not None else outcome.memo or agent["memo"],
          agent["updated_at"],
-         "blocked" if host_failure is not None else
+         "runnable" if deferred else "blocked" if host_failure is not None else
          ("runnable" if state.pending_revision(agent["id"]) else "done")
          if outcome.kind == protocol.DONE else "blocked", agent["id"]),
     )
@@ -292,12 +300,13 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
             # Persist what the agent wrote separately, then return a host
             # failure so scheduler handlers cannot apply it.
             state.end_run(run_id, outcome.kind, outcome.summary, tokens)
-            # A completed invocation still consumes a turn, as session
-            # exceptions historically did.  Keep its context intact so a
-            # retry sees the same memo and inbox.
-            state.set_agent(agent["id"], turns=agent["turns"] + 1,
-                            memo=agent["memo"])
-            return _host_failure(agent["role"], assessment)
+            failure = _host_failure(agent["role"], assessment)
+            # Provider deferral is not an agent turn.  The run remains the
+            # durable evidence, while memo/inbox/eligibility are untouched.
+            if not failure.deferred:
+                state.set_agent(agent["id"], turns=agent["turns"] + 1,
+                                memo=agent["memo"])
+            return failure
     except Exception as exc:
         logging.getLogger(__name__).exception("%s session failed", agent["role"])
         outcome = _no_outcome(agent["role"], exc)
@@ -336,14 +345,22 @@ def build_plan_critic_brief(state: State, proposal: sqlite3.Row,
 
 def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
                          adapter: Adapter) -> protocol.Outcome:
-    # Claim before starting: even a crash or invalid output consumes this attempt.
-    claim = state.x(
-        "INSERT OR IGNORE INTO plan_review(proposal_id,spec) VALUES(?,?)",
-        (proposal["id"], proposal["spec"]),
-    )
-    if not claim.rowcount:
-        return protocol.Outcome(kind=protocol.DONE, summary="Already reviewed")
-    review_id = claim.lastrowid
+    # A review is one logical `(proposal, spec)` item.  Only terminal provider
+    # evidence releases its claim; malformed advice retains the old failed
+    # policy and completed advice is never replayed.
+    claim = state.x("INSERT OR IGNORE INTO plan_review(proposal_id,spec) VALUES(?,?)",
+                    (proposal["id"], proposal["spec"]))
+    if claim.rowcount:
+        review_id = claim.lastrowid
+    else:
+        review = state.one("SELECT * FROM plan_review WHERE proposal_id=? AND spec=?",
+                           (proposal["id"], proposal["spec"]))
+        if review is None or review["status"] != "retryable":
+            return protocol.Outcome(kind=protocol.DONE, summary="Already reviewed")
+        if not state.x("UPDATE plan_review SET status='running' WHERE id=? AND status='retryable'",
+                       (review["id"],)).rowcount:
+            return protocol.Outcome(kind=protocol.DONE, summary="Review is already running")
+        review_id = review["id"]
     agent_id = f"plan-critic-{review_id}"
     model = cfg.model_for("plan_critic")
     state.add_agent(agent_id, "plan_critic", proposal["project_id"], None, model)
@@ -351,6 +368,8 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "session.log"
     run_id = state.start_run(agent_id, None, "plan_critic", model, str(log_path))
+    state.x("INSERT INTO plan_review_attempt(review_id,run_id,status,created_at) VALUES(?,?,?,?)",
+            (review_id, run_id, "running", time.time()))
     tokens = None
     result_recorded = False
     outcome_read = False
@@ -368,13 +387,17 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
         outcome = protocol.read_outcome(outcome_path)
         outcome_read = True
         if assessment.failed:
-            state.x("UPDATE plan_review SET status='failed', recommendation=? WHERE id=?",
-                    (f"host session failed: {assessment.category}", review_id))
+            failure = _host_failure("Plan review", assessment)
+            status = "retryable" if failure.deferred else "failed"
+            state.x("UPDATE plan_review SET status=?, recommendation=? WHERE id=?",
+                    (status, f"host session failed: {assessment.category}", review_id))
+            state.x("UPDATE plan_review_attempt SET status=? WHERE run_id=?",
+                    (status, run_id))
             state.end_run(run_id, outcome.kind, outcome.summary, tokens)
             # This advisory agent has completed its one attempt even though
             # the review itself must remain failed and unapplied.
-            state.set_agent(agent_id, state="done", turns=1)
-            return _host_failure("Plan review", assessment)
+            state.set_agent(agent_id, state="done", turns=0 if failure.deferred else 1)
+            return failure
         recommendation = outcome.raw.get("recommendation")
         if outcome.kind != protocol.DONE or not isinstance(recommendation, str):
             raise ValueError("plan critic requires DONE with a recommendation")
@@ -385,6 +408,7 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
             "UPDATE plan_review SET status='done', findings=?, recommendation=? WHERE id=?",
             (json.dumps(findings), recommendation, review_id),
         )
+        state.x("UPDATE plan_review_attempt SET status='done' WHERE run_id=?", (run_id,))
     except Exception as exc:
         logging.getLogger(__name__).exception("Plan review %s failed", review_id)
         # Validation happens after a parsed agent file; preserve it as a
@@ -401,6 +425,7 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
                                          assessment="FAILED")
         state.x("UPDATE plan_review SET status='failed', recommendation=? WHERE id=?",
                 (outcome.summary, review_id))
+        state.x("UPDATE plan_review_attempt SET status='failed' WHERE run_id=?", (run_id,))
     state.end_run(run_id, outcome.kind, outcome.summary, tokens)
     state.set_agent(agent_id, state="done", turns=1)
     return outcome

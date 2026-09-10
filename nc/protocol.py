@@ -43,6 +43,11 @@ class Outcome:
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def deferred(self) -> bool:
+        """True only for a host-classified, timer-retryable provider session."""
+        return bool(self.raw.get("host_deferred"))
+
+    @property
     def ok(self) -> bool:
         return self.kind in VALID_OUTCOMES
 

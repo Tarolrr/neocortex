@@ -64,7 +64,7 @@ Keep durable work, routed messages, attempts, incidents, outcome files, checks, 
 ```
 
 ```json
-{"id":"attempt:902","work_id":"review:17:sha256:abc","role":"plan_critic","attempt_no":2,"status":"deferred","execution_id":"run:1441","reason":"host timeout"}
+{"id":"attempt:902","work_id":"review:17:sha256:abc","role":"plan_critic","attempt_no":2,"status":"retryable","execution_id":"run:1441","reason":"adapter_terminal:provider_rate_limited"}
 ```
 
 ```json
@@ -77,7 +77,7 @@ Schema 1 requires nonempty id/kind/sender/recipient/sender_request_id, integer `
 
 Order: validate -> route/authorize -> persist idempotently on `(sender,kind,sender_request_id)` -> atomically domain apply plus receipt -> ack. Retry returns receipt; it cannot repeat wake, merge, rework, supersession, or replacement. Mixed migration: schema-1 readers retain schema-0 legacy semantics; writers dual-write legacy until all readers upgrade; old readers ignore additive tables; unknown newer values quarantine undelivered.
 
-Crash sequences: pre-commit leaves pending; post-commit/pre-response retry finds receipt then acks. Owner feedback receipt supersedes proposal and creates revision; correlated planner replacement is idempotent. Plan review attempt 1 may defer, attempt 2 crash/release expired claim, attempt 3 complete; later attempts see completed. Host ownership checks decide whether an active run can be reclaimed.
+Crash sequences: pre-commit leaves pending; post-commit/pre-response retry finds receipt then acks. Owner feedback receipt supersedes proposal and creates revision; correlated planner replacement is idempotent. A plan review may become retryable only on terminal adapter-specific temporary-provider evidence; a later attempt may crash and release its expired claim, and a subsequent attempt may complete; later attempts see completed. A host timeout is instead interrupted/retryable after positive ownership proof, or actionably blocked if ownership is ambiguous. Host ownership checks decide whether an active run can be reclaimed.
 
 ## Proposed interruption-recovery contract (run 93)
 
@@ -101,6 +101,19 @@ role-specific application, receipt and acknowledgement are separately
 idempotent transactions keyed by `(work_id, attempt_no, fence)`.  A completion
 or acknowledgement with a stale fence is rejected and recorded; it can never
 alter memo, inbox, task/review/proposal state, budgets, or acceptance.
+
+**Normative budget boundary.** Every role has a turn budget.  Charge exactly
+one turn, exactly once, in the same transaction that records successful adapter
+launch/ownership and changes its attempt from `claimed` to `running`.  Do not
+charge a merely claimed or pre-launch attempt.  A launched attempt retains that
+charge if it is interrupted, cancelled after launch, provider-retryable, or
+later rejected; each separately launched retry charges one more turn.  Recovery,
+restart reconciliation, duplicate submissions and stale completions never
+charge or refund a turn.  This rule applies uniformly to workers, change
+critics, planners and plan critics; `attempt_no`/failure history are preserved
+and are not budget counters.  Only an explicit, audited owner action may add
+budget capacity; it records the amount and reason and neither resets spent
+turns nor alters prior attempts.
 
 Ownership proof is a matching scheduler identity plus the dedicated adapter
 cgroup/process identity observed empty or otherwise positively quiescent.  A
@@ -147,19 +160,18 @@ future attempt, and the scheduler never closes the interrupted attempt.
 | recovery after positive quiescence | attempt N `running`, logical work in its existing phase | mark run and attempt N `interrupted`; preserve state; release fence N; logical work `retryable` | exact role eligible; no active fence; no attempt N+1 |
 | recovery with STOP/cancel/owner block/ambiguous survivor | attempt N nonterminal | close only if ownership allows; otherwise retain evidence; write or retain durable block reason/action | not eligible; no active fence only after positive quiescence |
 | scheduler claim | `retryable`, no active fence, role eligible | recheck exclusion and logical state; create attempt N+1/fence N+1; mark claim | one active fence, one claimed/running role |
-| duplicate recovery or scheduler race | recovery receipt or active fence exists | find receipt / conditional claim fails | no new attempt, wake, or budget charge |
+| duplicate recovery or scheduler race | recovery receipt or active fence exists | find receipt / conditional claim fails | no new attempt, wake, or budget charge/refund |
 
 | Event/role | durable logical work and partial state | eligibility / retry | feedback and budget |
 | --- | --- | --- | --- |
-| worker interrupted | preserve branch, memo, undelivered inbox and phase | retry existing phase after ownership proof; otherwise actionable block | charge only a started attempt by explicit policy; no automatic reset |
-| change critic interrupted | preserve worker's review phase and critic memo/inbox | release unique review claim; one next critic attempt, never concurrent | no duplicated verdict/rework/acceptance |
-| planner interrupted | preserve proposal, feedback, revision lineage and planner memo | retry planner phase; do not recreate/supersede proposal | feedback receipt prevents duplicate wake/revision; budget policy explicit |
-| plan critic interrupted | preserve proposal/spec and advisory history | release recoverable unique claim; only one completed advisory result | no repeated completed advice; owner still decides |
+| worker interrupted | preserve branch, memo, undelivered inbox and phase | retry existing phase after ownership proof; otherwise actionable block | a running attempt has already charged one turn; a retry charges only at its own launch; no reset |
+| change critic interrupted | preserve worker's review phase and critic memo/inbox | release unique review claim; one next critic attempt, never concurrent | same launch-only charge; no duplicated verdict/rework/acceptance |
+| planner interrupted | preserve proposal, feedback, revision lineage and planner memo | retry planner phase; do not recreate/supersede proposal | same launch-only charge; feedback receipt prevents duplicate wake/revision |
+| plan critic interrupted | preserve proposal/spec and advisory history | release recoverable unique claim; only one completed advisory result | same launch-only charge; no repeated completed advice; owner still decides |
 
-Budgets are charged at a documented boundary (recommended: successful launch,
-not pre-launch); a crash before launch consumes none, and recovery never resets
-turns/attempts.  An owner can deliberately allocate more budget through an
-explicit audited action.  A provider deferral requires terminal,
+Thus a crash before launch consumes no turn; a crash during execution consumes
+the one launch charge, and recovery never resets turns/attempts.  A provider
+retry classification requires terminal,
 adapter-specific evidence of a temporary provider category; host death,
 timeout, SIGTERM, local launcher failure, and unknown evidence are not that.
 This remains compatible with T008's host classification and T009's local

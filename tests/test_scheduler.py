@@ -1407,6 +1407,10 @@ def test_typed_provider_exception_persists_reset_epoch_for_every_role(setup, rol
         outcome = turn.run_plan_critic_turn(
             state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter,
         )
+        reviewer = state.one(
+            "SELECT turns FROM agent WHERE role='plan_critic' ORDER BY id DESC"
+        )
+        assert reviewer["turns"] == 0
     run = state.one("SELECT * FROM run ORDER BY id DESC")
     assert outcome.deferred
     assert run["terminal_category"] == "throttled"

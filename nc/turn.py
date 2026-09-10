@@ -444,6 +444,7 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
     outcome_read = False
     assessment: HostAssessment | None = None
     saved_failure: protocol.Outcome | None = None
+    exceptional: HostAssessment | None = None
     try:
         outcome_path = run_dir / "outcome.json"
         brief = build_plan_critic_brief(state, proposal, outcome_path)
@@ -504,6 +505,10 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
                 (status, (saved_failure or outcome).summary, review_id))
         state.x("UPDATE plan_review_attempt SET status=? WHERE run_id=?", (status, run_id))
     state.end_run(run_id, outcome.kind, outcome.summary, tokens)
-    deferred = bool(saved_failure and saved_failure.deferred)
+    # A typed launch exception is the same temporary provider evidence as a
+    # terminal SessionResult failure.  It has no saved SessionResult, but it
+    # still represents an interrupted host attempt rather than advice from
+    # this stable logical reviewer, so it must not spend its turn budget.
+    deferred = bool((saved_failure and saved_failure.deferred) or exceptional)
     state.set_agent(agent_id, state="done", turns=0 if deferred else 1)
     return saved_failure or outcome

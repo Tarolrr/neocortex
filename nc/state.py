@@ -191,6 +191,18 @@ class State:
                 UNIQUE(run_id)
             )
         """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS preflight_attempt (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                adapter TEXT NOT NULL,
+                model TEXT NOT NULL,
+                category TEXT NOT NULL,
+                diagnostic TEXT NOT NULL,
+                defer_until REAL,
+                created_at REAL NOT NULL
+            )
+        """)
         for table, column, decl in (
             ("proposal", "findings", "TEXT NOT NULL DEFAULT '[]'"),
             ("project", "mirror", "TEXT"),
@@ -224,6 +236,7 @@ class State:
             ("run", "terminal_diagnostic", "TEXT"),
             ("run", "host_assessment", "TEXT"),
             ("run", "defer_until", "REAL"),
+            ("preflight_attempt", "defer_until", "REAL"),
         ):
             known = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             if column not in known:
@@ -527,6 +540,77 @@ class State:
             (agent_id, role, project_id, task_id, model, now, now),
         )
         return agent_id
+
+    def claim_plan_review(self, proposal_id: int, spec: str, project_id: str,
+                          model: str) -> int | None:
+        """Atomically claim the one review for a still-current proposal.
+
+        The plan critic has a stable logical identity across provider attempts;
+        its individual executions are represented by ``plan_review_attempt``.
+        """
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            proposal = self.one("SELECT status, spec FROM proposal WHERE id=?", (proposal_id,))
+            if proposal is None or proposal["status"] != "pending" or proposal["spec"] != spec:
+                return None
+            inserted = self.db.execute(
+                "INSERT OR IGNORE INTO plan_review(proposal_id,spec) VALUES(?,?)",
+                (proposal_id, spec),
+            ).rowcount == 1
+            review = self.one("SELECT id, status FROM plan_review WHERE proposal_id=? AND spec=?",
+                              (proposal_id, spec))
+            if review is None or review["status"] in ("done", "failed"):
+                return None
+            if review["status"] == "running" and not inserted:
+                return None
+            if review["status"] == "retryable":
+                changed = self.db.execute(
+                    "UPDATE plan_review SET status='running' WHERE id=? AND status='retryable'",
+                    (review["id"],),
+                )
+                if changed.rowcount != 1:
+                    return None
+            now = time.time()
+            agent_id = f"plan-critic-{review['id']}"
+            self.db.execute(
+                "INSERT OR IGNORE INTO agent(id,role,project_id,task_id,state,model,created_at,updated_at)"
+                " VALUES(?,?,?,?,'runnable',?,?,?)",
+                (agent_id, "plan_critic", project_id, None, model, now, now),
+            )
+            return int(review["id"])
+
+    def record_preflight_attempt(self, role: str, adapter: str, model: str,
+                                 category: str, diagnostic: str,
+                                 defer_until: float | None = None) -> None:
+        """Keep provider readiness failures observable without creating an incident."""
+        self.x("INSERT INTO preflight_attempt(role,adapter,model,category,diagnostic,defer_until,created_at)"
+               " VALUES(?,?,?,?,?,?,?)",
+               (role, adapter, model, category, diagnostic[:1000], defer_until, time.time()))
+
+    def complete_plan_review(self, review_id: int, proposal_id: int, spec: str,
+                             run_id: int, findings: str, recommendation: str) -> bool:
+        """Apply advice only if the reviewed proposal is still exactly pending."""
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            current = self.one("SELECT status, spec FROM proposal WHERE id=?", (proposal_id,))
+            if current is None or current["status"] != "pending" or current["spec"] != spec:
+                self.db.execute(
+                    "UPDATE plan_review SET status='failed', recommendation=? WHERE id=?"
+                    " AND status='running'",
+                    ("proposal changed while review was running", review_id),
+                )
+                self.db.execute("UPDATE plan_review_attempt SET status='failed' WHERE run_id=?",
+                                (run_id,))
+                return False
+            changed = self.db.execute(
+                "UPDATE plan_review SET status='done', findings=?, recommendation=?"
+                " WHERE id=? AND status='running'",
+                (findings, recommendation, review_id),
+            )
+            if changed.rowcount != 1:
+                return False
+            self.db.execute("UPDATE plan_review_attempt SET status='done' WHERE run_id=?", (run_id,))
+            return True
 
     def planner_feedback(self, project_id: str | None, text: str, model: str,
                          task_id: str | None = None,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import subprocess
 import time
@@ -44,6 +45,17 @@ class Scheduler:
 
     def _adapter_for(self, role: str) -> Adapter:
         return get_adapter(self.cfg.adapter_for(role))
+
+    @staticmethod
+    def _defer_until(detail: str) -> float | None:
+        """Trust only bounded epoch reset evidence from a provider diagnostic."""
+        match = re.search(r"(?:retry|reset)[ _-]?(?:at|until)[:= ]+(1[0-9]{9}(?:\.[0-9]+)?)",
+                          detail, re.IGNORECASE)
+        if match:
+            until = float(match.group(1))
+            if time.time() < until <= time.time() + 7 * 86400:
+                return until
+        return None
 
     # --- preflight --------------------------------------------------------
     def preflight(self) -> tuple[bool, str]:
@@ -82,8 +94,19 @@ class Scheduler:
             return None
         self._preflight_role = role
         self._preflight_category = None
-        ok, detail = self.preflight()
         self._preflight_pairs.add(pair)
+        try:
+            ok, detail = self.preflight()
+        except Exception as exc:
+            # Adapters may fail before producing a SessionResult.  Typed
+            # provider evidence has the same timer-deferral policy as a turn.
+            assessment = turn._exception_assessment(exc)
+            if assessment is None:
+                self.state.incident("preflight", str(exc))
+                log.exception("preflight failed")
+                return "preflight_failed"
+            self._preflight_category = assessment.category
+            ok, detail = False, f"model {pair[1]} is not usable ({assessment.category}): {assessment.diagnostic}"
         if ok:
             return None
         # Preflight output is host diagnostics.  It has no task/agent effects.
@@ -92,6 +115,9 @@ class Scheduler:
         if self._preflight_category in {
             "subscription_limit", "throttled", "overloaded", "transient",
         }:
+            self.state.record_preflight_attempt(role, pair[0], pair[1],
+                                                self._preflight_category, detail,
+                                                self._defer_until(detail))
             log.warning("temporary %s preflight failure: %s", role, detail)
             return "deferred"
         self.state.incident("preflight", detail)
@@ -531,8 +557,12 @@ class Scheduler:
         self._in_run = True
         try:
             while max_turns == 0 or turns < max_turns:
-                deferred = self.state.one("SELECT MAX(defer_until) AS until FROM run"
-                                          " WHERE defer_until > ?", (time.time(),))
+                deferred = self.state.one(
+                    "SELECT MAX(defer_until) AS until FROM ("
+                    " SELECT defer_until FROM run WHERE defer_until > ?"
+                    " UNION ALL SELECT defer_until FROM preflight_attempt WHERE defer_until > ?"
+                    ")", (time.time(), time.time()),
+                )
                 if deferred is not None and deferred["until"] is not None:
                     log.info("provider retry is deferred until %s", deferred["until"])
                     return True

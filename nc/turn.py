@@ -373,25 +373,14 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
     # The scheduler selection is only a hint: feedback can supersede a
     # proposal after selection and before this call obtains its review claim.
     # Never revive advice for a nonpending or changed proposal.
-    current = state.one("SELECT status, spec FROM proposal WHERE id=?", (proposal["id"],))
-    if current is None or current["status"] != "pending" or current["spec"] != proposal["spec"]:
-        return protocol.Outcome(kind=protocol.DONE, summary="Proposal is no longer pending")
-    claim = state.x("INSERT OR IGNORE INTO plan_review(proposal_id,spec) VALUES(?,?)",
-                    (proposal["id"], proposal["spec"]))
-    if claim.rowcount:
-        review_id = claim.lastrowid
-    else:
-        review = state.one("SELECT * FROM plan_review WHERE proposal_id=? AND spec=?",
-                           (proposal["id"], proposal["spec"]))
-        if review is None or review["status"] != "retryable":
-            return protocol.Outcome(kind=protocol.DONE, summary="Already reviewed")
-        if not state.x("UPDATE plan_review SET status='running' WHERE id=? AND status='retryable'",
-                       (review["id"],)).rowcount:
-            return protocol.Outcome(kind=protocol.DONE, summary="Review is already running")
-        review_id = review["id"]
-    agent_id = f"plan-critic-{review_id}"
     model = cfg.model_for("plan_critic")
-    state.add_agent(agent_id, "plan_critic", proposal["project_id"], None, model)
+    # The ID is stable for the logical review.  Claiming also creates it only
+    # once, so a retry adds another run/attempt rather than another agent.
+    review_id = state.claim_plan_review(proposal["id"], proposal["spec"], proposal["project_id"],
+                                        model)
+    if review_id is None:
+        return protocol.Outcome(kind=protocol.DONE, summary="Proposal is no longer reviewable")
+    agent_id = f"plan-critic-{review_id}"
     run_dir = cfg.runs_dir / f"{agent_id}_{time.time_ns()}"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "session.log"
@@ -432,11 +421,10 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
         findings = outcome.raw.get("findings")
         if not isinstance(findings, list) or any(not isinstance(f, str) for f in findings):
             raise ValueError("plan critic requires a list of findings")
-        state.x(
-            "UPDATE plan_review SET status='done', findings=?, recommendation=? WHERE id=?",
-            (json.dumps(findings), recommendation, review_id),
-        )
-        state.x("UPDATE plan_review_attempt SET status='done' WHERE run_id=?", (run_id,))
+        if not state.complete_plan_review(review_id, proposal["id"], proposal["spec"], run_id,
+                                          json.dumps(findings), recommendation):
+            outcome = protocol.Outcome(kind=protocol.DONE,
+                                       summary="Proposal changed while review was running")
     except Exception as exc:
         logging.getLogger(__name__).exception("Plan review %s failed", review_id)
         exceptional = _exception_assessment(exc)

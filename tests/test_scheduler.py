@@ -1293,6 +1293,65 @@ def test_plan_critic_host_failure_with_done_cannot_complete_review(setup, failur
     )
 
 
+def test_plan_critic_provider_retry_reuses_logical_review_and_records_attempts(setup):
+    """A timer's next invocation retries advice, not a new logical review."""
+    cfg, state, _repo = setup
+    proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+    adapter = ScriptedAdapter([
+        emit({"outcome": "DONE", "recommendation": "discard", "findings": []}),
+        emit({"outcome": "DONE", "recommendation": "keep", "findings": ["one"]}),
+    ])
+    adapter.run_planner = adapter.run
+    original = adapter.run_planner
+
+    def temporarily_unavailable(*args):
+        result = original(*args)
+        result.terminal_category = "transient"
+        return result
+
+    adapter.run_planner = temporarily_unavailable
+    scheduler = sched(cfg, state, [])
+    scheduler._adapter_for = lambda _role: adapter
+    assert scheduler.step() == "deferred"
+    review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+    assert review["status"] == "retryable"
+    adapter.run_planner = original
+    assert scheduler.step() == protocol.DONE
+    review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+    attempts = state.q("SELECT status FROM plan_review_attempt WHERE review_id=? ORDER BY id",
+                       (review["id"],))
+    assert review["status"] == "done" and review["recommendation"] == "keep"
+    assert [row["status"] for row in attempts] == ["retryable", "done"]
+    assert state.one("SELECT COUNT(*) FROM agent WHERE id=?", (f"plan-critic-{review['id']}",))[0] == 1
+
+
+def test_typed_preflight_exception_defers_without_incident_and_retries(setup, monkeypatch):
+    cfg, state, _repo = setup
+    state.add_task("neocortex", "preflight retry", "objective", [])
+    scheduler = sched(cfg, state, [emit({"outcome": "YIELD", "summary": "later"})])
+    monkeypatch.setattr(scheduler, "readiness", lambda: (True, "test"))
+
+    class ProviderUnavailable(Exception):
+        terminal_category = "throttled"
+
+    calls = [ProviderUnavailable("retry at 1999999999"), None]
+
+    def preflight():
+        item = calls.pop(0)
+        if item:
+            raise item
+        return True, "ok"
+
+    monkeypatch.setattr(scheduler, "preflight", preflight)
+    assert scheduler.run(max_turns=1)
+    assert not scheduler.adapter.calls
+    attempt = state.one("SELECT * FROM preflight_attempt")
+    assert attempt["role"] == "worker" and attempt["category"] == "throttled"
+    assert not state.open_incidents()
+    assert scheduler.run(max_turns=1)
+    assert len(scheduler.adapter.calls) == 1
+
+
 @pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
 def test_planner_host_failure_with_valid_done_keeps_revision_context(setup, failure):
     """A planner's valid proposal never consumes feedback after host failure."""

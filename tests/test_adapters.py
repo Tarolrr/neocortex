@@ -74,11 +74,11 @@ def test_legacy_text_envelope_is_not_terminal_evidence(tmp_path):
 
 
 @pytest.mark.parametrize(("adapter", "fixture", "expected"), [
-    ("codex", "codex-0.86.0-terminal-error.jsonl", "throttled"),
-    ("claude", "claude-2.1.76-terminal-error.jsonl", "authentication"),
+    ("codex", "codex-terminal-error.synthetic.jsonl", "throttled"),
+    ("claude", "claude-terminal-error.synthetic.jsonl", "authentication"),
 ])
-def test_captured_versioned_terminal_jsonl_fixture(tmp_path, adapter, fixture, expected):
-    """Captured JSONL shape, labeled by pinned CLI version; no live call."""
+def test_synthetic_unverified_terminal_jsonl_fixture(tmp_path, adapter, fixture, expected):
+    """Synthetic, unverified JSONL shape; no live call or version claim."""
     path = tmp_path / "session.log"
     path.write_text((Path(__file__).parent / "fixtures" / fixture).read_text())
     assessment = assess_session(SessionResult(0, path, None, False), adapter)

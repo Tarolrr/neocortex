@@ -156,6 +156,21 @@ def _record_host(state: State, run_id: int, result, assessment: HostAssessment) 
     )
 
 
+def _record_outcome_read_failure(state: State, run_id: int, result,
+                                 exc: Exception) -> None:
+    """Replace a completed-session assessment when its local output is unreadable.
+
+    A SessionResult is still useful evidence (in particular its exit status and
+    timeout observation), but an OSError while reading the agent-owned outcome
+    is a host filesystem failure, not a successful host session.
+    """
+    state.record_host_assessment(
+        run_id, exit_code=result.exit_code, timed_out=result.timed_out,
+        category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
+        assessment="FAILED",
+    )
+
+
 def _host_failure(role: str, assessment: HostAssessment) -> protocol.Outcome:
     detail = f" ({assessment.diagnostic})" if assessment.diagnostic else ""
     return protocol.Outcome(kind=protocol.FAIL,
@@ -179,6 +194,7 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
     run_session = getattr(adapter, "run_planner", adapter.run)
     tokens = None
     result_recorded = False
+    outcome_read = False
     try:
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
@@ -187,6 +203,7 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
         _record_host(state, run_id, result, assessment)
         result_recorded = True
         outcome = protocol.read_outcome(outcome_path)
+        outcome_read = True
         if assessment.failed:
             # Keep parsed outcome in the run for diagnosis, but never let it
             # create a proposal/question or consume planner context.
@@ -195,7 +212,9 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
     except Exception as exc:
         logging.getLogger(__name__).exception("Planner session failed")
         outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Planner session failure: {exc}")
-        if not result_recorded:
+        if result_recorded and not outcome_read:
+            _record_outcome_read_failure(state, run_id, result, exc)
+        elif not result_recorded:
             # The adapter raised before yielding a SessionResult, so timeout
             # status was never observed.  Keep that evidence explicitly unknown.
             state.record_host_assessment(run_id, exit_code=None, timed_out=None,
@@ -244,6 +263,7 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
     run_id = state.start_run(agent["id"], agent["task_id"], agent["role"], model, str(log_path))
     tokens = None
     result_recorded = False
+    outcome_read = False
     try:
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = adapter.run(brief, cwd, model, log_path, cfg.turn_timeout_s)
@@ -252,6 +272,7 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
         _record_host(state, run_id, result, assessment)
         result_recorded = True
         outcome = protocol.read_outcome(outcome_path)
+        outcome_read = True
         if assessment.failed:
             # Persist what the agent wrote separately, then return a host
             # failure so scheduler handlers cannot apply it.
@@ -261,7 +282,9 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
         logging.getLogger(__name__).exception("%s session failed", agent["role"])
         outcome = protocol.Outcome(kind=protocol.FAIL,
                                    summary=f"{agent['role']} session failure: {exc}")
-        if not result_recorded:
+        if result_recorded and not outcome_read:
+            _record_outcome_read_failure(state, run_id, result, exc)
+        elif not result_recorded:
             # No SessionResult was returned: do not invent a completed timeout state.
             state.record_host_assessment(run_id, exit_code=None, timed_out=None,
                                          category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
@@ -311,6 +334,7 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
     run_id = state.start_run(agent_id, None, "plan_critic", model, str(log_path))
     tokens = None
     result_recorded = False
+    outcome_read = False
     try:
         outcome_path = run_dir / "outcome.json"
         brief = build_plan_critic_brief(state, proposal, outcome_path)
@@ -323,6 +347,7 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
         _record_host(state, run_id, result, assessment)
         result_recorded = True
         outcome = protocol.read_outcome(outcome_path)
+        outcome_read = True
         if assessment.failed:
             state.x("UPDATE plan_review SET status='failed', recommendation=? WHERE id=?",
                     (f"host session failed: {assessment.category}", review_id))
@@ -341,10 +366,10 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
     except Exception as exc:
         logging.getLogger(__name__).exception("Plan review %s failed", review_id)
         outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Plan review unavailable: {exc}")
-        # A launcher/read/validation failure has no SessionResult evidence.
-        # Do not overwrite structured evidence recorded above.
-        if not result_recorded:
-            # A launcher/read/validation exception has no timeout observation.
+        if result_recorded and not outcome_read:
+            _record_outcome_read_failure(state, run_id, result, exc)
+        elif not result_recorded:
+            # A launcher failure has no timeout observation.
             state.record_host_assessment(run_id, exit_code=None, timed_out=None,
                                          category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
                                          assessment="FAILED")

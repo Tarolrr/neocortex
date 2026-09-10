@@ -38,10 +38,14 @@ stream-json --verbose` ([Claude CLI reference](https://code.claude.com/docs/en/c
 retrieved 2026-09-10). The adapter accepts only a final JSON error event:
 Codex `{"type":"error","message":...}` or Claude
 `{"type":"result","is_error":true,"result":...}`. That structured
-terminal evidence wins even with exit zero. Version-labelled JSONL fixtures
-(`codex-0.86.0-*`, `claude-2.1.76-*`) are offline captured-format fixtures,
-not owner incidents and not a claim that every release has the same grammar.
-They exercise temporary and permanent classifications without a paid call.
+terminal evidence wins even with exit zero. The JSONL fixtures are **synthetic
+and unverified terminal-format examples**, not captures and
+not owner incidents. The pinned-version distribution metadata establishes only
+that bootstrap pins Codex 0.86.0 and Claude Code 2.1.76; it does **not**
+support the event grammar above. No retained capture provenance or
+version-specific primary-source terminal-event schema is currently available,
+so these examples must not be read as version-specific evidence. They exercise
+temporary and permanent classifications without a paid call.
 
 The old `Codex API Error: <code>` / `Claude API Error: <code>` text envelopes
 are **synthetic, unverified** and are no longer classified. Any arbitrary

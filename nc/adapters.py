@@ -262,6 +262,21 @@ def assess_session(result: SessionResult, _adapter: str) -> HostAssessment:
     """Apply host evidence precedence before an outcome can have effects."""
     if result.timed_out:
         return HostAssessment("FAILED", "host_timeout", "host timeout")
+    # On POSIX, subprocess reports a signal-terminated child as -SIGNUM.
+    # This is independent host evidence even when the deadline wrapper did not
+    # set ``timed_out`` (for example, containment/recovery killed the process).
+    # Keep it ahead of adapter diagnostics: the diagnostic may describe an
+    # earlier provider error, but it cannot erase the terminal host kill.
+    if result.exit_code < 0:
+        signum = -result.exit_code
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = f"signal {signum}"
+        return HostAssessment(
+            "FAILED", "host_timeout",
+            sanitize_diagnostic(f"host-killed process terminated by {name} ({signum})"),
+        )
     terminal_category = getattr(result, "terminal_category", None)
     if terminal_category:
         category = terminal_category if terminal_category in _TERMINAL_CATEGORIES else "unknown"

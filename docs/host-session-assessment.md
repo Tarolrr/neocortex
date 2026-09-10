@@ -28,7 +28,7 @@ host evidence. Old rows display as `legacy/unknown`.
 | `invalid_request` | Invalid model or request. |
 | `billing_credits` | Exhausted API billing/credits. `insufficient_quota` without a specific terminal diagnostic is not proof of a subscription resettable limit. |
 | `local_error` | Launcher, filesystem, or outcome-reading exception on this host. |
-| `host_timeout` | Runner deadline/kill. |
+| `host_timeout` | Runner deadline or observed host-signal kill (including a negative POSIX signal exit status). |
 | `protocol` | Reserved for a structured adapter terminal protocol defect. |
 | `unknown` | Unsupported or insufficient evidence. |
 
@@ -63,7 +63,7 @@ Fixtures in tests are synthetic unless a test says otherwise. No historical
 owner incident is called verified without its original run log and terminal
 evidence; no such incident is asserted here.
 
-Execution precedence is: timeout, structured terminal failure, nonzero exit,
+Execution precedence is: timeout/host-signal kill, structured terminal failure, nonzero exit,
 then parsed outcome. A host failure records usage and run evidence but cannot
 acknowledge inbox/memo, create a proposal or question, apply a task verdict,
 or complete an advisory plan review.

@@ -149,6 +149,39 @@ def test_host_assessment_precedence(tmp_path, exit_code, timed_out, category, ex
 
 
 @pytest.mark.parametrize("adapter", ["codex", "claude"])
+def test_signal_killed_session_is_host_failure_for_both_adapter_paths(tmp_path, adapter):
+    """Synthetic process status: a host SIGKILL is not an unknown bad exit."""
+    path = tmp_path / "session.log"
+    path.write_text('{"type":"error","message":"rate_limit_exceeded"}\n')
+    assessment = assess_session(
+        SessionResult(-9, path, None, False, "throttled", "rate_limit_exceeded"), adapter,
+    )
+    assert (assessment.status, assessment.category) == ("FAILED", "host_timeout")
+    assert "SIGKILL (9)" in assessment.diagnostic
+
+
+@pytest.mark.parametrize("adapter", ["codex", "claude"])
+def test_run_preserves_signal_exit_code_for_both_adapter_paths(tmp_path, monkeypatch, adapter):
+    """Synthetic adapter process verifies the real runner path retains -SIGNUM."""
+    class Proc:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return -9
+
+    def popen(cmd, **kwargs):
+        kwargs["stdout"].write("killed by test host\n")
+        return Proc()
+
+    monkeypatch.setattr("nc.adapters.subprocess.Popen", popen)
+    command = [adapter if adapter == "codex" else "/usr/bin/claude", "exec"]
+    result = _run(command, tmp_path, tmp_path / "session.log", 10)
+    assessment = assess_session(result, adapter)
+    assert result.exit_code == -9
+    assert assessment.category == "host_timeout"
+
+
+@pytest.mark.parametrize("adapter", ["codex", "claude"])
 def test_successful_retry_output_is_not_terminal_evidence(tmp_path, adapter):
     """Synthetic recovered stream: only terminal structured evidence can fail a zero exit."""
     path = tmp_path / "session.log"

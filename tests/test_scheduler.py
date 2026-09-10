@@ -1313,6 +1313,8 @@ def test_planner_host_failure_with_valid_done_keeps_revision_context(setup, fail
     assert run["outcome"] == protocol.DONE and run["host_assessment"] == "FAILED"
     assert state.pending_revision(planner_id) is not None
     assert len(state.q("SELECT * FROM proposal")) == 1
+    agent = state.one("SELECT state, turns FROM agent WHERE id=?", (planner_id,))
+    assert (agent["state"], agent["turns"]) == ("blocked", 1)
 
 
 @pytest.mark.parametrize('role', ['worker', 'critic', 'capacity'])

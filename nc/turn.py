@@ -206,6 +206,7 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
     tokens = None
     result_recorded = False
     outcome_read = False
+    host_failure: protocol.Outcome | None = None
     try:
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
@@ -218,8 +219,7 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
         if assessment.failed:
             # Keep parsed outcome in the run for diagnosis, but never let it
             # create a proposal/question or consume planner context.
-            state.end_run(run_id, outcome.kind, outcome.summary, tokens)
-            return _host_failure("Planner", assessment)
+            host_failure = _host_failure("Planner", assessment)
     except Exception as exc:
         logging.getLogger(__name__).exception("Planner session failed")
         outcome = _no_outcome("Planner", exc)
@@ -232,20 +232,20 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
                                          category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
                                          assessment="FAILED")
     try:
-        if outcome.kind == protocol.DONE:
+        if host_failure is None and outcome.kind == protocol.DONE:
             specs = _planner_specs(outcome, agent["project_id"])
             state.add_proposal(agent["project_id"], agent["id"], outcome.summary, specs,
                                revision["original_id"] if revision else None)
-        elif outcome.kind == protocol.ASK:
+        elif host_failure is None and outcome.kind == protocol.ASK:
             if outcome.to != "owner" or not outcome.question.strip():
                 raise ValueError("planner ASK requires a question addressed to owner")
             state.send(protocol.QUESTION, agent["id"], "owner",
                        {"question": outcome.question, "summary": outcome.summary})
-        elif outcome.kind == protocol.YIELD:
+        elif host_failure is None and outcome.kind == protocol.YIELD:
             raise ValueError("planner must record one proposal or ask the owner a question")
     except (ValueError, TypeError) as exc:
         outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Planner protocol failure: {exc}")
-    if outcome.kind in (protocol.DONE, protocol.ASK):
+    if host_failure is None and outcome.kind in (protocol.DONE, protocol.ASK):
         state.mark_delivered(inbox_ids)
     state.end_run(run_id, outcome.kind, outcome.summary, tokens)
     # Do not erase a wake arriving while this session was running.
@@ -253,10 +253,11 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
         "UPDATE agent SET turns=turns+1, memo=?,"
         " state=CASE WHEN updated_at=? THEN ? ELSE state END WHERE id=?",
         (outcome.memo or agent["memo"], agent["updated_at"],
+         "blocked" if host_failure is not None else
          ("runnable" if state.pending_revision(agent["id"]) else "done")
          if outcome.kind == protocol.DONE else "blocked", agent["id"]),
     )
-    return outcome
+    return host_failure or outcome
 
 
 def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,

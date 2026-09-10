@@ -247,10 +247,15 @@ def test_structured_terminal_category_beats_zero_exit(tmp_path, category):
 
 def test_diagnostic_redacts_credentials_and_is_bounded():
     diagnostic = sanitize_diagnostic(
-        "Bearer abcdefghijklmnop API_KEY=super-secret sk-abcdefghijklmnop password: hunter2")
+        "Bearer abcdefghijklmnop API_KEY=super-secret "
+        "ANTHROPIC_API_KEY=plaintextcredential "
+        "OPENAI_ACCESS_TOKEN=anotherplaintextcredential "
+        "sk-abcdefghijklmnop password: hunter2")
     assert "abcdefghijklmnop" not in diagnostic
     assert "super-secret" not in diagnostic
     assert "hunter2" not in diagnostic
+    assert "plaintextcredential" not in diagnostic
+    assert "anotherplaintextcredential" not in diagnostic
     assert "[REDACTED]" in diagnostic
 
 

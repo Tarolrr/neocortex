@@ -116,8 +116,13 @@ def sanitize_diagnostic(text: str) -> str:
     text = re.sub(r"(?i)\b(bearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
     text = re.sub(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", text)
     text = re.sub(
-        r"(?i)\b(api[_ -]?key|access[_ -]?token|authorization|password|secret)"
-        r"\s*([=:])\s*([^\s,;]+)", r"\1\2[REDACTED]", text,
+        # Environment variables commonly namespace the credential name, e.g.
+        # ANTHROPIC_API_KEY and OPENAI_ACCESS_TOKEN.  ``_`` is a word
+        # character, so a boundary before API/ACCESS alone would miss them.
+        r"(?i)\b((?:(?:[a-z][a-z0-9]*_)+)?(?:api[_ -]?key|access[_ -]?token|"
+        r"authorization|password|secret|token|client[_ -]?secret|"
+        r"secret[_ -]?access[_ -]?key))\s*([=:])\s*([^\s,;]+)",
+        r"\1\2[REDACTED]", text,
     )
     return " ".join(text.split())[:1000]
 

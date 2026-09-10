@@ -77,7 +77,13 @@ CREATE TABLE IF NOT EXISTS run (
     tokens     INTEGER,
     log_path   TEXT,
     started_at REAL NOT NULL,
-    ended_at   REAL
+    ended_at   REAL,
+    -- Host evidence is deliberately independent from parsed agent outcome.
+    exit_code  INTEGER,
+    timed_out  INTEGER,
+    terminal_category TEXT,
+    terminal_diagnostic TEXT,
+    host_assessment TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_seq (
@@ -202,6 +208,11 @@ class State:
             ("run", "interrupted_at", "REAL"),
             ("run", "recovered_at", "REAL"),
             ("run", "recovery_reason", "TEXT"),
+            ("run", "exit_code", "INTEGER"),
+            ("run", "timed_out", "INTEGER"),
+            ("run", "terminal_category", "TEXT"),
+            ("run", "terminal_diagnostic", "TEXT"),
+            ("run", "host_assessment", "TEXT"),
         ):
             known = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             if column not in known:
@@ -659,6 +670,16 @@ class State:
         self.x(
             "UPDATE run SET outcome=?, detail=?, tokens=?, ended_at=? WHERE id=?",
             (outcome, detail[:4000], tokens, time.time(), run_id),
+        )
+
+    def record_host_assessment(self, run_id: int, *, exit_code: int | None,
+                               timed_out: bool | None, category: str,
+                               diagnostic: str, assessment: str) -> None:
+        self.x(
+            "UPDATE run SET exit_code=?, timed_out=?, terminal_category=?,"
+            " terminal_diagnostic=?, host_assessment=? WHERE id=?",
+            (exit_code, None if timed_out is None else int(timed_out), category,
+             diagnostic[:1000], assessment, run_id),
         )
 
     def incident(self, kind: str, detail: str) -> int:

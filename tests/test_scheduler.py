@@ -953,7 +953,7 @@ def test_plan_critic_requires_restricted_adapter(setup):
     cfg, state, _repo = setup
     state.add_proposal('neocortex', 'planner', 'rationale', [planner_spec()])
     scheduler = sched(cfg, state, [])
-    assert scheduler.step() == protocol.FAIL
+    assert scheduler.step() == protocol.NO_OUTCOME
     assert scheduler.adapter.calls == []
     assert scheduler.step() == 'idle'
 
@@ -1125,8 +1125,9 @@ def test_session_exception_finalizes_worker_and_critic_without_consuming_feedbac
     outcome = turn.run_turn(state, cfg, adapter, state.one("SELECT * FROM agent WHERE id=?", (agent,)),
                             repo, "main")
     run = state.one("SELECT * FROM run WHERE agent_id=?", (agent,))
-    assert outcome.kind == protocol.FAIL
-    assert run["outcome"] == protocol.FAIL and "adapter exploded" in run["detail"]
+    assert outcome.kind == protocol.NO_OUTCOME
+    assert run["outcome"] == protocol.NO_OUTCOME and "adapter exploded" in run["detail"]
+    assert run["timed_out"] is None and run["exit_code"] is None
     assert json.loads(state.inbox(agent)[0]["payload"]) == {"text": "retain me"}
 
 
@@ -1139,8 +1140,9 @@ def test_session_exception_finalizes_planner_and_plan_critic_with_context(setup)
     agent = state.one("SELECT * FROM agent WHERE id=?", (planner,))
     outcome = turn.run_planner_turn(state, cfg, agent, adapter)
     run = state.one("SELECT * FROM run WHERE agent_id=? ORDER BY id DESC", (planner,))
-    assert outcome.kind == protocol.FAIL and run["outcome"] == protocol.FAIL
+    assert outcome.kind == protocol.NO_OUTCOME and run["outcome"] == protocol.NO_OUTCOME
     assert "planner exploded" in run["detail"]
+    assert run["timed_out"] is None and run["exit_code"] is None
     assert state.pending_revision(planner) is not None
 
     proposal = state.add_proposal("neocortex", planner, "", [planner_spec()])
@@ -1148,8 +1150,178 @@ def test_session_exception_finalizes_planner_and_plan_critic_with_context(setup)
     adapter.script = [lambda _cwd, _outcome: (_ for _ in ()).throw(RuntimeError("critic exploded"))]
     outcome = turn.run_plan_critic_turn(state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter)
     run = state.one("SELECT * FROM run WHERE role='plan_critic' ORDER BY id DESC")
-    assert outcome.kind == protocol.FAIL and run["outcome"] == protocol.FAIL
+    assert outcome.kind == protocol.NO_OUTCOME and run["outcome"] == protocol.NO_OUTCOME
     assert "critic exploded" in run["detail"]
+    assert run["timed_out"] is None and run["exit_code"] is None
+
+
+@pytest.mark.parametrize("role", ["worker", "critic"])
+@pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
+def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role, failure):
+    """Synthetic terminal evidence must beat a valid agent-authored DONE."""
+    cfg, state, repo = setup
+    task = state.add_task("neocortex", "host evidence", "objective", [])
+    state.set_task(task, status="in_review" if role == "critic" else "in_progress")
+    agent_id = state.add_agent(f"{role}-host", role, "neocortex", task, "model")
+    state.set_agent(agent_id, memo="keep")
+    state.send("feedback", "owner", agent_id, {"text": "keep inbox"}, task)
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "verdict": "pass", "memo": "lose"})])
+    original = adapter.run
+
+    def failed_session(*args):
+        result = original(*args)
+        if failure == "nonzero":
+            result.exit_code = 1
+        elif failure == "timeout":
+            result.timed_out = True
+        else:
+            result.terminal_category = "overloaded"
+        return result
+
+    adapter.run = failed_session
+    agent = state.one("SELECT * FROM agent WHERE id=?", (agent_id,))
+    outcome = turn.run_turn(state, cfg, adapter, agent, repo, "main")
+    run = state.one("SELECT * FROM run WHERE agent_id=?", (agent_id,))
+    assert outcome.kind == protocol.FAIL
+    assert run["outcome"] == protocol.DONE and run["host_assessment"] == "FAILED"
+    assert state.one("SELECT memo FROM agent WHERE id=?", (agent_id,))[0] == "keep"
+    assert state.inbox(agent_id)
+    assert state.one("SELECT turns FROM agent WHERE id=?", (agent_id,))[0] == 1
+
+
+@pytest.mark.parametrize("role", ["worker", "critic"])
+def test_outcome_read_oserror_is_local_host_failure_for_task_roles(setup, monkeypatch, role):
+    """A filesystem failure after a clean CLI exit cannot consume task context."""
+    cfg, state, repo = setup
+    task = state.add_task("neocortex", "unreadable outcome", "objective", [])
+    state.set_task(task, status="in_review" if role == "critic" else "in_progress")
+    agent_id = state.add_agent(f"{role}-unreadable", role, "neocortex", task, "model")
+    state.set_agent(agent_id, memo="retain memo")
+    state.send("feedback", "owner", agent_id, {"text": "retain inbox"}, task)
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "memo": "discard"})])
+
+    def unreadable(_path):
+        raise OSError("simulated outcome filesystem error")
+
+    monkeypatch.setattr(protocol, "read_outcome", unreadable)
+    outcome = turn.run_turn(state, cfg, adapter,
+                            state.one("SELECT * FROM agent WHERE id=?", (agent_id,)),
+                            repo, "main")
+    run = state.one("SELECT * FROM run WHERE agent_id=?", (agent_id,))
+    assert outcome.kind == protocol.NO_OUTCOME
+    assert run["outcome"] == protocol.NO_OUTCOME
+    assert (run["host_assessment"], run["terminal_category"], run["exit_code"], run["timed_out"]) == (
+        "FAILED", "local_error", 0, 0,
+    )
+    assert state.one("SELECT memo FROM agent WHERE id=?", (agent_id,))[0] == "retain memo"
+    assert state.inbox(agent_id)
+
+
+def test_outcome_read_oserror_is_local_host_failure_for_planner(setup, monkeypatch):
+    cfg, state, _repo = setup
+    original = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+    planner_id, _ = state.planner_feedback(
+        None, "retain revision feedback", "model", proposal_id=original,
+    )
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "proposal": [planner_spec()]})])
+
+    monkeypatch.setattr(protocol, "read_outcome",
+                        lambda _path: (_ for _ in ()).throw(OSError("outcome unreadable")))
+    outcome = turn.run_planner_turn(
+        state, cfg, state.one("SELECT * FROM agent WHERE id=?", (planner_id,)), adapter,
+    )
+    run = state.one("SELECT * FROM run WHERE agent_id=? ORDER BY id DESC", (planner_id,))
+    assert outcome.kind == protocol.NO_OUTCOME
+    assert run["outcome"] == protocol.NO_OUTCOME
+    assert (run["host_assessment"], run["terminal_category"], run["exit_code"], run["timed_out"]) == (
+        "FAILED", "local_error", 0, 0,
+    )
+    assert state.pending_revision(planner_id) is not None
+    assert len(state.q("SELECT * FROM proposal")) == 1
+
+
+def test_outcome_read_oserror_is_local_host_failure_for_plan_critic(setup, monkeypatch):
+    cfg, state, _repo = setup
+    proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "recommendation": "yes", "findings": []})])
+    adapter.run_planner = adapter.run
+    monkeypatch.setattr(protocol, "read_outcome",
+                        lambda _path: (_ for _ in ()).throw(OSError("outcome unreadable")))
+    outcome = turn.run_plan_critic_turn(
+        state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter,
+    )
+    run = state.one("SELECT * FROM run WHERE role='plan_critic' ORDER BY id DESC")
+    review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+    assert outcome.kind == protocol.NO_OUTCOME and review["status"] == "failed"
+    assert run["outcome"] == protocol.NO_OUTCOME
+    assert (run["host_assessment"], run["terminal_category"], run["exit_code"], run["timed_out"]) == (
+        "FAILED", "local_error", 0, 0,
+    )
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
+def test_plan_critic_host_failure_with_done_cannot_complete_review(setup, failure):
+    cfg, state, _repo = setup
+    proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "recommendation": "yes", "findings": []})])
+    adapter.run_planner = adapter.run
+    original = adapter.run_planner
+
+    def failed_session(*args):
+        result = original(*args)
+        if failure == "nonzero":
+            result.exit_code = 1
+        elif failure == "timeout":
+            result.timed_out = True
+        else:
+            result.terminal_category = "transient"
+        return result
+
+    adapter.run_planner = failed_session
+    outcome = turn.run_plan_critic_turn(
+        state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter,
+    )
+    review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+    assert outcome.kind == protocol.FAIL and review["status"] == "failed"
+    agent = state.one("SELECT state, turns FROM agent WHERE role='plan_critic' ORDER BY id DESC")
+    assert (agent["state"], agent["turns"]) == ("done", 1)
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
+def test_planner_host_failure_with_valid_done_keeps_revision_context(setup, failure):
+    """A planner's valid proposal never consumes feedback after host failure."""
+    cfg, state, _repo = setup
+    original_proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+    planner_id, _ = state.planner_feedback(
+        None, "retain revision feedback", "model", proposal_id=original_proposal,
+    )
+    state.set_agent(planner_id, memo="retain planner memo")
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "proposal": [planner_spec()],
+                                    "memo": "discard planner memo"})])
+    original_run = adapter.run
+
+    def failed_session(*args):
+        result = original_run(*args)
+        if failure == "nonzero":
+            result.exit_code = 1
+        elif failure == "timeout":
+            result.timed_out = True
+        else:
+            result.terminal_category = "transient"
+        return result
+
+    adapter.run = failed_session
+    planner = state.one("SELECT * FROM agent WHERE id=?", (planner_id,))
+    outcome = turn.run_planner_turn(state, cfg, planner, adapter)
+    run = state.one("SELECT * FROM run WHERE agent_id=? ORDER BY id DESC", (planner_id,))
+    assert outcome.kind == protocol.FAIL
+    assert run["outcome"] == protocol.DONE and run["host_assessment"] == "FAILED"
+    assert state.pending_revision(planner_id) is not None
+    assert len(state.q("SELECT * FROM proposal")) == 1
+    agent = state.one("SELECT state, turns, memo FROM agent WHERE id=?", (planner_id,))
+    assert (agent["state"], agent["turns"], agent["memo"]) == (
+        "blocked", 1, "retain planner memo",
+    )
 
 
 @pytest.mark.parametrize('role', ['worker', 'critic', 'capacity'])

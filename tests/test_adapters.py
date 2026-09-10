@@ -4,7 +4,61 @@ from pathlib import Path
 
 import pytest
 
-from nc.adapters import _run, adapter_ownership, parse_tokens
+from nc.adapters import (
+    SessionResult,
+    _category_from_terminal,
+    _run,
+    adapter_ownership,
+    assess_session,
+    parse_stream_tokens,
+    parse_tokens,
+    sanitize_diagnostic,
+)
+
+
+@pytest.mark.parametrize(("diagnostic", "expected"), [
+    ("usage limit reached", "unknown"),
+    ("plan limit reached", "unknown"),
+    ("organization usage limit resets at midnight", "unknown"),
+    # HTTP 429 is throttling evidence, but still says nothing about a
+    # resettable subscription allowance.
+    ("HTTP 429: plan limit reached", "throttled"),
+])
+def test_generic_usage_or_plan_limit_is_not_a_subscription_limit(diagnostic, expected):
+    """Synthetic terminal diagnostics without subscription evidence stay unknown."""
+    assert _category_from_terminal(diagnostic) == expected
+
+
+@pytest.mark.parametrize("diagnostic", [
+    "billing service reported an error",
+    "billing configuration could not be loaded",
+    "credit balance is unavailable",
+    "quota exceeded",
+    "project quota exceeded",
+])
+def test_ambiguous_billing_or_quota_diagnostic_is_not_billing_credits(diagnostic):
+    """Synthetic terminal diagnostics need explicit API-credit exhaustion."""
+    assert _category_from_terminal(diagnostic) == "unknown"
+
+
+@pytest.mark.parametrize("diagnostic", [
+    "API credits exhausted",
+    "billing credits have been depleted",
+    "no remaining API credits",
+])
+def test_explicit_api_credit_exhaustion_is_billing_credits(diagnostic):
+    """Synthetic terminal diagnostics explicitly establish exhausted credits."""
+    assert _category_from_terminal(diagnostic) == "billing_credits"
+
+
+@pytest.mark.parametrize("diagnostic", [
+    "Your subscription limit resets at 17:00 UTC",
+    "Your ChatGPT Plus limit resets on 2026-09-11",
+    "Codex Pro has a weekly allowance",
+])
+def test_explicit_resettable_subscription_allowance_is_classified(diagnostic):
+    """Synthetic diagnostics must identify both the product and reset/cadence."""
+    assert _category_from_terminal(diagnostic) == "subscription_limit"
 
 
 def test_real_codex_usage(tmp_path, monkeypatch):
@@ -57,6 +111,227 @@ def test_parse_tokens(text, expected):
     assert parse_tokens(text) == expected
 
 
+@pytest.mark.parametrize(("adapter", "event", "expected"), [
+    ("codex", '{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":80,"output_tokens":30}}', 150),
+    ("claude", '{"type":"result","is_error":false,"usage":{"input_tokens":120,"output_tokens":30,"cache_creation_input_tokens":40,"cache_read_input_tokens":50}}', 240),
+])
+def test_parse_stream_tokens_from_terminal_usage(adapter, event, expected):
+    """Synthetic current machine-stream terminal records retain usage."""
+    assert parse_stream_tokens(adapter, event + "\n") == expected
+
+
+@pytest.mark.parametrize(("adapter", "event", "expected"), [
+    ("codex", '{"type":"turn.completed","usage":{"total_tokens":77}}', 77),
+    ("claude", '{"type":"result","usage":{"total_tokens":88}}', 88),
+])
+def test_run_retains_terminal_stream_usage(tmp_path, monkeypatch, adapter, event, expected):
+    """Both forced machine-stream adapter paths retain terminal token usage."""
+    class Proc:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(cmd, **kwargs):
+        kwargs["stdout"].write(event + "\n")
+        return Proc()
+
+    monkeypatch.setattr("nc.adapters.subprocess.Popen", popen)
+    command = [adapter if adapter == "codex" else "/usr/bin/claude", "exec"]
+    assert _run(command, tmp_path, tmp_path / "session.log", 10).tokens == expected
+
+
+def test_stream_usage_ignores_nonterminal_and_truncated_records():
+    """Synthetic arbitrary stream-like content is never token evidence."""
+    assert parse_stream_tokens("codex", '{"type":"item.completed","usage":{"total_tokens":99}}\n') is None
+    assert parse_stream_tokens("claude", '{"type":"result","usage":{"total_tokens":99}}\n{"type":') is None
+
+
+def test_legacy_text_envelope_is_not_terminal_evidence(tmp_path):
+    """Synthetic compatibility text must not pretend to be a CLI event."""
+    path = tmp_path / "session.log"
+    path.write_text("Codex API Error: rate_limit_exceeded\n")
+    assessment = assess_session(SessionResult(1, path, None, False), "codex")
+    assert assessment.category == "unknown"
+    assert assessment.failed
+
+
+@pytest.mark.parametrize(("adapter", "fixture", "expected"), [
+    ("codex", "codex-terminal-error.synthetic.jsonl", "throttled"),
+    ("claude", "claude-terminal-error.synthetic.jsonl", "authentication"),
+])
+def test_adapter_terminal_stream_is_terminal_evidence(tmp_path, adapter, fixture, expected):
+    """Synthetic fixtures exercise the documented terminal event envelopes."""
+    path = tmp_path / "session.log"
+    path.write_text((Path(__file__).parent / "fixtures" / fixture).read_text())
+    assessment = assess_session(SessionResult(0, path, None, False), adapter)
+    assert assessment.category == expected
+    assert assessment.failed
+
+
+@pytest.mark.parametrize("adapter", ["codex", "claude"])
+def test_fallback_never_searches_prompt_or_truncated_streams(tmp_path, adapter):
+    path = tmp_path / "session.log"
+    path.write_text('prompt says "rate_limit_exceeded"\n' * 1000 +
+                    'agent quoted "Codex API Error: permission_denied"\n')
+    assessment = assess_session(SessionResult(1, path, None, False), adapter)
+    assert assessment.category == "unknown"
+
+
+def test_truncated_jsonl_terminal_stream_is_unknown(tmp_path):
+    path = tmp_path / "session.log"
+    path.write_text('{"type":"error","message":"rate_limit_exceeded"')
+    assessment = assess_session(SessionResult(1, path, None, False), "codex")
+    assert assessment.category == "unknown"
+
+
+@pytest.mark.parametrize(("adapter", "event"), [
+    ("codex", '{"type":"error","message":"rate_limit_exceeded"}'),
+    ("claude", '{"type":"result","is_error":true,"result":"rate_limit_exceeded"}'),
+])
+def test_trailing_truncated_stream_never_promotes_prior_event(tmp_path, adapter, event):
+    path = tmp_path / "session.log"
+    path.write_text(event + '\n{"type":')
+    assessment = assess_session(SessionResult(1, path, None, False), adapter)
+    assert assessment.category == "unknown"
+
+
+@pytest.mark.parametrize(("exit_code", "timed_out", "category", "expected"), [
+    (1, False, None, "unknown"), (0, True, None, "host_timeout"),
+    (0, False, "overloaded", "overloaded"), (0, False, None, "none"),
+])
+def test_host_assessment_precedence(tmp_path, exit_code, timed_out, category, expected):
+    path = tmp_path / "session.log"
+    path.write_text("agent recovered from rate_limit_exceeded\n")
+    assessment = assess_session(SessionResult(exit_code, path, None, timed_out, category), "codex")
+    assert assessment.category == expected
+
+
+@pytest.mark.parametrize("adapter", ["codex", "claude"])
+def test_signal_killed_session_is_host_failure_for_both_adapter_paths(tmp_path, adapter):
+    """Synthetic process status: a host SIGKILL is not an unknown bad exit."""
+    path = tmp_path / "session.log"
+    path.write_text('{"type":"error","message":"rate_limit_exceeded"}\n')
+    assessment = assess_session(
+        SessionResult(-9, path, None, False, "throttled", "rate_limit_exceeded"), adapter,
+    )
+    assert (assessment.status, assessment.category) == ("FAILED", "host_timeout")
+    assert "SIGKILL (9)" in assessment.diagnostic
+
+
+@pytest.mark.parametrize("adapter", ["codex", "claude"])
+def test_run_preserves_signal_exit_code_for_both_adapter_paths(tmp_path, monkeypatch, adapter):
+    """Synthetic adapter process verifies the real runner path retains -SIGNUM."""
+    class Proc:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return -9
+
+    def popen(cmd, **kwargs):
+        kwargs["stdout"].write("killed by test host\n")
+        return Proc()
+
+    monkeypatch.setattr("nc.adapters.subprocess.Popen", popen)
+    command = [adapter if adapter == "codex" else "/usr/bin/claude", "exec"]
+    result = _run(command, tmp_path, tmp_path / "session.log", 10)
+    assessment = assess_session(result, adapter)
+    assert result.exit_code == -9
+    assert assessment.category == "host_timeout"
+
+
+@pytest.mark.parametrize("adapter", ["codex", "claude"])
+def test_successful_retry_output_is_not_terminal_evidence(tmp_path, adapter):
+    """Synthetic recovered stream: only terminal structured evidence can fail a zero exit."""
+    path = tmp_path / "session.log"
+    path.write_text("Codex API Error: rate_limit_exceeded\nretry succeeded\n")
+    assessment = assess_session(SessionResult(0, path, None, False), adapter)
+    assert assessment.status == "SUCCESS"
+
+
+@pytest.mark.parametrize(("adapter", "events"), [
+    ("codex", [
+        '{"type":"error","message":"rate_limit_exceeded"}',
+        '{"type":"turn.completed"}',
+    ]),
+    ("claude", [
+        '{"type":"result","is_error":true,"result":"rate_limit_exceeded"}',
+        '{"type":"result","subtype":"success","is_error":false,"result":"ok"}',
+    ]),
+])
+def test_successful_structured_retry_wins_over_intermediate_error(tmp_path, adapter, events):
+    path = tmp_path / "session.log"
+    path.write_text("\n".join(events) + "\n")
+    assert not assess_session(SessionResult(0, path, None, False), adapter).failed
+
+
+@pytest.mark.parametrize(("adapter", "event", "category"), [
+    ("codex", '{"type":"error","message":"insufficient_quota"}', "billing_credits"),
+    ("codex", '{"type":"turn.failed","error":{"code":"model_not_found"}}', "invalid_request"),
+    ("claude", '{"type":"result","is_error":true,"result":"service overloaded"}', "overloaded"),
+    ("claude", '{"type":"result","is_error":true,"result":"permission_denied"}', "permission"),
+])
+def test_run_populates_terminal_evidence_from_adapter_stream(tmp_path, monkeypatch, adapter, event, category):
+    class Proc:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(cmd, **kwargs):
+        kwargs["stdout"].write(event + "\n")
+        return Proc()
+
+    monkeypatch.setattr("nc.adapters.subprocess.Popen", popen)
+    command = [adapter if adapter == "codex" else "/usr/bin/claude", "exec"]
+    result = _run(command, tmp_path, tmp_path / "session.log", 10)
+    assert (result.exit_code, result.terminal_category) == (0, category)
+    assert assess_session(result, adapter).failed
+
+
+@pytest.mark.parametrize("category", [
+    "subscription_limit", "throttled", "overloaded", "transient",
+    "authentication", "permission", "invalid_request", "billing_credits",
+    "local_error", "protocol", "not-a-provider-category",
+])
+def test_structured_terminal_category_beats_zero_exit(tmp_path, category):
+    """Synthetic structured terminal evidence, including unsupported/unknown evidence."""
+    path = tmp_path / "session.log"
+    assessment = assess_session(
+        SessionResult(0, path, None, False, category, "terminal failure"), "codex",
+    )
+    assert assessment.failed
+    assert assessment.category == (category if category != "not-a-provider-category" else "unknown")
+
+
+def test_diagnostic_redacts_credentials_and_is_bounded():
+    diagnostic = sanitize_diagnostic(
+        "Bearer abcdefghijklmnop API_KEY=super-secret "
+        "ANTHROPIC_API_KEY=plaintextcredential "
+        "OPENAI_ACCESS_TOKEN=anotherplaintextcredential "
+        "sk-abcdefghijklmnop password: hunter2")
+    assert "abcdefghijklmnop" not in diagnostic
+    assert "super-secret" not in diagnostic
+    assert "hunter2" not in diagnostic
+    assert "plaintextcredential" not in diagnostic
+    assert "anotherplaintextcredential" not in diagnostic
+    assert "[REDACTED]" in diagnostic
+
+
+@pytest.mark.parametrize("diagnostic", [
+    '{"access_token":"abcdefghijklmnop"}',
+    '{"api_key": "super-secret"}',
+    "{'client_secret': 'plaintextcredential'}",
+])
+def test_diagnostic_redacts_json_credential_fields(diagnostic):
+    """Structured terminal diagnostics must be safe to retain and display."""
+    sanitized = sanitize_diagnostic(diagnostic)
+    assert "abcdefghijklmnop" not in sanitized
+    assert "super-secret" not in sanitized
+    assert "plaintextcredential" not in sanitized
+    assert "[REDACTED]" in sanitized
+
+
 @pytest.mark.parametrize("binary", ["/usr/bin/claude", None])
 @pytest.mark.parametrize("model", ["sonnet", ""])
 def test_claude_command(tmp_path, monkeypatch, binary, model):
@@ -71,8 +346,9 @@ def test_claude_command(tmp_path, monkeypatch, binary, model):
     prompt = "Review this diff.\nReport findings."
     log = tmp_path / "session.log"
     result = ClaudeAdapter().run(prompt, tmp_path, model, log, 30)
-    cmd = [binary or str(tmp_path / ".local/bin/claude"),
-           "-p", prompt, "--permission-mode", "bypassPermissions"]
+    cmd = [binary or str(tmp_path / ".local/bin/claude"), "-p", prompt,
+           "--output-format", "stream-json", "--verbose",
+           "--permission-mode", "bypassPermissions"]
     if model:
         cmd += ["--model", model]
     run.assert_called_once_with(cmd, tmp_path, log, 30)

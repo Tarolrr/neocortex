@@ -252,12 +252,30 @@ def test_why_evidence(tmp_path, capsys):
     ):
         assert (f"agent=agent-{index} role={role} outcome={outcome} "
                 f"duration=12.5s log=/logs/run-{index}.txt") in output
+    assert "host=legacy/unknown/unknown exit=unknown timeout=unknown" in output
     assert "agent-0 -> owner" in output
     assert "Which color?" in output
     assert "owner -> agent-0" in output
     assert "Blue" in output
     assert "$ pytest -q\n42 passed\n" in output
     assert "unrelated" not in output
+
+
+def test_why_shows_outcome_separately_from_sanitized_host_evidence(tmp_path, capsys):
+    state = State(Config.load(tmp_path).db_path)
+    state.add_project("demo", "Demo", str(tmp_path), None)
+    task = state.add_task("demo", "Host failure", "objective", [])
+    agent = state.add_agent("worker", "worker", "demo", task, "model")
+    run = state.start_run(agent, task, "worker", "model", "/logs/host.txt")
+    state.end_run(run, "FAIL", "agent declined")
+    state.record_host_assessment(run, exit_code=1, timed_out=False, category="permission",
+                                 diagnostic="permission_denied [REDACTED]", assessment="FAILED")
+    state.db.close()
+    assert main(["--home", str(tmp_path), "why", task]) == 0
+    output = capsys.readouterr().out
+    assert "outcome=FAIL" in output
+    assert "host=FAILED/permission exit=1 timeout=0" in output
+    assert "terminal diagnostic: permission_denied [REDACTED]" in output
 
 
 def test_why_empty_and_running(tmp_path, capsys, monkeypatch):

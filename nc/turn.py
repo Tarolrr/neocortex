@@ -149,20 +149,47 @@ def _planner_specs(outcome: protocol.Outcome, project_id: str) -> list[dict]:
     return specs
 
 
+def _defer_until(diagnostic: str) -> float | None:
+    """Return a provider-supplied, bounded reset epoch, if one is present.
+
+    This is deliberately shared by terminal SessionResults and typed launch
+    exceptions: in both cases the adapter has classified the provider event.
+    """
+    match = re.search(r"(?:retry|reset)[ _-]?(?:at|until)[:= ]+(1[0-9]{9}(?:\.[0-9]+)?)",
+                      diagnostic, re.IGNORECASE)
+    if match:
+        until = float(match.group(1))
+        if time.time() < until <= time.time() + 7 * 86400:
+            return until
+    return None
+
+
+def _set_defer_until(state: State, run_id: int, diagnostic: str) -> None:
+    until = _defer_until(diagnostic)
+    if until is not None:
+        state.x("UPDATE run SET defer_until=? WHERE id=?", (until, run_id))
+
+
 def _record_host(state: State, run_id: int, result, assessment: HostAssessment) -> None:
     state.record_host_assessment(
         run_id, exit_code=result.exit_code, timed_out=result.timed_out,
         category=assessment.category, diagnostic=assessment.diagnostic,
         assessment=assessment.status,
     )
-    # Only an explicit, bounded epoch supplied by a terminal provider event is
-    # trusted.  Human prose and unbounded dates retain the normal timer retry.
-    match = re.search(r"(?:retry|reset)[ _-]?(?:at|until)[:= ]+(1[0-9]{9}(?:\.[0-9]+)?)",
-                      assessment.diagnostic, re.IGNORECASE)
-    if match:
-        until = float(match.group(1))
-        if time.time() < until <= time.time() + 7 * 86400:
-            state.x("UPDATE run SET defer_until=? WHERE id=?", (until, run_id))
+    _set_defer_until(state, run_id, assessment.diagnostic)
+
+
+def _record_exception_host(state: State, run_id: int,
+                           assessment: HostAssessment | None, exc: Exception) -> None:
+    """Persist a pre-result launcher failure, including typed reset evidence."""
+    diagnostic = assessment.diagnostic if assessment else sanitize_diagnostic(str(exc))
+    state.record_host_assessment(
+        run_id, exit_code=None, timed_out=None,
+        category=assessment.category if assessment else "local_error",
+        diagnostic=diagnostic, assessment="FAILED",
+    )
+    if assessment is not None:
+        _set_defer_until(state, run_id, diagnostic)
 
 
 def _record_outcome_read_failure(state: State, run_id: int, result,
@@ -254,9 +281,7 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
         elif not result_recorded:
             # The adapter raised before yielding a SessionResult, so timeout
             # status was never observed.  Keep that evidence explicitly unknown.
-            state.record_host_assessment(run_id, exit_code=None, timed_out=None,
-                                         category=exceptional.category if exceptional else "local_error", diagnostic=sanitize_diagnostic(str(exc)),
-                                         assessment="FAILED")
+            _record_exception_host(state, run_id, exceptional, exc)
     try:
         if host_failure is None and outcome.kind == protocol.DONE:
             specs = _planner_specs(outcome, agent["project_id"])
@@ -336,9 +361,7 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
             _record_outcome_read_failure(state, run_id, result, exc)
         elif not result_recorded:
             # No SessionResult was returned: do not invent a completed timeout state.
-            state.record_host_assessment(run_id, exit_code=None, timed_out=None,
-                                         category=exceptional.category if exceptional else "local_error",
-                                         diagnostic=sanitize_diagnostic(str(exc)), assessment="FAILED")
+            _record_exception_host(state, run_id, exceptional, exc)
     # Session exceptions are evidence too.  Do not deliver inbox messages: a
     # retry must retain feedback/questions that were never successfully used.
     state.end_run(run_id, outcome.kind, outcome.summary, tokens)
@@ -437,9 +460,7 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
             _record_outcome_read_failure(state, run_id, result, exc)
         elif not result_recorded:
             # A launcher failure has no timeout observation.
-            state.record_host_assessment(run_id, exit_code=None, timed_out=None,
-                                         category=exceptional.category if exceptional else "local_error", diagnostic=sanitize_diagnostic(str(exc)),
-                                         assessment="FAILED")
+            _record_exception_host(state, run_id, exceptional, exc)
         status = "retryable" if exceptional else "failed"
         state.x("UPDATE plan_review SET status=?, recommendation=? WHERE id=?",
                 (status, outcome.summary, review_id))

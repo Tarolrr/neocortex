@@ -1317,6 +1317,10 @@ def test_plan_critic_provider_retry_reuses_logical_review_and_records_attempts(s
     review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
     assert review["status"] == "retryable"
     adapter.run_planner = original
+    # A timer starts a fresh scheduler process; the retryable claim and its
+    # first attempt live in SQLite rather than in Scheduler memory.
+    scheduler = sched(cfg, state, [])
+    scheduler._adapter_for = lambda _role: adapter
     assert scheduler.step() == protocol.DONE
     review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
     attempts = state.q("SELECT status FROM plan_review_attempt WHERE review_id=? ORDER BY id",
@@ -1324,6 +1328,44 @@ def test_plan_critic_provider_retry_reuses_logical_review_and_records_attempts(s
     assert review["status"] == "done" and review["recommendation"] == "keep"
     assert [row["status"] for row in attempts] == ["retryable", "done"]
     assert state.one("SELECT COUNT(*) FROM agent WHERE id=?", (f"plan-critic-{review['id']}",))[0] == 1
+
+
+@pytest.mark.parametrize("role", ["worker", "critic", "planner", "plan_critic"])
+def test_typed_provider_exception_persists_reset_epoch_for_every_role(setup, role):
+    """A typed launch exception has the same reset evidence as a terminal event."""
+    cfg, state, repo = setup
+    future = time.time() + 3600
+
+    class ProviderUnavailable(Exception):
+        terminal_category = "throttled"
+
+    def unavailable(_cwd, _outcome):
+        raise ProviderUnavailable(f"rate limited; retry at {future}")
+
+    adapter = ScriptedAdapter([unavailable])
+    if role in {"worker", "critic"}:
+        task = state.add_task("neocortex", f"{role} reset", "objective", [])
+        state.set_task(task, status="in_review" if role == "critic" else "in_progress")
+        agent_id = state.add_agent(f"{role}-reset", role, "neocortex", task, "model")
+        outcome = turn.run_turn(state, cfg, adapter,
+                                state.one("SELECT * FROM agent WHERE id=?", (agent_id,)),
+                                repo, "main")
+    elif role == "planner":
+        proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+        planner_id, _ = state.planner_feedback(None, "revise", "model", proposal_id=proposal)
+        outcome = turn.run_planner_turn(
+            state, cfg, state.one("SELECT * FROM agent WHERE id=?", (planner_id,)), adapter,
+        )
+    else:
+        proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+        adapter.run_planner = adapter.run
+        outcome = turn.run_plan_critic_turn(
+            state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter,
+        )
+    run = state.one("SELECT * FROM run ORDER BY id DESC")
+    assert outcome.deferred
+    assert run["terminal_category"] == "throttled"
+    assert run["defer_until"] == pytest.approx(future)
 
 
 def test_typed_preflight_exception_defers_without_incident_and_retries(setup, monkeypatch):

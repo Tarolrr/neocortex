@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 import subprocess
 import time
@@ -50,13 +49,7 @@ class Scheduler:
     @staticmethod
     def _defer_until(detail: str) -> float | None:
         """Trust only bounded epoch reset evidence from a provider diagnostic."""
-        match = re.search(r"(?:retry|reset)[ _-]?(?:at|until)[:= ]+(1[0-9]{9}(?:\.[0-9]+)?)",
-                          detail, re.IGNORECASE)
-        if match:
-            until = float(match.group(1))
-            if time.time() < until <= time.time() + 7 * 86400:
-                return until
-        return None
+        return turn._defer_until(detail)
 
     # --- preflight --------------------------------------------------------
     def preflight(self) -> tuple[bool, str]:

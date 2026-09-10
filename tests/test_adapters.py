@@ -15,15 +15,17 @@ from nc.adapters import (
 )
 
 
-@pytest.mark.parametrize("diagnostic", [
-    "usage limit reached",
-    "plan limit reached",
-    "organization usage limit resets at midnight",
-    "HTTP 429: plan limit reached",
+@pytest.mark.parametrize(("diagnostic", "expected"), [
+    ("usage limit reached", "unknown"),
+    ("plan limit reached", "unknown"),
+    ("organization usage limit resets at midnight", "unknown"),
+    # HTTP 429 is throttling evidence, but still says nothing about a
+    # resettable subscription allowance.
+    ("HTTP 429: plan limit reached", "throttled"),
 ])
-def test_generic_usage_or_plan_limit_is_not_a_subscription_limit(diagnostic):
+def test_generic_usage_or_plan_limit_is_not_a_subscription_limit(diagnostic, expected):
     """Synthetic terminal diagnostics without subscription evidence stay unknown."""
-    assert _category_from_terminal(diagnostic) == "unknown"
+    assert _category_from_terminal(diagnostic) == expected
 
 
 @pytest.mark.parametrize("diagnostic", [

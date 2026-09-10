@@ -257,6 +257,7 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
     result_recorded = False
     outcome_read = False
     host_failure: protocol.Outcome | None = None
+    assessment: HostAssessment | None = None
     try:
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
@@ -272,11 +273,25 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
             host_failure = _host_failure("Planner", assessment)
     except Exception as exc:
         logging.getLogger(__name__).exception("Planner session failed")
+        # A terminal provider assessment is stronger evidence than a missing
+        # agent-owned outcome file.  In particular, do not relabel a
+        # throttled/overloaded session as a local filesystem error merely
+        # because the provider stopped before writing its outcome.
+        saved_failure = (_host_failure("Planner", assessment)
+                         if result_recorded and assessment is not None and assessment.failed
+                         and assessment.category in {
+                             "subscription_limit", "throttled", "overloaded", "transient",
+                         }
+                         else None)
         exceptional = _exception_assessment(exc)
-        outcome = _host_failure("Planner", exceptional) if exceptional else _no_outcome("Planner", exc)
-        if exceptional:
+        outcome = (_no_outcome("Planner", exc) if saved_failure is not None else
+                   _host_failure("Planner", exceptional) if exceptional else
+                   _no_outcome("Planner", exc))
+        if saved_failure is not None:
+            host_failure = saved_failure
+        elif exceptional:
             host_failure = outcome
-        if result_recorded and not outcome_read:
+        if result_recorded and not outcome_read and saved_failure is None:
             _record_outcome_read_failure(state, run_id, result, exc)
         elif not result_recorded:
             # The adapter raised before yielding a SessionResult, so timeout
@@ -332,6 +347,7 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
     tokens = None
     result_recorded = False
     outcome_read = False
+    assessment: HostAssessment | None = None
     try:
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = adapter.run(brief, cwd, model, log_path, cfg.turn_timeout_s)
@@ -354,10 +370,23 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
             return failure
     except Exception as exc:
         logging.getLogger(__name__).exception("%s session failed", agent["role"])
+        saved_failure = (_host_failure(agent["role"], assessment)
+                         if result_recorded and assessment is not None and assessment.failed
+                         and assessment.category in {
+                             "subscription_limit", "throttled", "overloaded", "transient",
+                         }
+                         else None)
         exceptional = _exception_assessment(exc)
-        outcome = (_host_failure(agent["role"], exceptional) if exceptional else
+        outcome = (_no_outcome(agent["role"], exc) if saved_failure is not None else
+                   _host_failure(agent["role"], exceptional) if exceptional else
                    _no_outcome(agent["role"], exc))
-        if result_recorded and not outcome_read:
+        if saved_failure is not None and saved_failure.deferred:
+            # Keep the no-outcome run record, but defer using the provider
+            # evidence already persisted above.  This must not consume a turn
+            # or acknowledge inbox feedback.
+            state.end_run(run_id, outcome.kind, outcome.summary, tokens)
+            return saved_failure
+        if result_recorded and not outcome_read and saved_failure is None:
             _record_outcome_read_failure(state, run_id, result, exc)
         elif not result_recorded:
             # No SessionResult was returned: do not invent a completed timeout state.
@@ -413,6 +442,8 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
     tokens = None
     result_recorded = False
     outcome_read = False
+    assessment: HostAssessment | None = None
+    saved_failure: protocol.Outcome | None = None
     try:
         outcome_path = run_dir / "outcome.json"
         brief = build_plan_critic_brief(state, proposal, outcome_path)
@@ -450,21 +481,29 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
                                        summary="Proposal changed while review was running")
     except Exception as exc:
         logging.getLogger(__name__).exception("Plan review %s failed", review_id)
+        saved_failure = (_host_failure("Plan review", assessment)
+                         if result_recorded and assessment is not None and assessment.failed
+                         and assessment.category in {
+                             "subscription_limit", "throttled", "overloaded", "transient",
+                         }
+                         else None)
         exceptional = _exception_assessment(exc)
         # Validation happens after a parsed agent file; preserve it as a
         # protocol FAIL rather than misreporting an absent host outcome.
-        outcome = (_host_failure("Plan review", exceptional) if exceptional else protocol.Outcome(kind=protocol.FAIL,
+        outcome = (_no_outcome("Plan review", exc) if saved_failure is not None else
+                   _host_failure("Plan review", exceptional) if exceptional else protocol.Outcome(kind=protocol.FAIL,
                                     summary=f"Plan review protocol failure: {exc}")
                    if outcome_read else _no_outcome("Plan review", exc))
-        if result_recorded and not outcome_read:
+        if result_recorded and not outcome_read and saved_failure is None:
             _record_outcome_read_failure(state, run_id, result, exc)
         elif not result_recorded:
             # A launcher failure has no timeout observation.
             _record_exception_host(state, run_id, exceptional, exc)
-        status = "retryable" if exceptional else "failed"
+        status = "retryable" if (saved_failure and saved_failure.deferred) or exceptional else "failed"
         state.x("UPDATE plan_review SET status=?, recommendation=? WHERE id=?",
-                (status, outcome.summary, review_id))
+                (status, (saved_failure or outcome).summary, review_id))
         state.x("UPDATE plan_review_attempt SET status=? WHERE run_id=?", (status, run_id))
     state.end_run(run_id, outcome.kind, outcome.summary, tokens)
-    state.set_agent(agent_id, state="done", turns=0 if outcome.deferred else 1)
-    return outcome
+    deferred = bool(saved_failure and saved_failure.deferred)
+    state.set_agent(agent_id, state="done", turns=0 if deferred else 1)
+    return saved_failure or outcome

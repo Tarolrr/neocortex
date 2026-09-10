@@ -1262,6 +1262,51 @@ def test_outcome_read_oserror_is_local_host_failure_for_plan_critic(setup, monke
     )
 
 
+@pytest.mark.parametrize("role", ["worker", "critic", "planner", "plan_critic"])
+def test_terminal_provider_failure_without_outcome_preserves_provider_evidence(setup, role):
+    """Provider evidence wins when an interrupted child writes no outcome file."""
+    cfg, state, repo = setup
+    adapter = ScriptedAdapter([nothing])
+    original = adapter.run
+
+    def interrupted(*args):
+        result = original(*args)
+        result.terminal_category = "throttled"
+        return result
+
+    adapter.run = interrupted
+    if role in {"worker", "critic"}:
+        task = state.add_task("neocortex", f"{role} outage", "objective", [])
+        state.set_task(task, status="in_review" if role == "critic" else "in_progress")
+        agent_id = state.add_agent(f"{role}-outage", role, "neocortex", task, "model")
+        state.set_agent(agent_id, memo="retain")
+        state.send("feedback", "owner", agent_id, {"text": "retain"}, task)
+        outcome = turn.run_turn(state, cfg, adapter,
+                                state.one("SELECT * FROM agent WHERE id=?", (agent_id,)),
+                                repo, "main")
+        agent = state.one("SELECT turns, memo FROM agent WHERE id=?", (agent_id,))
+        assert agent["turns"] == 0 and agent["memo"] == "retain" and state.inbox(agent_id)
+    elif role == "planner":
+        original_proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+        planner_id, _ = state.planner_feedback(None, "retain", "model", proposal_id=original_proposal)
+        outcome = turn.run_planner_turn(
+            state, cfg, state.one("SELECT * FROM agent WHERE id=?", (planner_id,)), adapter)
+        assert state.pending_revision(planner_id) is not None
+    else:
+        proposal_id = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+        adapter.run_planner = adapter.run
+        outcome = turn.run_plan_critic_turn(
+            state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal_id,)), adapter)
+        assert state.one("SELECT status FROM plan_review WHERE proposal_id=?", (proposal_id,))[0] == "retryable"
+
+    run = state.one("SELECT * FROM run ORDER BY id DESC")
+    assert outcome.kind == protocol.FAIL and outcome.deferred
+    assert run["outcome"] == protocol.NO_OUTCOME
+    assert (run["host_assessment"], run["terminal_category"], run["exit_code"], run["timed_out"]) == (
+        "FAILED", "throttled", 0, 0,
+    )
+
+
 @pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
 def test_plan_critic_host_failure_with_done_cannot_complete_review(setup, failure):
     cfg, state, _repo = setup

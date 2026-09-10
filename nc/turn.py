@@ -252,7 +252,10 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
     state.x(
         "UPDATE agent SET turns=turns+1, memo=?,"
         " state=CASE WHEN updated_at=? THEN ? ELSE state END WHERE id=?",
-        (outcome.memo or agent["memo"], agent["updated_at"],
+        # A parsed file from a failed host session is diagnostic evidence only;
+        # it must not replace the planner context needed by a retry.
+        (agent["memo"] if host_failure is not None else outcome.memo or agent["memo"],
+         agent["updated_at"],
          "blocked" if host_failure is not None else
          ("runnable" if state.pending_revision(agent["id"]) else "done")
          if outcome.kind == protocol.DONE else "blocked", agent["id"]),
@@ -289,6 +292,11 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
             # Persist what the agent wrote separately, then return a host
             # failure so scheduler handlers cannot apply it.
             state.end_run(run_id, outcome.kind, outcome.summary, tokens)
+            # A completed invocation still consumes a turn, as session
+            # exceptions historically did.  Keep its context intact so a
+            # retry sees the same memo and inbox.
+            state.set_agent(agent["id"], turns=agent["turns"] + 1,
+                            memo=agent["memo"])
             return _host_failure(agent["role"], assessment)
     except Exception as exc:
         logging.getLogger(__name__).exception("%s session failed", agent["role"])

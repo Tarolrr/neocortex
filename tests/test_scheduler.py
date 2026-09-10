@@ -1186,6 +1186,7 @@ def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role, 
     assert run["outcome"] == protocol.DONE and run["host_assessment"] == "FAILED"
     assert state.one("SELECT memo FROM agent WHERE id=?", (agent_id,))[0] == "keep"
     assert state.inbox(agent_id)
+    assert state.one("SELECT turns FROM agent WHERE id=?", (agent_id,))[0] == 1
 
 
 @pytest.mark.parametrize("role", ["worker", "critic"])
@@ -1292,7 +1293,9 @@ def test_planner_host_failure_with_valid_done_keeps_revision_context(setup, fail
     planner_id, _ = state.planner_feedback(
         None, "retain revision feedback", "model", proposal_id=original_proposal,
     )
-    adapter = ScriptedAdapter([emit({"outcome": "DONE", "proposal": [planner_spec()]})])
+    state.set_agent(planner_id, memo="retain planner memo")
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "proposal": [planner_spec()],
+                                    "memo": "discard planner memo"})])
     original_run = adapter.run
 
     def failed_session(*args):
@@ -1313,8 +1316,10 @@ def test_planner_host_failure_with_valid_done_keeps_revision_context(setup, fail
     assert run["outcome"] == protocol.DONE and run["host_assessment"] == "FAILED"
     assert state.pending_revision(planner_id) is not None
     assert len(state.q("SELECT * FROM proposal")) == 1
-    agent = state.one("SELECT state, turns FROM agent WHERE id=?", (planner_id,))
-    assert (agent["state"], agent["turns"]) == ("blocked", 1)
+    agent = state.one("SELECT state, turns, memo FROM agent WHERE id=?", (planner_id,))
+    assert (agent["state"], agent["turns"], agent["memo"]) == (
+        "blocked", 1, "retain planner memo",
+    )
 
 
 @pytest.mark.parametrize('role', ['worker', 'critic', 'capacity'])

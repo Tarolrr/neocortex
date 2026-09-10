@@ -296,6 +296,20 @@ def test_diagnostic_redacts_credentials_and_is_bounded():
     assert "[REDACTED]" in diagnostic
 
 
+@pytest.mark.parametrize("diagnostic", [
+    '{"access_token":"abcdefghijklmnop"}',
+    '{"api_key": "super-secret"}',
+    "{'client_secret': 'plaintextcredential'}",
+])
+def test_diagnostic_redacts_json_credential_fields(diagnostic):
+    """Structured terminal diagnostics must be safe to retain and display."""
+    sanitized = sanitize_diagnostic(diagnostic)
+    assert "abcdefghijklmnop" not in sanitized
+    assert "super-secret" not in sanitized
+    assert "plaintextcredential" not in sanitized
+    assert "[REDACTED]" in sanitized
+
+
 @pytest.mark.parametrize("binary", ["/usr/bin/claude", None])
 @pytest.mark.parametrize("model", ["sonnet", ""])
 def test_claude_command(tmp_path, monkeypatch, binary, model):

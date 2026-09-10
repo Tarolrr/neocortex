@@ -178,9 +178,12 @@ def sanitize_diagnostic(text: str) -> str:
         # Environment variables commonly namespace the credential name, e.g.
         # ANTHROPIC_API_KEY and OPENAI_ACCESS_TOKEN.  ``_`` is a word
         # character, so a boundary before API/ACCESS alone would miss them.
-        r"(?i)\b((?:(?:[a-z][a-z0-9]*_)+)?(?:api[_ -]?key|access[_ -]?token|"
+        # Structured terminal events can be JSON.  Accept quoted keys and
+        # quoted values as well as shell-style ``KEY=value`` diagnostics.
+        r"(?i)\b([\"']?(?:(?:[a-z][a-z0-9]*_)+)?(?:api[_ -]?key|access[_ -]?token|"
         r"authorization|password|secret|token|client[_ -]?secret|"
-        r"secret[_ -]?access[_ -]?key))\s*([=:])\s*([^\s,;]+)",
+        r"secret[_ -]?access[_ -]?key)[\"']?)\s*([=:])\s*"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)",
         r"\1\2[REDACTED]", text,
     )
     return " ".join(text.split())[:1000]

@@ -348,6 +348,12 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
     # A review is one logical `(proposal, spec)` item.  Only terminal provider
     # evidence releases its claim; malformed advice retains the old failed
     # policy and completed advice is never replayed.
+    # The scheduler selection is only a hint: feedback can supersede a
+    # proposal after selection and before this call obtains its review claim.
+    # Never revive advice for a nonpending or changed proposal.
+    current = state.one("SELECT status, spec FROM proposal WHERE id=?", (proposal["id"],))
+    if current is None or current["status"] != "pending" or current["spec"] != proposal["spec"]:
+        return protocol.Outcome(kind=protocol.DONE, summary="Proposal is no longer pending")
     claim = state.x("INSERT OR IGNORE INTO plan_review(proposal_id,spec) VALUES(?,?)",
                     (proposal["id"], proposal["spec"]))
     if claim.rowcount:

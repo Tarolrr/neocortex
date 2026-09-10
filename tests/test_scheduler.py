@@ -1186,7 +1186,9 @@ def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role, 
     assert run["outcome"] == protocol.DONE and run["host_assessment"] == "FAILED"
     assert state.one("SELECT memo FROM agent WHERE id=?", (agent_id,))[0] == "keep"
     assert state.inbox(agent_id)
-    assert state.one("SELECT turns FROM agent WHERE id=?", (agent_id,))[0] == 1
+    assert state.one("SELECT turns FROM agent WHERE id=?", (agent_id,))[0] == (
+        0 if failure == "terminal" else 1
+    )
 
 
 @pytest.mark.parametrize("role", ["worker", "critic"])
@@ -1282,9 +1284,13 @@ def test_plan_critic_host_failure_with_done_cannot_complete_review(setup, failur
         state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter,
     )
     review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
-    assert outcome.kind == protocol.FAIL and review["status"] == "failed"
+    assert outcome.kind == protocol.FAIL and review["status"] == (
+        "retryable" if failure == "terminal" else "failed"
+    )
     agent = state.one("SELECT state, turns FROM agent WHERE role='plan_critic' ORDER BY id DESC")
-    assert (agent["state"], agent["turns"]) == ("done", 1)
+    assert (agent["state"], agent["turns"]) == (
+        "done", 0 if failure == "terminal" else 1,
+    )
 
 
 @pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
@@ -1320,7 +1326,9 @@ def test_planner_host_failure_with_valid_done_keeps_revision_context(setup, fail
     assert len(state.q("SELECT * FROM proposal")) == 1
     agent = state.one("SELECT state, turns, memo FROM agent WHERE id=?", (planner_id,))
     assert (agent["state"], agent["turns"], agent["memo"]) == (
-        "blocked", 1, "retain planner memo",
+        "runnable" if failure == "terminal" else "blocked",
+        0 if failure == "terminal" else 1,
+        "retain planner memo",
     )
 
 

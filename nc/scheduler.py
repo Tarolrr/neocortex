@@ -34,6 +34,7 @@ class Scheduler:
         # while the lifecycle/repository exclusions are actually owned.
         self._lifecycle_hook = None
         self._preflight_pairs: set[tuple[str, str]] = set()
+        self._preflight_category: str | None = None
         self._in_run = False
         self._preflight_role = "worker"
 
@@ -64,6 +65,7 @@ class Scheduler:
             probe_dir / "probe.log", self.cfg.preflight_timeout_s,
         )
         assessment = assess_session(result, adapter.name)
+        self._preflight_category = assessment.category if assessment.failed else None
         text = result.log_path.read_text(errors="replace")
         # The probe's terminal nonblank response is the contract; an arbitrary
         # OK somewhere in CLI/tool output is not completion evidence.
@@ -80,6 +82,7 @@ class Scheduler:
         if pair in self._preflight_pairs:
             return None
         self._preflight_role = role
+        self._preflight_category = None
         ok, detail = self.preflight()
         self._preflight_pairs.add(pair)
         if ok:
@@ -87,9 +90,9 @@ class Scheduler:
         # Preflight output is host diagnostics.  It has no task/agent effects.
         # A supported temporary terminal category is deferred by the timer;
         # unknown/permanent readiness failures retain the existing incident path.
-        temporary = any(category in detail for category in (
-            "subscription_limit", "throttled", "overloaded", "transient"))
-        if temporary:
+        if self._preflight_category in {
+            "subscription_limit", "throttled", "overloaded", "transient",
+        }:
             log.warning("temporary %s preflight failure: %s", role, detail)
             return "deferred"
         self.state.incident("preflight", detail)
@@ -522,6 +525,10 @@ class Scheduler:
         log.info("host environment readiness ok: %s", detail)
 
         turns = 0
+        # A Scheduler object can serve more than one timer invocation in tests
+        # and embedded callers.  The probe bound is per invocation, not for
+        # the lifetime of that object.
+        self._preflight_pairs.clear()
         self._in_run = True
         try:
             while max_turns == 0 or turns < max_turns:

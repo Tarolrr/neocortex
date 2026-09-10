@@ -30,6 +30,7 @@ itself, proof that every separately launched adapter descendant had died.
 | 2026-09-09 21:42:09 | systemd logged timeout and SIGTERM of the service main process. |
 | 2026-09-09 21:47:25 onward | Later timer-triggered services logged `no runnable agents`; they did not run T008. |
 | 2026-09-09 22:01:57 | Later owner recovery closed run 93: `outcome=INTERRUPTED`, `ended_at=interrupted_at=recovered_at`; reason recorded as `nc killed by sysctl by timeout, wrong command by owner`. |
+| 2026-09-10 06:18:33 | Later owner feedback message 83 (delivered, `owner` to `planner-neocortex`) reported that run 93 had left a task “running” with no new runner and requested this investigation/protocol revision. |
 | 2026-09-10 08:10:36 | Read-only snapshot: T008 `in_progress`; its worker `blocked`; no run after 93; T009 remains `queued` and depends on T008 and T007. |
 
 Run 93's `session.log` was an empty, zero-byte file.  `brief.md` exists and
@@ -45,6 +46,15 @@ worker-directed `review_verdict` messages (IDs 76--79) were present. IDs 76
 and 77 were delivered; IDs 78 and 79 were undelivered. They are historical
 critic/arbiter feedback, not termination evidence, and no separate T008 worker
 message establishes an exit cause.
+
+Feedback 83 is a later (2026-09-10T06:18:33Z) delivered owner `feedback`
+message, addressed to `planner-neocortex` with no task ID. Sanitized, it says
+that NC and its children, including runner 93, had exited; that interrupting
+the run left the task running without a new runner; and it asks for log/state/
+code investigation and a protocol revision. This is the owner's incident
+report and explains the requested investigation. It is **not** independent
+proof of how NC or an adapter terminated, and is deliberately distinguished
+from the incident-time journal and from the later 08:10:36Z database snapshot.
 
 The full investigated code commit is
 [`735907fe6afb6f635e3e02cfaa1e361d06c70128`](https://github.com/Tarolrr/neocortex/blob/735907fe6afb6f635e3e02cfaa1e361d06c70128/nc/operations.py#L175).
@@ -70,8 +80,55 @@ selection requires `agent.state='runnable'`; automatic spawn considers only
 `task.status='queued'`.  Consequently an `in_progress` T008 with a blocked
 worker matches neither path.
 
-Minimal reproducible state transition (isolated database fixture; no live
-command was executed):
+The following is an isolated, disposable-database reproduction. It is not a
+command against `/root/.neocortex/state.db`, does not contact an adapter, and
+does not start a worker. It precisely creates the three durable rows, applies
+the current recovery transition, and invokes `Scheduler.pick()`:
+
+```sh
+repro_dir=$(mktemp -d)
+REPRO_DIR="$repro_dir" python3 - <<'PY'
+import os
+from pathlib import Path
+
+from nc.config import Config
+from nc.operations import recover_runs
+from nc.scheduler import Scheduler
+from nc.state import State
+
+home = Path(os.environ["REPRO_DIR"]) / "home"
+home.mkdir()
+cfg = Config(home=home)
+state = State(cfg.db_path)
+try:
+    state.add_project("p", "P", str(home), None)
+    task = state.add_task("p", "interrupted claim", "reproduce", [])
+    worker = state.add_agent("worker-p-T001", "worker", "p", task, "model")
+    # Model the already-claimed run; no Scheduler spawn is involved here.
+    state.set_task(task, status="in_progress")
+    run = state.start_run(worker, task, "worker", "model", "unused.log")
+    # A legacy record with no ownership evidence needs explicit, verified
+    # quiescence; this makes the fixture eligible for current recovery.
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?", (run,))
+    recover_runs(state, [run], "fixture: verified quiescent", True)
+    print(tuple(state.one("SELECT outcome, ended_at IS NOT NULL FROM run WHERE id=?", (run,))))
+    print(tuple(state.one("SELECT state FROM agent WHERE id=?", (worker,))))
+    print(tuple(state.one("SELECT status FROM task WHERE id=?", (task,))))
+    print(Scheduler(cfg, state).pick())
+finally:
+    state.db.close()
+PY
+```
+
+Expected output is an interrupted, ended run; a `blocked` worker; an
+`in_progress` task; and `None` from `pick()`. The final `None` is meaningful:
+`pick()` tries queued-task activation before returning, but the only task is
+not queued. The relevant checked-in recovery precedent is
+[`test_legacy_requires_explicit_quiescence_and_preserves_task`](https://github.com/Tarolrr/neocortex/blob/735907fe6afb6f635e3e02cfaa1e361d06c70128/tests/test_recovery.py#L65),
+which confirms that recovery preserves task state; this recipe adds the
+scheduler selection observation without modifying the test suite.
+
+The resulting transition is:
 
 | Step | run | worker agent | task | `Scheduler.pick()` result |
 | --- | --- | --- | --- | --- |

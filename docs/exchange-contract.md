@@ -2,6 +2,10 @@
 
 This is documentation only. **Current** is this branch's behavior; **proposed** is a later contract, not enforced behavior. It changes no brief, format, authority, or runtime behavior.
 
+The investigated consequence of closing an interrupted current run is documented
+in [Run 93](bugs/run-93-interrupted-claim.md).  In particular, current recovery
+is an execution-record closure, not logical-work restoration.
+
 ## Current durable flows
 
 SQLite (`SCHEMA`/ `State`, `nc/state.py`) is durable truth. `runs/<agent>_<stamp>/outcome.json` is agent-owned, one object per execution, parsed by `protocol.read_outcome` in `turn.run_turn`, `run_planner_turn`, and `run_plan_critic_turn`. Its parsed fields are `outcome`, `summary`, `memo`, `to`, `question`, `verdict`, `findings`; raw planner `proposal` and plan-critic `recommendation` are role-validated later. Missing/malformed/non-object/unknown outcome becomes synthetic `NO_OUTCOME` in a `run`, not a message. Run files/logs are outside SQLite history.
@@ -60,7 +64,7 @@ Keep durable work, routed messages, attempts, incidents, outcome files, checks, 
 ```
 
 ```json
-{"id":"attempt:902","work_id":"review:17:sha256:abc","role":"plan_critic","attempt_no":2,"status":"deferred","execution_id":"run:1441","reason":"host timeout"}
+{"id":"attempt:902","work_id":"review:17:sha256:abc","role":"plan_critic","attempt_no":2,"status":"retryable","execution_id":"run:1441","reason":"adapter_terminal:provider_rate_limited"}
 ```
 
 ```json
@@ -73,7 +77,130 @@ Schema 1 requires nonempty id/kind/sender/recipient/sender_request_id, integer `
 
 Order: validate -> route/authorize -> persist idempotently on `(sender,kind,sender_request_id)` -> atomically domain apply plus receipt -> ack. Retry returns receipt; it cannot repeat wake, merge, rework, supersession, or replacement. Mixed migration: schema-1 readers retain schema-0 legacy semantics; writers dual-write legacy until all readers upgrade; old readers ignore additive tables; unknown newer values quarantine undelivered.
 
-Crash sequences: pre-commit leaves pending; post-commit/pre-response retry finds receipt then acks. Owner feedback receipt supersedes proposal and creates revision; correlated planner replacement is idempotent. Plan review attempt 1 may defer, attempt 2 crash/release expired claim, attempt 3 complete; later attempts see completed. Host ownership checks decide whether an active run can be reclaimed.
+Crash sequences: pre-commit leaves pending; post-commit/pre-response retry finds receipt then acks. Owner feedback receipt supersedes proposal and creates revision; correlated planner replacement is idempotent. A plan review may become retryable only on terminal adapter-specific temporary-provider evidence; a later attempt may crash and release its expired claim, and a subsequent attempt may complete; later attempts see completed. A host timeout is instead interrupted/retryable after positive ownership proof, or actionably blocked if ownership is ambiguous. Host ownership checks decide whether an active run can be reclaimed.
+
+## Proposed interruption-recovery contract (run 93)
+
+**Proposed, not current implementation.**  This contract fixes the separation
+between a durable logical claim and an execution attempt without weakening STOP,
+cancellation, owner blocks, arbiter-only acceptance, or process ownership.
+
+### Definitions and required transaction
+
+Logical work is the durable task, planner revision, or `(proposal, spec-hash)`
+review.  An attempt is a fenced execution of that work.  A run is its host
+observation.  Closing a run records an attempt fact; stopping a process is an
+ownership action; restoring eligibility changes logical state; accepting work is
+the later arbiter/owner domain action.  None implies another.
+
+Every claim has `work_id`, phase, `attempt_no`, monotonic fence token, status
+(`claimed|running|result_persisted|applied|acknowledged|interrupted|retryable|
+blocked|cancelled`), and a durable recovery reason/owner action where blocked.
+`interrupted` is terminal for an execution attempt; `retryable` is a logical-work
+state, not a state to which a closed attempt is reopened. Claim,
+agent eligibility and active-fence creation commit together.  Result persistence,
+role-specific application, receipt and acknowledgement are separately
+idempotent transactions keyed by `(work_id, attempt_no, fence)`.  A completion
+or acknowledgement with a stale fence is rejected and recorded; it can never
+alter memo, inbox, task/review/proposal state, budgets, or acceptance.
+
+**Normative budget boundary.** Every role has a turn budget.  Charge exactly
+one turn, exactly once, in the same transaction that records successful adapter
+launch/ownership and changes its attempt from `claimed` to `running`.  Do not
+charge a merely claimed or pre-launch attempt.  A launched attempt retains that
+charge if it is interrupted, cancelled after launch, provider-retryable, or
+later rejected; each separately launched retry charges one more turn.  Recovery,
+restart reconciliation, duplicate submissions and stale completions never
+charge or refund a turn.  This rule applies uniformly to workers, change
+critics, planners and plan critics; `attempt_no`/failure history are preserved
+and are not budget counters.  Only an explicit, audited owner action may add
+budget capacity; it records the amount and reason and neither resets spent
+turns nor alters prior attempts.
+
+Ownership proof is a matching scheduler identity plus the dedicated adapter
+cgroup/process identity observed empty or otherwise positively quiescent.  A
+missing parent PID alone proves nothing.  Live or ambiguous descendants remain
+blocked with an owner-visible action to inspect/stop under lifecycle authority;
+recovery never bypasses them.  All recovery, claim, apply and owner lifecycle
+operations take the lifecycle exclusion, re-read state, and use an immediate
+transaction.  Repeating recovery finds the existing recovery receipt and is a
+no-op: no new attempt, message, wake, or budget charge.
+
+### Run-93 recovery sequence
+
+1. Stop scheduling/claiming under lifecycle exclusion; inspect run 93 and prove
+   or retain ambiguity of scheduler and adapter ownership.  Do not classify the
+   host timeout as a provider deferral.
+2. Atomically mark its run/attempt interrupted, retain log path, partial
+   worktree, memo, inbox, revision lineage, usage/history and role phase, and
+   release only its matching fence after ownership proof.
+3. If STOP, cancellation, an owner block, or ambiguous descendants apply, write
+   logical `blocked` with that durable reason and exact owner recovery path;
+   do not wake it.  Deliberate cancellation remains cancelled and STOP remains
+   stopped.
+4. Otherwise leave T008's **interrupted existing attempt** terminally
+   `interrupted`; atomically set its logical work to `retryable`, retain its
+   phase and partial state, clear only that attempt's active fence, and make
+   exactly its worker eligible for a retry claim. Do not create a next attempt
+   here, reset attempts/budget, or discard its branch.
+5. The scheduler, not recovery, may select that retryable work. In one separate
+   claim transaction it rechecks STOP/cancellation/owner-block and eligibility,
+   creates the next attempt and its new fence, and changes the worker to claimed
+   or running. A failed recheck leaves it retryable or records the specified
+   actionable block; it never creates a second active attempt.
+6. On the next completion, persist result first, then apply it once (arbiter for
+   worker acceptance), write receipt, then acknowledge rendered inbox.  Restart
+   reconciliation completes any missing later idempotent step; it never reruns
+   an accepted result.
+
+The recovery and scheduler transitions are deliberately separate and each is
+idempotent. `retryable` has no active fence and is eligible but unclaimed;
+`claimed`/`running` has exactly one new active fence. Recovery never creates a
+future attempt, and the scheduler never closes the interrupted attempt.
+
+| Actor / boundary | prior durable state | one transaction writes | resulting eligibility / fence |
+| --- | --- | --- | --- |
+| recovery after positive quiescence | attempt N `running`, logical work in its existing phase | mark run and attempt N `interrupted`; preserve state; release fence N; logical work `retryable` | exact role eligible; no active fence; no attempt N+1 |
+| recovery with STOP/cancel/owner block/ambiguous survivor | attempt N nonterminal | close only if ownership allows; otherwise retain evidence; write or retain durable block reason/action | not eligible; no active fence only after positive quiescence |
+| scheduler claim | `retryable`, no active fence, role eligible | recheck exclusion and logical state; create attempt N+1/fence N+1; mark claim | one active fence, one claimed/running role |
+| duplicate recovery or scheduler race | recovery receipt or active fence exists | find receipt / conditional claim fails | no new attempt, wake, or budget charge/refund |
+
+| Event/role | durable logical work and partial state | eligibility / retry | feedback and budget |
+| --- | --- | --- | --- |
+| worker interrupted | preserve branch, memo, undelivered inbox and phase | retry existing phase after ownership proof; otherwise actionable block | a running attempt has already charged one turn; a retry charges only at its own launch; no reset |
+| change critic interrupted | preserve worker's review phase and critic memo/inbox | release unique review claim; one next critic attempt, never concurrent | same launch-only charge; no duplicated verdict/rework/acceptance |
+| planner interrupted | preserve proposal, feedback, revision lineage and planner memo | retry planner phase; do not recreate/supersede proposal | same launch-only charge; feedback receipt prevents duplicate wake/revision |
+| plan critic interrupted | preserve proposal/spec and advisory history | release recoverable unique claim; only one completed advisory result | same launch-only charge; no repeated completed advice; owner still decides |
+
+Thus a crash before launch consumes no turn; a crash during execution consumes
+the one launch charge, and recovery never resets turns/attempts.  A provider
+retry classification requires terminal,
+adapter-specific evidence of a temporary provider category; host death,
+timeout, SIGTERM, local launcher failure, and unknown evidence are not that.
+This remains compatible with T008's host classification and T009's local
+provider retry without duplicating either implementation.
+
+### Restart reconciliation and acceptance tests
+
+On startup, enumerate nonterminal fences and reconcile each in one transaction:
+unlaunched claim -> terminal interrupted attempt plus logical work retryable;
+positively quiesced running attempt -> terminal interrupted attempt plus logical
+work retryable; ambiguous/live
+ownership -> actionable block; result-persisted -> apply once; applied ->
+acknowledge once.  STOP/cancelled/owner-blocked states win every
+branch.  Validate injected crashes before launch, during execution, between
+persist/apply/ack, duplicate recovery submission, stale completion, process
+survivor, each of the four roles, and restart after every boundary.  Assertions:
+no two live fences for work, no stranded `in_progress`/`blocked` without reason
+and action, no replay of accepted/advisory result, preserved memo/inbox/revision
+and worktree, and deterministic budget/history.
+
+Migration requires an owner-approved stopped-system backup and additive
+attempt/fence/receipt records.  Dual-read legacy rows as explicitly
+`ownership-unknown`; do not silently auto-recover them.  Rollback disables the
+new claimant before restoring the recorded backup; it must not erase historical
+run/receipt evidence.  This is the only migration/rollback change required by
+this revised contract.
 
 ## Future migration; separate immediate fixes
 

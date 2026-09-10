@@ -144,6 +144,9 @@ run log); an inactive systemd unit alone is not sufficient. The acknowledgement
 is intentionally explicit because it is not proof supplied by the database.
 
 Once all actual blockers are recovered, requeue is a separate explicit action.
+
+This is current behavior and can strand an `in_progress` task with a blocked
+agent; see [the run-93 incident report](bugs/run-93-interrupted-claim.md).
 For an exhausted task such as T024, use an owner reason and a larger budget, for
 example `nc requeue neocortex-T024 --budget 8 --reason "continue after reviewed interruption"`.
 Recovery itself never does this. UI deployment templates and the deployment

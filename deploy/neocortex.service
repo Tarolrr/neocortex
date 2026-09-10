@@ -10,5 +10,4 @@ Environment=PATH=/opt/neocortex-runner/.venv/bin:/root/.local/bin:/usr/local/sbi
 ExecStart=/opt/neocortex-runner/.venv/bin/nc run
 TimeoutStartSec=3600
 # One run drains the queue and exits; the timer decides when to start the next
-# one. Interrupted claims require explicit logical-work recovery; closing a run
-# alone does not make its task eligible again.
+# one. A crashed turn therefore costs one cycle, not the system.

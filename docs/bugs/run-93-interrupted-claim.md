@@ -14,10 +14,15 @@ The deployed unit source was read as `/etc/systemd/system/neocortex.service`
 via `systemctl cat neocortex.service`, without changing it. It had
 `TimeoutStartSec=3600`. The tracked
 [`deploy/neocortex.service`](https://github.com/Tarolrr/neocortex/blob/735907fe6afb6f635e3e02cfaa1e361d06c70128/deploy/neocortex.service)
-also specifies 3600 seconds, but differs from that deployed source in its
-`PATH` (it includes the runner venv) and its updated explanatory comment. The
-deployed comment says a crashed turn costs one cycle; that is not true for a
-claimed worker under the current recovery code. The journal records systemd's
+also specifies 3600 seconds.  At the investigated commit, its explanatory
+comment is the same “a crashed turn ... costs one cycle” claim observed in the
+deployed unit; the tracked template differs from the deployed source in its
+`PATH` (it includes the runner venv).  That comment is contradicted by this
+incident for a claimed worker under the current recovery code.  An earlier
+revision on this documentation branch temporarily corrected the template
+comment, but that non-functional change is deliberately not retained: the
+task delivers documentation only, and the correction belongs in this report
+and the exchange contract rather than in a service template.  The journal records systemd's
 `start operation timed out. Terminating`, then main process `status=15/TERM`
 and `result 'timeout'` at **2026-09-09T21:42:09Z**.  This is evidence that the
 *service main process* was terminated for its start timeout; it is not, by

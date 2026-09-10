@@ -1395,6 +1395,158 @@ def test_typed_preflight_exception_defers_without_incident_and_retries(setup, mo
     assert len(scheduler.adapter.calls) == 1
 
 
+class TimerFlakyAdapter(ScriptedAdapter):
+    """A fake provider which fails completed sessions before later recovery."""
+
+    def __init__(self, script, temporary_failures=1, *, permanent=False):
+        super().__init__(script)
+        self.temporary_failures = temporary_failures
+        self.permanent = permanent
+
+    def run(self, *args, **kwargs):
+        result = super().run(*args, **kwargs)
+        if self.temporary_failures:
+            self.temporary_failures -= 1
+            if self.permanent:
+                result.exit_code = 1
+            else:
+                # This is adapter-owned terminal evidence, after the agent has
+                # made a partial change/written an outcome, not agent JSON.
+                result.terminal_category = "transient"
+                result.terminal_diagnostic = "provider connection reset"
+        return result
+
+
+def timer_invocation(cfg, state, adapter):
+    """Fresh Scheduler instance: equivalent to the next five-minute timer run."""
+    scheduler = Scheduler(cfg, state)
+    scheduler._adapter_for = lambda _role: adapter
+    scheduler.readiness = lambda: (True, "isolated fake host")
+    scheduler.preflight = lambda: (True, "isolated fake model")
+    assert scheduler.run(max_turns=1)
+    return scheduler
+
+
+@pytest.mark.parametrize("role", ["worker", "critic", "planner", "plan_critic"])
+def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
+    """A provider outage ends this timer run; its next run resumes logical work."""
+    cfg, state, _repo = setup
+    def partial(cwd, outcome_path):
+        (cwd / "partial-provider-state").write_text("keep\n")
+        outcome_path.parent.mkdir(parents=True, exist_ok=True)
+        outcome_path.write_text(json.dumps({"outcome": "YIELD", "summary": "interrupted"}))
+    if role == "worker":
+        task = state.add_task("neocortex", "worker outage", "objective", [])
+        adapter = TimerFlakyAdapter([
+            partial,
+            commit_and_emit("complete", "ok\n", {"outcome": "DONE", "summary": "done"}),
+        ])
+        # Undelivered feedback must survive the failed host session.
+        state.add_agent(f"worker-{task}", "worker", "neocortex", task, "model")
+        state.set_task(task, status="in_progress")
+        state.send(protocol.FEEDBACK, "owner", f"worker-{task}", {"text": "retain"}, task)
+    elif role == "critic":
+        task = state.add_task("neocortex", "critic outage", "objective", [])
+        state.set_task(task, status="in_review")
+        state.add_agent(f"worker-{task}", "worker", "neocortex", task, "model")
+        state.set_agent(f"worker-{task}", state="blocked")
+        state.add_agent(f"critic-{task}-1", "critic", "neocortex", task, "model")
+        state.send(protocol.FEEDBACK, "owner", f"critic-{task}-1", {"text": "retain"}, task)
+        adapter = TimerFlakyAdapter([
+            partial,
+            emit({"outcome": "DONE", "verdict": "rework", "findings": ["fix"]}),
+        ])
+    elif role == "planner":
+        planner, _ = state.planner_feedback(None, "retain revision wake", "model")
+        adapter = TimerFlakyAdapter([
+            partial,
+            emit({"outcome": "DONE", "summary": "proposal", "proposal": [planner_spec()]}),
+        ])
+    else:
+        proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+        adapter = TimerFlakyAdapter([
+            partial,
+            emit({"outcome": "DONE", "recommendation": "keep", "findings": ["sound"]}),
+        ])
+        adapter.run_planner = adapter.run
+
+    # The first invocation makes exactly one dispatch and returns on deferral.
+    timer_invocation(cfg, state, adapter)
+    assert len(adapter.calls) == 1
+    assert not state.open_incidents()
+    assert state.one("SELECT COUNT(*) FROM run")[0] == 1
+    assert state.one("SELECT turns FROM agent WHERE role=? ORDER BY id LIMIT 1", (role,))[0] == 0
+    if role in {"worker", "critic"}:
+        assert (cfg.work_dir / task / "partial-provider-state").read_text() == "keep\n"
+        recipient = f"worker-{task}" if role == "worker" else f"critic-{task}-1"
+        assert state.inbox(recipient), "host outage cannot acknowledge feedback"
+        assert state.one("SELECT attempts FROM task WHERE id=?", (task,))[0] == 0
+    elif role == "planner":
+        assert state.inbox(planner), "planner feedback and wake remain durable"
+        assert state.one("SELECT state FROM agent WHERE id=?", (planner,))[0] == "runnable"
+    else:
+        review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+        assert review["status"] == "retryable"
+
+    # A new Scheduler object models the later timer process, not an in-memory retry.
+    timer_invocation(cfg, state, adapter)
+    assert len(adapter.calls) == 2
+    if role == "worker":
+        assert state.one("SELECT status FROM task WHERE id=?", (task,))[0] == "in_review"
+        assert state.one("SELECT COUNT(*) FROM agent WHERE role='critic' AND task_id=?", (task,))[0] == 1
+    elif role == "critic":
+        assert state.one("SELECT status FROM task WHERE id=?", (task,))[0] == "in_progress"
+        assert state.one("SELECT COUNT(*) FROM message WHERE kind=? AND sender=? AND task_id=?",
+                         (protocol.REVIEW_VERDICT, f"critic-{task}-1", task))[0] == 1
+    elif role == "planner":
+        assert state.one("SELECT COUNT(*) FROM proposal")[0] == 1
+        assert not state.inbox(planner)
+    else:
+        review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+        attempts = state.q("SELECT status FROM plan_review_attempt WHERE review_id=? ORDER BY id",
+                           (review["id"],))
+        assert review["status"] == "done"
+        assert [row["status"] for row in attempts] == ["retryable", "done"]
+
+
+def test_timer_outages_exceed_task_and_turn_budgets_without_breaker(setup):
+    """Repeated provider outages are recorded runs, never task/turn failures."""
+    cfg, state, _repo = setup
+    cfg.max_attempts = 2
+    cfg.max_consecutive_failures = 2
+    task = state.add_task("neocortex", "many outages", "objective", [], budget_turns=2)
+    state.add_agent(f"worker-{task}", "worker", "neocortex", task, "model")
+    state.set_task(task, status="in_progress")
+    adapter = TimerFlakyAdapter(
+        [emit({"outcome": "YIELD", "summary": "interrupted"})] * 3
+        + [emit({"outcome": "YIELD", "summary": "recovered"})],
+        temporary_failures=3,
+    )
+    for _ in range(3):
+        scheduler = timer_invocation(cfg, state, adapter)
+        assert scheduler.consecutive_failures == 0
+    agent = state.one("SELECT turns, state FROM agent WHERE id=?", (f"worker-{task}",))
+    task_row = state.one("SELECT attempts, status FROM task WHERE id=?", (task,))
+    assert (agent["turns"], agent["state"], task_row["attempts"], task_row["status"]) == (0, "runnable", 0, "in_progress")
+    assert not (cfg.home / "STOP").exists()
+    timer_invocation(cfg, state, adapter)
+    assert state.one("SELECT turns FROM agent WHERE id=?", (f"worker-{task}",))[0] == 1
+
+
+def test_timer_keeps_stop_and_nontransient_fail_policy(setup):
+    """Deferral coverage does not weaken owner STOP or ordinary host failures."""
+    cfg, state, _repo = setup
+    task = state.add_task("neocortex", "stop first", "objective", [])
+    adapter = TimerFlakyAdapter([emit({"outcome": "YIELD", "summary": "failed"})], permanent=True)
+    cfg.home.mkdir(parents=True, exist_ok=True)
+    (cfg.home / "STOP").write_text("owner stop\n")
+    timer_invocation(cfg, state, adapter)
+    assert not adapter.calls
+    (cfg.home / "STOP").unlink()
+    timer_invocation(cfg, state, adapter)
+    assert state.one("SELECT attempts FROM task WHERE id=?", (task,))[0] == 1
+
+
 def test_agent_authored_host_deferred_flag_does_not_bypass_fail_policy(setup, monkeypatch):
     """Only adapter assessment, never outcome JSON, may defer a failed turn."""
     cfg, state, _repo = setup

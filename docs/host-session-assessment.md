@@ -21,7 +21,7 @@ host evidence. Old rows display as `legacy/unknown`.
 
 | Category | Meaning and evidence |
 | --- | --- |
-| `subscription_limit` | A resettable product/subscription allowance only when a terminal CLI diagnostic explicitly says so. It is not inferred from HTTP 429. |
+| `subscription_limit` | A resettable product/subscription allowance only when a terminal CLI diagnostic explicitly identifies the subscription/product plan **and** a reset or cadence. Bare `usage limit`, `plan limit`, `insufficient_quota`, or HTTP 429 do not establish it. |
 | `throttled` | Rate limiting. A 429 alone has no reset schedule. |
 | `overloaded`, `transient` | Provider capacity or transport failures; neither is authorization. |
 | `authentication`, `permission` | Login/key/authorization failure. |

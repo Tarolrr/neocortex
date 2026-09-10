@@ -174,10 +174,19 @@ def _category_from_terminal(text: str) -> str:
     """Map a *structured terminal* provider diagnostic to the runner taxonomy."""
     value = text.lower()
     # Ordered from specific product/account states to broad HTTP-style errors.
-    if any(token in value for token in (
-        "subscription limit", "usage limit", "plan limit", "limit resets",
-        "resets at", "resets on", "weekly limit", "monthly limit",
-    )):
+    # A bare "usage limit" or "plan limit" also occurs for API organization
+    # spend limits.  It cannot establish a resettable end-user subscription
+    # allowance.  Require both an explicit consumer subscription/product plan
+    # and an explicit reset/cadence in the terminal event.
+    subscription_product = re.search(
+        r"\bsubscription\b|\b(?:chatgpt|codex)\s+"
+        r"(?:plus|pro|team|business|enterprise|plan)\b", value,
+    )
+    resettable_allowance = re.search(
+        r"\b(?:limit\s+)?resets?\s+(?:at|on|in)\b|"
+        r"\b(?:weekly|monthly)\s+(?:subscription|allowance|limit)\b", value,
+    )
+    if subscription_product and resettable_allowance:
         return "subscription_limit"
     if any(token in value for token in (
         "insufficient_quota", "billing", "credit balance", "credits exhausted",

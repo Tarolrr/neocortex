@@ -6,12 +6,34 @@ import pytest
 
 from nc.adapters import (
     SessionResult,
+    _category_from_terminal,
     _run,
     adapter_ownership,
     assess_session,
     parse_tokens,
     sanitize_diagnostic,
 )
+
+
+@pytest.mark.parametrize("diagnostic", [
+    "usage limit reached",
+    "plan limit reached",
+    "organization usage limit resets at midnight",
+    "HTTP 429: plan limit reached",
+])
+def test_generic_usage_or_plan_limit_is_not_a_subscription_limit(diagnostic):
+    """Synthetic terminal diagnostics without subscription evidence stay unknown."""
+    assert _category_from_terminal(diagnostic) == "unknown"
+
+
+@pytest.mark.parametrize("diagnostic", [
+    "Your subscription limit resets at 17:00 UTC",
+    "Your ChatGPT Plus limit resets on 2026-09-11",
+    "Codex Pro has a weekly allowance",
+])
+def test_explicit_resettable_subscription_allowance_is_classified(diagnostic):
+    """Synthetic diagnostics must identify both the product and reset/cadence."""
+    assert _category_from_terminal(diagnostic) == "subscription_limit"
 
 
 def test_real_codex_usage(tmp_path, monkeypatch):

@@ -255,10 +255,19 @@ def _category_from_terminal(text: str) -> str:
     )
     if subscription_product and resettable_allowance:
         return "subscription_limit"
-    if any(token in value for token in (
-        "insufficient_quota", "billing", "credit balance", "credits exhausted",
-        "quota exceeded",
-    )):
+    # ``insufficient_quota`` is the provider's explicit API error code.  Do
+    # not turn vague references to billing, a credit balance, or a quota into
+    # an assertion that API credits are exhausted: those also describe billing
+    # service faults and non-credit quotas.  Natural-language diagnostics must
+    # say that API/billing credits have actually been exhausted or depleted.
+    credits_exhausted = re.search(
+        r"\b(?:api\s+|billing\s+)?credits?\s+"
+        r"(?:are\s+|have\s+been\s+|were\s+)?"
+        r"(?:exhausted|depleted|empty|zero|used\s+up)\b|"
+        r"\bno\s+(?:remaining\s+)?(?:api\s+|billing\s+)?credits?\b",
+        value,
+    )
+    if "insufficient_quota" in value or credits_exhausted:
         return "billing_credits"
     if any(token in value for token in (
         "permission_denied", "permission denied", "forbidden", "not authorized",

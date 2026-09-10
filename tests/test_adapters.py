@@ -30,6 +30,28 @@ def test_generic_usage_or_plan_limit_is_not_a_subscription_limit(diagnostic, exp
 
 
 @pytest.mark.parametrize("diagnostic", [
+    "billing service reported an error",
+    "billing configuration could not be loaded",
+    "credit balance is unavailable",
+    "quota exceeded",
+    "project quota exceeded",
+])
+def test_ambiguous_billing_or_quota_diagnostic_is_not_billing_credits(diagnostic):
+    """Synthetic terminal diagnostics need explicit API-credit exhaustion."""
+    assert _category_from_terminal(diagnostic) == "unknown"
+
+
+@pytest.mark.parametrize("diagnostic", [
+    "API credits exhausted",
+    "billing credits have been depleted",
+    "no remaining API credits",
+])
+def test_explicit_api_credit_exhaustion_is_billing_credits(diagnostic):
+    """Synthetic terminal diagnostics explicitly establish exhausted credits."""
+    assert _category_from_terminal(diagnostic) == "billing_credits"
+
+
+@pytest.mark.parametrize("diagnostic", [
     "Your subscription limit resets at 17:00 UTC",
     "Your ChatGPT Plus limit resets on 2026-09-11",
     "Codex Pro has a weekly allowance",

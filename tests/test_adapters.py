@@ -64,23 +64,27 @@ def test_parse_tokens(text, expected):
     assert parse_tokens(text) == expected
 
 
-@pytest.mark.parametrize(("adapter", "line", "expected"), [
-    ("codex", "Codex API Error: rate_limit_exceeded", "throttled"),
-    ("claude", "Claude API Error: insufficient_quota", "billing_credits"),
-    ("codex", "Codex API Error: permission_denied", "permission"),
-    ("claude", "Claude API Error: authentication_error", "authentication"),
-    ("codex", "Codex API Error: invalid_model", "invalid_request"),
-    ("claude", "Claude API Error: temporarily_unavailable", "transient"),
-    ("codex", "Codex API Error: overloaded", "overloaded"),
-    ("claude", "Claude API Error: usage_limit", "subscription_limit"),
-])
-def test_adapter_specific_final_terminal_fixture(tmp_path, adapter, line, expected):
-    """Synthetic fixtures; these envelopes are deliberately not live evidence."""
+def test_legacy_text_envelope_is_not_terminal_evidence(tmp_path):
+    """Synthetic compatibility text must not pretend to be a CLI event."""
     path = tmp_path / "session.log"
-    path.write_text("ordinary output\n" + line + "\n")
-    assessment = assess_session(SessionResult(1, path, None, False), adapter)
+    path.write_text("Codex API Error: rate_limit_exceeded\n")
+    assessment = assess_session(SessionResult(1, path, None, False), "codex")
+    assert assessment.category == "unknown"
+    assert assessment.failed
+
+
+@pytest.mark.parametrize(("adapter", "fixture", "expected"), [
+    ("codex", "codex-0.86.0-terminal-error.jsonl", "throttled"),
+    ("claude", "claude-2.1.76-terminal-error.jsonl", "authentication"),
+])
+def test_captured_versioned_terminal_jsonl_fixture(tmp_path, adapter, fixture, expected):
+    """Captured JSONL shape, labeled by pinned CLI version; no live call."""
+    path = tmp_path / "session.log"
+    path.write_text((Path(__file__).parent / "fixtures" / fixture).read_text())
+    assessment = assess_session(SessionResult(0, path, None, False), adapter)
     assert assessment.category == expected
     assert assessment.failed
+    assert assessment.diagnostic
 
 
 @pytest.mark.parametrize("adapter", ["codex", "claude"])
@@ -89,6 +93,13 @@ def test_fallback_never_searches_prompt_or_truncated_streams(tmp_path, adapter):
     path.write_text('prompt says "rate_limit_exceeded"\n' * 1000 +
                     'agent quoted "Codex API Error: permission_denied"\n')
     assessment = assess_session(SessionResult(1, path, None, False), adapter)
+    assert assessment.category == "unknown"
+
+
+def test_truncated_jsonl_terminal_stream_is_unknown(tmp_path):
+    path = tmp_path / "session.log"
+    path.write_text('{"type":"error","message":"rate_limit_exceeded"')
+    assessment = assess_session(SessionResult(1, path, None, False), "codex")
     assert assessment.category == "unknown"
 
 
@@ -150,8 +161,9 @@ def test_claude_command(tmp_path, monkeypatch, binary, model):
     prompt = "Review this diff.\nReport findings."
     log = tmp_path / "session.log"
     result = ClaudeAdapter().run(prompt, tmp_path, model, log, 30)
-    cmd = [binary or str(tmp_path / ".local/bin/claude"),
-           "-p", prompt, "--permission-mode", "bypassPermissions"]
+    cmd = [binary or str(tmp_path / ".local/bin/claude"), "-p", prompt,
+           "--output-format", "stream-json", "--verbose",
+           "--permission-mode", "bypassPermissions"]
     if model:
         cmd += ["--model", model]
     run.assert_called_once_with(cmd, tmp_path, log, 30)

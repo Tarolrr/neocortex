@@ -267,6 +267,8 @@ def cmd_why(args) -> int:
               f"/{run['terminal_category'] or 'unknown'} "
               f"exit={run['exit_code'] if run['exit_code'] is not None else 'unknown'} "
               f"timeout={run['timed_out'] if run['timed_out'] is not None else 'unknown'}")
+        if run["terminal_diagnostic"]:
+            print(f"    terminal diagnostic: {run['terminal_diagnostic']}")
     if not task["runs"]:
         print("  (none)")
 

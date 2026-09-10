@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -134,26 +135,73 @@ def _fallback_terminal(adapter: str, log_path: Path) -> tuple[str, str]:
     except OSError:
         return "unknown", "terminal diagnostic unavailable"
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    line = lines[-1] if lines else ""
-    # These are intentionally distinct.  They are conservative fixture-backed
-    # envelopes, not claims that every version emits every form (see docs).
-    envelopes = {
-        "codex": r"^Codex API Error:\s*(?P<code>[a-z_]+)\s*$",
-        "claude": r"^Claude API Error:\s*(?P<code>[a-z_]+)\s*$",
-    }
-    match = re.match(envelopes.get(adapter, r"(?!x)x"), line, re.IGNORECASE)
-    codes = {
-        "usage_limit": "subscription_limit", "rate_limit_exceeded": "throttled",
-        "overloaded": "overloaded", "server_error": "overloaded",
-        "temporarily_unavailable": "transient", "network_error": "transient",
-        "authentication_error": "authentication", "permission_denied": "permission",
-        "invalid_request": "invalid_request", "invalid_model": "invalid_request",
-        "insufficient_quota": "billing_credits",
-    }
-    if match:
-        return codes.get(match.group("code").lower(), "unknown"), sanitize_diagnostic(
-            f"{adapter}: {line}")
-    return "unknown", sanitize_diagnostic(line)
+    # The narrow fallback deliberately reports no provider category.  A
+    # non-JSON final line can establish that the launcher failed, but cannot
+    # establish whose service failed or what a quoted API-looking phrase means.
+    return "unknown", sanitize_diagnostic(lines[-1] if lines else "")
+
+
+def _category_from_structured_message(message: str) -> str:
+    """Map an error *field* from a terminal JSON event, never free prose."""
+    value = message.lower()
+    # These identifiers are API error identifiers, but are only acted on after
+    # the CLI has put them in its terminal machine-readable event.
+    if "rate_limit" in value or "rate limit" in value:
+        return "throttled"
+    if "insufficient_quota" in value or "billing" in value or "credit" in value:
+        return "billing_credits"
+    if "usage_limit" in value or "subscription" in value:
+        return "subscription_limit"
+    if "overload" in value or "server_error" in value:
+        return "overloaded"
+    if "temporarily_unavailable" in value or "network" in value or "connection" in value:
+        return "transient"
+    if "authentication" in value or "unauthenticated" in value:
+        return "authentication"
+    if "permission" in value or "forbidden" in value:
+        return "permission"
+    if "invalid_model" in value or "invalid_request" in value or "bad request" in value:
+        return "invalid_request"
+    return "unknown"
+
+
+def _structured_terminal(adapter: str, log_path: Path) -> tuple[str, str] | None:
+    """Read only a final machine-readable error event emitted by a CLI.
+
+    Codex ``exec --json`` and Claude ``-p --output-format stream-json
+    --verbose`` each write JSON Lines.  We intentionally require the *last*
+    JSON event to be an error/result-error: this avoids treating an
+    intermediate retry event, a tool payload, or text quoted by an agent as a
+    terminal provider failure.
+    """
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    records = []
+    for line in lines:
+        if not line.lstrip().startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            # A killed process can leave a partial JSON record.  It is not
+            # terminal evidence and must not hide an earlier textual log.
+            continue
+        records.append(record)
+    if not records or not isinstance(records[-1], dict):
+        return None
+    event = records[-1]
+    if adapter == "codex" and event.get("type") == "error":
+        message = event.get("message") or event.get("error") or ""
+    elif (adapter == "claude" and event.get("type") == "result"
+          and event.get("is_error") is True):
+        message = event.get("result") or event.get("error") or event.get("subtype") or ""
+    else:
+        return None
+    if not isinstance(message, str):
+        message = json.dumps(message, ensure_ascii=False)
+    return _category_from_structured_message(message), sanitize_diagnostic(message)
 
 
 def assess_session(result: SessionResult, adapter: str) -> HostAssessment:
@@ -165,6 +213,10 @@ def assess_session(result: SessionResult, adapter: str) -> HostAssessment:
         category = terminal_category if terminal_category in _TERMINAL_CATEGORIES else "unknown"
         return HostAssessment("FAILED", category,
                               sanitize_diagnostic(getattr(result, "terminal_diagnostic", "")))
+    structured = _structured_terminal(adapter, result.log_path)
+    if structured is not None:
+        category, diagnostic = structured
+        return HostAssessment("FAILED", category, diagnostic)
     if result.exit_code != 0:
         category, diagnostic = _fallback_terminal(adapter, result.log_path)
         return HostAssessment("FAILED", category, diagnostic or f"CLI exited {result.exit_code}")
@@ -224,7 +276,13 @@ def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionRe
     _remove_cgroup(cgroup)
     text = log_path.read_text(errors="replace")
     tokens = parse_tokens(text)
-    return SessionResult(exit_code=code, log_path=log_path, tokens=tokens, timed_out=timed_out)
+    # Both real adapters opt into a documented JSONL mode.  This is parsed
+    # here, at the process boundary, rather than guessed later from an outcome.
+    adapter = Path(cmd[0]).name
+    structured = _structured_terminal(adapter, log_path)
+    return SessionResult(exit_code=code, log_path=log_path, tokens=tokens, timed_out=timed_out,
+                         terminal_category=structured[0] if structured else None,
+                         terminal_diagnostic=structured[1] if structured else "")
 
 
 class CodexAdapter(Adapter):
@@ -237,6 +295,7 @@ class CodexAdapter(Adapter):
             timeout_s: int) -> SessionResult:
         cmd = [
             "codex", "exec",
+            "--json",
             "--model", model,
             "--sandbox", "danger-full-access",
             "--skip-git-repo-check",
@@ -247,7 +306,7 @@ class CodexAdapter(Adapter):
     def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
                     timeout_s: int) -> SessionResult:
         return _run([
-            "codex", "exec", "--model", model, "--sandbox", "workspace-write",
+            "codex", "exec", "--json", "--model", model, "--sandbox", "workspace-write",
             "--skip-git-repo-check", prompt,
         ], cwd, log_path, timeout_s)
 
@@ -261,7 +320,8 @@ class ClaudeAdapter(Adapter):
     def run(self, prompt: str, cwd: Path, model: str, log_path: Path,
             timeout_s: int) -> SessionResult:
         binary = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
-        cmd = [binary, "-p", prompt, "--permission-mode", "bypassPermissions"]
+        cmd = [binary, "-p", prompt, "--output-format", "stream-json", "--verbose",
+               "--permission-mode", "bypassPermissions"]
         if model:
             cmd += ["--model", model]
         return _run(cmd, cwd, log_path, timeout_s)
@@ -269,7 +329,8 @@ class ClaudeAdapter(Adapter):
     def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
                     timeout_s: int) -> SessionResult:
         binary = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
-        cmd = [binary, "-p", prompt, "--permission-mode", "dontAsk",
+        cmd = [binary, "-p", prompt, "--output-format", "stream-json", "--verbose",
+               "--permission-mode", "dontAsk",
                "--tools", "Read,Glob,Grep,Write", "--allowedTools",
                "Read", "Glob", "Grep", f"Write(//{cwd.as_posix().lstrip('/')}/outcome.json)"]
         if model:

@@ -32,19 +32,22 @@ host evidence. Old rows display as `legacy/unknown`.
 | `protocol` | Reserved for a structured adapter terminal protocol defect. |
 | `unknown` | Unsupported or insufficient evidence. |
 
-The current Codex and Claude adapters provide process exit, timeout, and a
-combined terminal log, but no structured vendor terminal event. Therefore a
-log fallback is used only after a nonzero exit and only for an adapter-specific
-final envelope (`Codex API Error: <code>` or `Claude API Error: <code>`).
-Those envelopes and their tests are **synthetic, unverified terminal forms**:
-they are deliberately narrow compatibility fixtures, not claims about what
-Codex 0.86.0 or Claude 2.1.76 emits. Any other line, including a prompt,
-quotation, tool output, truncated stream, or agent summary, is `unknown`.
-Successful exit logs are never searched. A future adapter may supply
-`SessionResult.terminal_category` and
-`terminal_diagnostic`; that structured evidence wins even with exit zero. A
-recovered intermediate error followed by exit zero and no structured terminal
-failure is successful.
+The real adapters request machine-readable streams: Codex uses `codex exec
+--json` (the non-interactive guide) and Claude uses `-p --output-format
+stream-json --verbose` ([Claude CLI reference](https://code.claude.com/docs/en/cli-reference),
+retrieved 2026-09-10). The adapter accepts only a final JSON error event:
+Codex `{"type":"error","message":...}` or Claude
+`{"type":"result","is_error":true,"result":...}`. That structured
+terminal evidence wins even with exit zero. Version-labelled JSONL fixtures
+(`codex-0.86.0-*`, `claude-2.1.76-*`) are offline captured-format fixtures,
+not owner incidents and not a claim that every release has the same grammar.
+They exercise temporary and permanent classifications without a paid call.
+
+The old `Codex API Error: <code>` / `Claude API Error: <code>` text envelopes
+are **synthetic, unverified** and are no longer classified. Any arbitrary
+line, including a prompt, quotation, tool output, agent summary, or truncated
+JSON stream, is `unknown` after a bad exit. A recovered intermediate error
+followed by a successful final event and exit zero is success.
 
 Fixtures in tests are synthetic unless a test says otherwise. No historical
 owner incident is called verified without its original run log and terminal

@@ -35,17 +35,21 @@ host evidence. Old rows display as `legacy/unknown`.
 The real adapters request machine-readable streams: Codex uses `codex exec
 --json` (the non-interactive guide) and Claude uses `-p --output-format
 stream-json --verbose` ([Claude CLI reference](https://code.claude.com/docs/en/cli-reference),
-retrieved 2026-09-10). The adapter accepts only a final JSON error event:
-Codex `{"type":"error","message":...}` or Claude
-`{"type":"result","is_error":true,"result":...}`. That structured
-terminal evidence wins even with exit zero. The JSONL fixtures are **synthetic
-and unverified terminal-format examples**, not captures and
-not owner incidents. The pinned-version distribution metadata establishes only
-that bootstrap pins Codex 0.86.0 and Claude Code 2.1.76; it does **not**
-support the event grammar above. No retained capture provenance or
-version-specific primary-source terminal-event schema is currently available,
-so these examples must not be read as version-specific evidence. They exercise
-temporary and permanent classifications without a paid call.
+retrieved 2026-09-10). However, the versioned publisher artifacts establish
+only that bootstrap pins Codex 0.86.0 and Claude Code 2.1.76; they do **not**
+provide a version-specific primary-source terminal-event schema. Therefore the
+runner deliberately does **not** classify JSON records scraped from either
+combined session log. This makes a truncated record, a tool JSON payload, and
+a quoted JSON-looking string unsupported evidence rather than a provider
+failure. `SessionResult.terminal_category` is reserved for an adapter that
+supplies independently structured terminal evidence with its own verified,
+version-specific contract; that evidence wins even with exit zero.
+
+The JSONL fixtures are **synthetic and unverified** examples only. They are
+not captures, not evidence that either pinned version emits those shapes, and
+are not classified by the runner. They exist to ensure unsupported and
+truncated streams remain harmless. No retained capture provenance or
+version-specific primary-source terminal-event schema is currently available.
 
 The old `Codex API Error: <code>` / `Claude API Error: <code>` text envelopes
 are **synthetic, unverified** and are no longer classified. Any arbitrary

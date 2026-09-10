@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -141,70 +140,7 @@ def _fallback_terminal(adapter: str, log_path: Path) -> tuple[str, str]:
     return "unknown", sanitize_diagnostic(lines[-1] if lines else "")
 
 
-def _category_from_structured_message(message: str) -> str:
-    """Map an error *field* from a terminal JSON event, never free prose."""
-    value = message.lower()
-    # These identifiers are API error identifiers, but are only acted on after
-    # the CLI has put them in its terminal machine-readable event.
-    if "rate_limit" in value or "rate limit" in value:
-        return "throttled"
-    if "insufficient_quota" in value or "billing" in value or "credit" in value:
-        return "billing_credits"
-    if "usage_limit" in value or "subscription" in value:
-        return "subscription_limit"
-    if "overload" in value or "server_error" in value:
-        return "overloaded"
-    if "temporarily_unavailable" in value or "network" in value or "connection" in value:
-        return "transient"
-    if "authentication" in value or "unauthenticated" in value:
-        return "authentication"
-    if "permission" in value or "forbidden" in value:
-        return "permission"
-    if "invalid_model" in value or "invalid_request" in value or "bad request" in value:
-        return "invalid_request"
-    return "unknown"
-
-
-def _structured_terminal(adapter: str, log_path: Path) -> tuple[str, str] | None:
-    """Read only a final machine-readable error event emitted by a CLI.
-
-    Codex ``exec --json`` and Claude ``-p --output-format stream-json
-    --verbose`` each write JSON Lines.  We intentionally require the *last*
-    JSON event to be an error/result-error: this avoids treating an
-    intermediate retry event, a tool payload, or text quoted by an agent as a
-    terminal provider failure.
-    """
-    try:
-        lines = log_path.read_text(errors="replace").splitlines()
-    except OSError:
-        return None
-    records = []
-    for line in lines:
-        if not line.lstrip().startswith("{"):
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            # A killed process can leave a partial JSON record.  It is not
-            # terminal evidence and must not hide an earlier textual log.
-            continue
-        records.append(record)
-    if not records or not isinstance(records[-1], dict):
-        return None
-    event = records[-1]
-    if adapter == "codex" and event.get("type") == "error":
-        message = event.get("message") or event.get("error") or ""
-    elif (adapter == "claude" and event.get("type") == "result"
-          and event.get("is_error") is True):
-        message = event.get("result") or event.get("error") or event.get("subtype") or ""
-    else:
-        return None
-    if not isinstance(message, str):
-        message = json.dumps(message, ensure_ascii=False)
-    return _category_from_structured_message(message), sanitize_diagnostic(message)
-
-
-def assess_session(result: SessionResult, adapter: str) -> HostAssessment:
+def assess_session(result: SessionResult, _adapter: str) -> HostAssessment:
     """Apply host evidence precedence before an outcome can have effects."""
     if result.timed_out:
         return HostAssessment("FAILED", "host_timeout", "host timeout")
@@ -213,12 +149,8 @@ def assess_session(result: SessionResult, adapter: str) -> HostAssessment:
         category = terminal_category if terminal_category in _TERMINAL_CATEGORIES else "unknown"
         return HostAssessment("FAILED", category,
                               sanitize_diagnostic(getattr(result, "terminal_diagnostic", "")))
-    structured = _structured_terminal(adapter, result.log_path)
-    if structured is not None:
-        category, diagnostic = structured
-        return HostAssessment("FAILED", category, diagnostic)
     if result.exit_code != 0:
-        category, diagnostic = _fallback_terminal(adapter, result.log_path)
+        category, diagnostic = _fallback_terminal(_adapter, result.log_path)
         return HostAssessment("FAILED", category, diagnostic or f"CLI exited {result.exit_code}")
     return HostAssessment("SUCCESS", "none", "")
 
@@ -276,13 +208,9 @@ def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionRe
     _remove_cgroup(cgroup)
     text = log_path.read_text(errors="replace")
     tokens = parse_tokens(text)
-    # Both real adapters opt into a documented JSONL mode.  This is parsed
-    # here, at the process boundary, rather than guessed later from an outcome.
-    adapter = Path(cmd[0]).name
-    structured = _structured_terminal(adapter, log_path)
-    return SessionResult(exit_code=code, log_path=log_path, tokens=tokens, timed_out=timed_out,
-                         terminal_category=structured[0] if structured else None,
-                         terminal_diagnostic=structured[1] if structured else "")
+    # The stream is retained as a log reference, but is not classified without
+    # a verified terminal-event contract for this pinned CLI version.
+    return SessionResult(exit_code=code, log_path=log_path, tokens=tokens, timed_out=timed_out)
 
 
 class CodexAdapter(Adapter):

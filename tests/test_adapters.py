@@ -74,17 +74,16 @@ def test_legacy_text_envelope_is_not_terminal_evidence(tmp_path):
 
 
 @pytest.mark.parametrize(("adapter", "fixture", "expected"), [
-    ("codex", "codex-terminal-error.synthetic.jsonl", "throttled"),
-    ("claude", "claude-terminal-error.synthetic.jsonl", "authentication"),
+    ("codex", "codex-terminal-error.synthetic.jsonl", "none"),
+    ("claude", "claude-terminal-error.synthetic.jsonl", "none"),
 ])
-def test_synthetic_unverified_terminal_jsonl_fixture(tmp_path, adapter, fixture, expected):
-    """Synthetic, unverified JSONL shape; no live call or version claim."""
+def test_synthetic_unverified_jsonl_is_not_terminal_evidence(tmp_path, adapter, fixture, expected):
+    """Unsupported stream shapes cannot turn output into provider evidence."""
     path = tmp_path / "session.log"
     path.write_text((Path(__file__).parent / "fixtures" / fixture).read_text())
     assessment = assess_session(SessionResult(0, path, None, False), adapter)
     assert assessment.category == expected
-    assert assessment.failed
-    assert assessment.diagnostic
+    assert not assessment.failed
 
 
 @pytest.mark.parametrize("adapter", ["codex", "claude"])
@@ -100,6 +99,17 @@ def test_truncated_jsonl_terminal_stream_is_unknown(tmp_path):
     path = tmp_path / "session.log"
     path.write_text('{"type":"error","message":"rate_limit_exceeded"')
     assessment = assess_session(SessionResult(1, path, None, False), "codex")
+    assert assessment.category == "unknown"
+
+
+@pytest.mark.parametrize(("adapter", "event"), [
+    ("codex", '{"type":"error","message":"rate_limit_exceeded"}'),
+    ("claude", '{"type":"result","is_error":true,"result":"rate_limit_exceeded"}'),
+])
+def test_trailing_truncated_stream_never_promotes_prior_event(tmp_path, adapter, event):
+    path = tmp_path / "session.log"
+    path.write_text(event + '\n{"type":')
+    assessment = assess_session(SessionResult(1, path, None, False), adapter)
     assert assessment.category == "unknown"
 
 

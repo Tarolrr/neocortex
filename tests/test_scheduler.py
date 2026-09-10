@@ -953,7 +953,7 @@ def test_plan_critic_requires_restricted_adapter(setup):
     cfg, state, _repo = setup
     state.add_proposal('neocortex', 'planner', 'rationale', [planner_spec()])
     scheduler = sched(cfg, state, [])
-    assert scheduler.step() == protocol.FAIL
+    assert scheduler.step() == protocol.NO_OUTCOME
     assert scheduler.adapter.calls == []
     assert scheduler.step() == 'idle'
 
@@ -1125,8 +1125,8 @@ def test_session_exception_finalizes_worker_and_critic_without_consuming_feedbac
     outcome = turn.run_turn(state, cfg, adapter, state.one("SELECT * FROM agent WHERE id=?", (agent,)),
                             repo, "main")
     run = state.one("SELECT * FROM run WHERE agent_id=?", (agent,))
-    assert outcome.kind == protocol.FAIL
-    assert run["outcome"] == protocol.FAIL and "adapter exploded" in run["detail"]
+    assert outcome.kind == protocol.NO_OUTCOME
+    assert run["outcome"] == protocol.NO_OUTCOME and "adapter exploded" in run["detail"]
     assert run["timed_out"] is None and run["exit_code"] is None
     assert json.loads(state.inbox(agent)[0]["payload"]) == {"text": "retain me"}
 
@@ -1140,7 +1140,7 @@ def test_session_exception_finalizes_planner_and_plan_critic_with_context(setup)
     agent = state.one("SELECT * FROM agent WHERE id=?", (planner,))
     outcome = turn.run_planner_turn(state, cfg, agent, adapter)
     run = state.one("SELECT * FROM run WHERE agent_id=? ORDER BY id DESC", (planner,))
-    assert outcome.kind == protocol.FAIL and run["outcome"] == protocol.FAIL
+    assert outcome.kind == protocol.NO_OUTCOME and run["outcome"] == protocol.NO_OUTCOME
     assert "planner exploded" in run["detail"]
     assert run["timed_out"] is None and run["exit_code"] is None
     assert state.pending_revision(planner) is not None
@@ -1150,7 +1150,7 @@ def test_session_exception_finalizes_planner_and_plan_critic_with_context(setup)
     adapter.script = [lambda _cwd, _outcome: (_ for _ in ()).throw(RuntimeError("critic exploded"))]
     outcome = turn.run_plan_critic_turn(state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter)
     run = state.one("SELECT * FROM run WHERE role='plan_critic' ORDER BY id DESC")
-    assert outcome.kind == protocol.FAIL and run["outcome"] == protocol.FAIL
+    assert outcome.kind == protocol.NO_OUTCOME and run["outcome"] == protocol.NO_OUTCOME
     assert "critic exploded" in run["detail"]
     assert run["timed_out"] is None and run["exit_code"] is None
 
@@ -1207,7 +1207,8 @@ def test_outcome_read_oserror_is_local_host_failure_for_task_roles(setup, monkey
                             state.one("SELECT * FROM agent WHERE id=?", (agent_id,)),
                             repo, "main")
     run = state.one("SELECT * FROM run WHERE agent_id=?", (agent_id,))
-    assert outcome.kind == protocol.FAIL
+    assert outcome.kind == protocol.NO_OUTCOME
+    assert run["outcome"] == protocol.NO_OUTCOME
     assert (run["host_assessment"], run["terminal_category"], run["exit_code"], run["timed_out"]) == (
         "FAILED", "local_error", 0, 0,
     )
@@ -1229,7 +1230,8 @@ def test_outcome_read_oserror_is_local_host_failure_for_planner(setup, monkeypat
         state, cfg, state.one("SELECT * FROM agent WHERE id=?", (planner_id,)), adapter,
     )
     run = state.one("SELECT * FROM run WHERE agent_id=? ORDER BY id DESC", (planner_id,))
-    assert outcome.kind == protocol.FAIL
+    assert outcome.kind == protocol.NO_OUTCOME
+    assert run["outcome"] == protocol.NO_OUTCOME
     assert (run["host_assessment"], run["terminal_category"], run["exit_code"], run["timed_out"]) == (
         "FAILED", "local_error", 0, 0,
     )
@@ -1249,7 +1251,8 @@ def test_outcome_read_oserror_is_local_host_failure_for_plan_critic(setup, monke
     )
     run = state.one("SELECT * FROM run WHERE role='plan_critic' ORDER BY id DESC")
     review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
-    assert outcome.kind == protocol.FAIL and review["status"] == "failed"
+    assert outcome.kind == protocol.NO_OUTCOME and review["status"] == "failed"
+    assert run["outcome"] == protocol.NO_OUTCOME
     assert (run["host_assessment"], run["terminal_category"], run["exit_code"], run["timed_out"]) == (
         "FAILED", "local_error", 0, 0,
     )

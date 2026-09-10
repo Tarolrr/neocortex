@@ -177,6 +177,17 @@ def _host_failure(role: str, assessment: HostAssessment) -> protocol.Outcome:
                             summary=f"{role} host session failed: {assessment.category}{detail}")
 
 
+def _no_outcome(role: str, exc: Exception) -> protocol.Outcome:
+    """Represent host-side absence of an agent result without forging FAIL.
+
+    FAIL is an agent-authored, successfully parsed outcome.  A launcher or
+    filesystem exception has no such decision, even when the session managed
+    to write a valid-looking file before the host failed to read it.
+    """
+    return protocol.Outcome(kind=protocol.NO_OUTCOME,
+                            summary=f"{role} outcome unavailable: {exc}")
+
+
 def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
                      adapter: Adapter) -> protocol.Outcome:
     """Run a project session; only the host records the pending proposal."""
@@ -211,7 +222,7 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
             return _host_failure("Planner", assessment)
     except Exception as exc:
         logging.getLogger(__name__).exception("Planner session failed")
-        outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Planner session failure: {exc}")
+        outcome = _no_outcome("Planner", exc)
         if result_recorded and not outcome_read:
             _record_outcome_read_failure(state, run_id, result, exc)
         elif not result_recorded:
@@ -280,8 +291,7 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
             return _host_failure(agent["role"], assessment)
     except Exception as exc:
         logging.getLogger(__name__).exception("%s session failed", agent["role"])
-        outcome = protocol.Outcome(kind=protocol.FAIL,
-                                   summary=f"{agent['role']} session failure: {exc}")
+        outcome = _no_outcome(agent["role"], exc)
         if result_recorded and not outcome_read:
             _record_outcome_read_failure(state, run_id, result, exc)
         elif not result_recorded:
@@ -292,7 +302,7 @@ def run_turn(state: State, cfg: Config, adapter: Adapter, agent: sqlite3.Row,
     # Session exceptions are evidence too.  Do not deliver inbox messages: a
     # retry must retain feedback/questions that were never successfully used.
     state.end_run(run_id, outcome.kind, outcome.summary, tokens)
-    if outcome.kind != protocol.FAIL:
+    if outcome.kind in (protocol.DONE, protocol.ASK, protocol.YIELD):
         state.mark_delivered(inbox_ids)
     state.set_agent(agent["id"], turns=agent["turns"] + 1,
                     memo=outcome.memo or agent["memo"])
@@ -365,7 +375,11 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
         )
     except Exception as exc:
         logging.getLogger(__name__).exception("Plan review %s failed", review_id)
-        outcome = protocol.Outcome(kind=protocol.FAIL, summary=f"Plan review unavailable: {exc}")
+        # Validation happens after a parsed agent file; preserve it as a
+        # protocol FAIL rather than misreporting an absent host outcome.
+        outcome = (protocol.Outcome(kind=protocol.FAIL,
+                                    summary=f"Plan review protocol failure: {exc}")
+                   if outcome_read else _no_outcome("Plan review", exc))
         if result_recorded and not outcome_read:
             _record_outcome_read_failure(state, run_id, result, exc)
         elif not result_recorded:

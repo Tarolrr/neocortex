@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -1186,7 +1187,9 @@ def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role, 
     assert run["outcome"] == protocol.DONE and run["host_assessment"] == "FAILED"
     assert state.one("SELECT memo FROM agent WHERE id=?", (agent_id,))[0] == "keep"
     assert state.inbox(agent_id)
-    assert state.one("SELECT turns FROM agent WHERE id=?", (agent_id,))[0] == 1
+    assert state.one("SELECT turns FROM agent WHERE id=?", (agent_id,))[0] == (
+        0 if failure == "terminal" else 1
+    )
 
 
 @pytest.mark.parametrize("role", ["worker", "critic"])
@@ -1259,6 +1262,51 @@ def test_outcome_read_oserror_is_local_host_failure_for_plan_critic(setup, monke
     )
 
 
+@pytest.mark.parametrize("role", ["worker", "critic", "planner", "plan_critic"])
+def test_terminal_provider_failure_without_outcome_preserves_provider_evidence(setup, role):
+    """Provider evidence wins when an interrupted child writes no outcome file."""
+    cfg, state, repo = setup
+    adapter = ScriptedAdapter([nothing])
+    original = adapter.run
+
+    def interrupted(*args):
+        result = original(*args)
+        result.terminal_category = "throttled"
+        return result
+
+    adapter.run = interrupted
+    if role in {"worker", "critic"}:
+        task = state.add_task("neocortex", f"{role} outage", "objective", [])
+        state.set_task(task, status="in_review" if role == "critic" else "in_progress")
+        agent_id = state.add_agent(f"{role}-outage", role, "neocortex", task, "model")
+        state.set_agent(agent_id, memo="retain")
+        state.send("feedback", "owner", agent_id, {"text": "retain"}, task)
+        outcome = turn.run_turn(state, cfg, adapter,
+                                state.one("SELECT * FROM agent WHERE id=?", (agent_id,)),
+                                repo, "main")
+        agent = state.one("SELECT turns, memo FROM agent WHERE id=?", (agent_id,))
+        assert agent["turns"] == 0 and agent["memo"] == "retain" and state.inbox(agent_id)
+    elif role == "planner":
+        original_proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+        planner_id, _ = state.planner_feedback(None, "retain", "model", proposal_id=original_proposal)
+        outcome = turn.run_planner_turn(
+            state, cfg, state.one("SELECT * FROM agent WHERE id=?", (planner_id,)), adapter)
+        assert state.pending_revision(planner_id) is not None
+    else:
+        proposal_id = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+        adapter.run_planner = adapter.run
+        outcome = turn.run_plan_critic_turn(
+            state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal_id,)), adapter)
+        assert state.one("SELECT status FROM plan_review WHERE proposal_id=?", (proposal_id,))[0] == "retryable"
+
+    run = state.one("SELECT * FROM run ORDER BY id DESC")
+    assert outcome.kind == protocol.FAIL and outcome.deferred
+    assert run["outcome"] == protocol.NO_OUTCOME
+    assert (run["host_assessment"], run["terminal_category"], run["exit_code"], run["timed_out"]) == (
+        "FAILED", "throttled", 0, 0,
+    )
+
+
 @pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
 def test_plan_critic_host_failure_with_done_cannot_complete_review(setup, failure):
     cfg, state, _repo = setup
@@ -1282,9 +1330,308 @@ def test_plan_critic_host_failure_with_done_cannot_complete_review(setup, failur
         state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter,
     )
     review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
-    assert outcome.kind == protocol.FAIL and review["status"] == "failed"
+    assert outcome.kind == protocol.FAIL and review["status"] == (
+        "retryable" if failure == "terminal" else "failed"
+    )
     agent = state.one("SELECT state, turns FROM agent WHERE role='plan_critic' ORDER BY id DESC")
-    assert (agent["state"], agent["turns"]) == ("done", 1)
+    assert (agent["state"], agent["turns"]) == (
+        "done", 0 if failure == "terminal" else 1,
+    )
+
+
+def test_plan_critic_provider_retry_reuses_logical_review_and_records_attempts(setup):
+    """A timer's next invocation retries advice, not a new logical review."""
+    cfg, state, _repo = setup
+    proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+    adapter = ScriptedAdapter([
+        emit({"outcome": "DONE", "recommendation": "discard", "findings": []}),
+        emit({"outcome": "DONE", "recommendation": "keep", "findings": ["one"]}),
+    ])
+    adapter.run_planner = adapter.run
+    original = adapter.run_planner
+
+    def temporarily_unavailable(*args):
+        result = original(*args)
+        result.terminal_category = "transient"
+        return result
+
+    adapter.run_planner = temporarily_unavailable
+    scheduler = sched(cfg, state, [])
+    scheduler._adapter_for = lambda _role: adapter
+    assert scheduler.step() == "deferred"
+    review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+    assert review["status"] == "retryable"
+    adapter.run_planner = original
+    # A timer starts a fresh scheduler process; the retryable claim and its
+    # first attempt live in SQLite rather than in Scheduler memory.
+    scheduler = sched(cfg, state, [])
+    scheduler._adapter_for = lambda _role: adapter
+    assert scheduler.step() == protocol.DONE
+    review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+    attempts = state.q("SELECT status FROM plan_review_attempt WHERE review_id=? ORDER BY id",
+                       (review["id"],))
+    assert review["status"] == "done" and review["recommendation"] == "keep"
+    assert [row["status"] for row in attempts] == ["retryable", "done"]
+    assert state.one("SELECT COUNT(*) FROM agent WHERE id=?", (f"plan-critic-{review['id']}",))[0] == 1
+
+
+@pytest.mark.parametrize("role", ["worker", "critic", "planner", "plan_critic"])
+def test_typed_provider_exception_persists_reset_epoch_for_every_role(setup, role):
+    """A typed launch exception has the same reset evidence as a terminal event."""
+    cfg, state, repo = setup
+    future = time.time() + 3600
+
+    class ProviderUnavailable(Exception):
+        terminal_category = "throttled"
+
+    def unavailable(_cwd, _outcome):
+        raise ProviderUnavailable(f"rate limited; retry at {future}")
+
+    adapter = ScriptedAdapter([unavailable])
+    if role in {"worker", "critic"}:
+        task = state.add_task("neocortex", f"{role} reset", "objective", [])
+        state.set_task(task, status="in_review" if role == "critic" else "in_progress")
+        agent_id = state.add_agent(f"{role}-reset", role, "neocortex", task, "model")
+        outcome = turn.run_turn(state, cfg, adapter,
+                                state.one("SELECT * FROM agent WHERE id=?", (agent_id,)),
+                                repo, "main")
+    elif role == "planner":
+        proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+        planner_id, _ = state.planner_feedback(None, "revise", "model", proposal_id=proposal)
+        outcome = turn.run_planner_turn(
+            state, cfg, state.one("SELECT * FROM agent WHERE id=?", (planner_id,)), adapter,
+        )
+    else:
+        proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+        adapter.run_planner = adapter.run
+        outcome = turn.run_plan_critic_turn(
+            state, cfg, state.one("SELECT * FROM proposal WHERE id=?", (proposal,)), adapter,
+        )
+        reviewer = state.one(
+            "SELECT turns FROM agent WHERE role='plan_critic' ORDER BY id DESC"
+        )
+        assert reviewer["turns"] == 0
+    run = state.one("SELECT * FROM run ORDER BY id DESC")
+    assert outcome.deferred
+    assert run["terminal_category"] == "throttled"
+    assert run["defer_until"] == pytest.approx(future)
+
+
+def test_typed_preflight_exception_defers_without_incident_and_retries(setup, monkeypatch):
+    cfg, state, _repo = setup
+    state.add_task("neocortex", "preflight retry", "objective", [])
+    scheduler = sched(cfg, state, [emit({"outcome": "YIELD", "summary": "later"})])
+    monkeypatch.setattr(scheduler, "readiness", lambda: (True, "test"))
+
+    class ProviderUnavailable(Exception):
+        terminal_category = "throttled"
+
+    calls = [ProviderUnavailable("retry at 1999999999"), None]
+
+    def preflight():
+        item = calls.pop(0)
+        if item:
+            raise item
+        return True, "ok"
+
+    monkeypatch.setattr(scheduler, "preflight", preflight)
+    assert scheduler.run(max_turns=1)
+    assert not scheduler.adapter.calls
+    attempt = state.one("SELECT * FROM preflight_attempt")
+    assert attempt["role"] == "worker" and attempt["category"] == "throttled"
+    assert not state.open_incidents()
+    assert scheduler.run(max_turns=1)
+    assert len(scheduler.adapter.calls) == 1
+
+
+class TimerFlakyAdapter(ScriptedAdapter):
+    """A fake provider which fails completed sessions before later recovery."""
+
+    def __init__(self, script, temporary_failures=1, *, permanent=False):
+        super().__init__(script)
+        self.temporary_failures = temporary_failures
+        self.permanent = permanent
+
+    def run(self, *args, **kwargs):
+        result = super().run(*args, **kwargs)
+        if self.temporary_failures:
+            self.temporary_failures -= 1
+            if self.permanent:
+                result.exit_code = 1
+            else:
+                # This is adapter-owned terminal evidence, after the agent has
+                # made a partial change/written an outcome, not agent JSON.
+                result.terminal_category = "transient"
+                result.terminal_diagnostic = "provider connection reset"
+        return result
+
+
+def timer_invocation(cfg, state, adapter):
+    """Fresh Scheduler instance: equivalent to the next five-minute timer run."""
+    scheduler = Scheduler(cfg, state)
+    scheduler._adapter_for = lambda _role: adapter
+    scheduler.readiness = lambda: (True, "isolated fake host")
+    scheduler.preflight = lambda: (True, "isolated fake model")
+    assert scheduler.run(max_turns=1)
+    return scheduler
+
+
+@pytest.mark.parametrize("role", ["worker", "critic", "planner", "plan_critic"])
+def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
+    """A provider outage ends this timer run; its next run resumes logical work."""
+    cfg, state, _repo = setup
+    def partial(cwd, outcome_path):
+        (cwd / "partial-provider-state").write_text("keep\n")
+        outcome_path.parent.mkdir(parents=True, exist_ok=True)
+        outcome_path.write_text(json.dumps({"outcome": "YIELD", "summary": "interrupted"}))
+    if role == "worker":
+        task = state.add_task("neocortex", "worker outage", "objective", [])
+        adapter = TimerFlakyAdapter([
+            partial,
+            commit_and_emit("complete", "ok\n", {"outcome": "DONE", "summary": "done"}),
+        ])
+        # Undelivered feedback must survive the failed host session.
+        state.add_agent(f"worker-{task}", "worker", "neocortex", task, "model")
+        state.set_task(task, status="in_progress")
+        state.send(protocol.FEEDBACK, "owner", f"worker-{task}", {"text": "retain"}, task)
+    elif role == "critic":
+        task = state.add_task("neocortex", "critic outage", "objective", [])
+        state.set_task(task, status="in_review")
+        state.add_agent(f"worker-{task}", "worker", "neocortex", task, "model")
+        state.set_agent(f"worker-{task}", state="blocked")
+        state.add_agent(f"critic-{task}-1", "critic", "neocortex", task, "model")
+        state.send(protocol.FEEDBACK, "owner", f"critic-{task}-1", {"text": "retain"}, task)
+        adapter = TimerFlakyAdapter([
+            partial,
+            emit({"outcome": "DONE", "verdict": "rework", "findings": ["fix"]}),
+        ])
+    elif role == "planner":
+        planner, _ = state.planner_feedback(None, "retain revision wake", "model")
+        adapter = TimerFlakyAdapter([
+            partial,
+            emit({"outcome": "DONE", "summary": "proposal", "proposal": [planner_spec()]}),
+        ])
+    else:
+        proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
+        adapter = TimerFlakyAdapter([
+            partial,
+            emit({"outcome": "DONE", "recommendation": "keep", "findings": ["sound"]}),
+        ])
+        adapter.run_planner = adapter.run
+
+    # The first invocation makes exactly one dispatch and returns on deferral.
+    timer_invocation(cfg, state, adapter)
+    assert len(adapter.calls) == 1
+    assert not state.open_incidents()
+    assert state.one("SELECT COUNT(*) FROM run")[0] == 1
+    assert state.one("SELECT turns FROM agent WHERE role=? ORDER BY id LIMIT 1", (role,))[0] == 0
+    if role in {"worker", "critic"}:
+        assert (cfg.work_dir / task / "partial-provider-state").read_text() == "keep\n"
+        recipient = f"worker-{task}" if role == "worker" else f"critic-{task}-1"
+        assert state.inbox(recipient), "host outage cannot acknowledge feedback"
+        assert state.one("SELECT attempts FROM task WHERE id=?", (task,))[0] == 0
+    elif role == "planner":
+        assert state.inbox(planner), "planner feedback and wake remain durable"
+        assert state.one("SELECT state FROM agent WHERE id=?", (planner,))[0] == "runnable"
+    else:
+        review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+        assert review["status"] == "retryable"
+
+    # A new Scheduler object models the later timer process, not an in-memory retry.
+    timer_invocation(cfg, state, adapter)
+    assert len(adapter.calls) == 2
+    if role == "worker":
+        assert state.one("SELECT status FROM task WHERE id=?", (task,))[0] == "in_review"
+        assert state.one("SELECT COUNT(*) FROM agent WHERE role='critic' AND task_id=?", (task,))[0] == 1
+    elif role == "critic":
+        assert state.one("SELECT status FROM task WHERE id=?", (task,))[0] == "in_progress"
+        assert state.one("SELECT COUNT(*) FROM message WHERE kind=? AND sender=? AND task_id=?",
+                         (protocol.REVIEW_VERDICT, f"critic-{task}-1", task))[0] == 1
+    elif role == "planner":
+        assert state.one("SELECT COUNT(*) FROM proposal")[0] == 1
+        assert not state.inbox(planner)
+    else:
+        review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
+        attempts = state.q("SELECT status FROM plan_review_attempt WHERE review_id=? ORDER BY id",
+                           (review["id"],))
+        assert review["status"] == "done"
+        assert [row["status"] for row in attempts] == ["retryable", "done"]
+
+
+def test_timer_outages_exceed_task_and_turn_budgets_without_breaker(setup):
+    """Repeated provider outages are recorded runs, never task/turn failures."""
+    cfg, state, _repo = setup
+    cfg.max_attempts = 2
+    cfg.max_consecutive_failures = 2
+    task = state.add_task("neocortex", "many outages", "objective", [], budget_turns=2)
+    state.add_agent(f"worker-{task}", "worker", "neocortex", task, "model")
+    state.set_task(task, status="in_progress")
+    adapter = TimerFlakyAdapter(
+        [emit({"outcome": "YIELD", "summary": "interrupted"})] * 3
+        + [emit({"outcome": "YIELD", "summary": "recovered"})],
+        temporary_failures=3,
+    )
+    for _ in range(3):
+        scheduler = timer_invocation(cfg, state, adapter)
+        assert scheduler.consecutive_failures == 0
+    agent = state.one("SELECT turns, state FROM agent WHERE id=?", (f"worker-{task}",))
+    task_row = state.one("SELECT attempts, status FROM task WHERE id=?", (task,))
+    assert (agent["turns"], agent["state"], task_row["attempts"], task_row["status"]) == (0, "runnable", 0, "in_progress")
+    assert not (cfg.home / "STOP").exists()
+    timer_invocation(cfg, state, adapter)
+    assert state.one("SELECT turns FROM agent WHERE id=?", (f"worker-{task}",))[0] == 1
+
+
+def test_timer_keeps_stop_and_nontransient_fail_policy(setup):
+    """Deferral coverage does not weaken owner STOP or ordinary host failures."""
+    cfg, state, _repo = setup
+    task = state.add_task("neocortex", "stop first", "objective", [])
+    adapter = TimerFlakyAdapter([emit({"outcome": "YIELD", "summary": "failed"})], permanent=True)
+    cfg.home.mkdir(parents=True, exist_ok=True)
+    (cfg.home / "STOP").write_text("owner stop\n")
+    timer_invocation(cfg, state, adapter)
+    assert not adapter.calls
+    (cfg.home / "STOP").unlink()
+    timer_invocation(cfg, state, adapter)
+    assert state.one("SELECT attempts FROM task WHERE id=?", (task,))[0] == 1
+
+
+def test_agent_authored_host_deferred_flag_does_not_bypass_fail_policy(setup, monkeypatch):
+    """Only adapter assessment, never outcome JSON, may defer a failed turn."""
+    cfg, state, _repo = setup
+    task_id = state.add_task("neocortex", "forged defer", "objective", [])
+    scheduler = sched(cfg, state, [emit({"outcome": "FAIL", "summary": "real failure",
+                                        "host_deferred": True})])
+    monkeypatch.setattr(scheduler, "preflight", lambda: (True, "ok"))
+    assert scheduler.step() == protocol.FAIL
+    task = state.one("SELECT status, attempts FROM task WHERE id=?", (task_id,))
+    assert task["attempts"] == 1
+    assert scheduler.consecutive_failures == 1
+
+
+def test_preflight_reset_in_log_tail_is_not_trusted_without_terminal_evidence(setup, monkeypatch):
+    """A quoted retry epoch in ordinary CLI output cannot defer the scheduler."""
+    cfg, state, _repo = setup
+    state.add_task("neocortex", "untrusted reset", "objective", [])
+    scheduler = sched(cfg, state, [])
+    future = time.time() + 3600
+
+    class TailOnlyAdapter(ScriptedAdapter):
+        def run(self, prompt, cwd, model, log_path, timeout_s):
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(f"tool said retry at {future}")
+            return SessionResult(1, log_path, None, False, "transient", "provider unavailable")
+
+    adapter = TailOnlyAdapter([])
+    scheduler._adapter_for = lambda _role: adapter
+    monkeypatch.setattr(scheduler, "_free_mb", lambda: 9999)
+    scheduler._in_run = True
+    try:
+        assert scheduler.step() == "deferred"
+    finally:
+        scheduler._in_run = False
+    attempt = state.one("SELECT defer_until FROM preflight_attempt")
+    assert attempt["defer_until"] is None
 
 
 @pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
@@ -1320,7 +1667,9 @@ def test_planner_host_failure_with_valid_done_keeps_revision_context(setup, fail
     assert len(state.q("SELECT * FROM proposal")) == 1
     agent = state.one("SELECT state, turns, memo FROM agent WHERE id=?", (planner_id,))
     assert (agent["state"], agent["turns"], agent["memo"]) == (
-        "blocked", 1, "retain planner memo",
+        "runnable" if failure == "terminal" else "blocked",
+        0 if failure == "terminal" else 1,
+        "retain planner memo",
     )
 
 

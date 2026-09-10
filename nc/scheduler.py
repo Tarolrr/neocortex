@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from . import arbiter, protocol, turn
-from .adapters import Adapter, get_adapter
+from .adapters import Adapter, assess_session, get_adapter, has_successful_terminal
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_lock
 from .state import State
@@ -33,6 +33,11 @@ class Scheduler:
         # A deliberately narrow test seam for process barriers.  Hooks run
         # while the lifecycle/repository exclusions are actually owned.
         self._lifecycle_hook = None
+        self._preflight_pairs: set[tuple[str, str]] = set()
+        self._preflight_category: str | None = None
+        self._preflight_diagnostic = ""
+        self._in_run = False
+        self._preflight_role = "worker"
 
     def _hook(self, phase: str) -> None:
         if self._lifecycle_hook is not None:
@@ -41,9 +46,16 @@ class Scheduler:
     def _adapter_for(self, role: str) -> Adapter:
         return get_adapter(self.cfg.adapter_for(role))
 
+    @staticmethod
+    def _defer_until(detail: str) -> float | None:
+        """Trust only bounded epoch reset evidence from a provider diagnostic."""
+        return turn._defer_until(detail)
+
     # --- preflight --------------------------------------------------------
     def preflight(self) -> tuple[bool, str]:
-        adapter = self._adapter_for("worker")
+        """Probe the selected adapter/model pair once for this invocation."""
+        role = self._preflight_role
+        adapter = self._adapter_for(role)
         if not adapter.available():
             return False, f"adapter {adapter.name} is not installed"
 
@@ -53,16 +65,61 @@ class Scheduler:
 
         probe_dir = self.cfg.home / "preflight"
         probe_dir.mkdir(parents=True, exist_ok=True)
-        model = self.cfg.model_for("worker")
+        model = self.cfg.model_for(role)
         result = adapter.run(
             "Reply with exactly: OK", probe_dir, model,
             probe_dir / "probe.log", self.cfg.preflight_timeout_s,
         )
+        assessment = assess_session(result, adapter.name)
+        self._preflight_category = assessment.category if assessment.failed else None
+        self._preflight_diagnostic = assessment.diagnostic
         text = result.log_path.read_text(errors="replace")
-        if result.exit_code != 0 or "OK" not in text:
+        # Production adapters use machine streams: success is their final
+        # terminal event, rather than prose which could be tool output.
+        if assessment.failed or not has_successful_terminal(adapter.name, result.log_path):
             tail = text.strip()[-500:]
-            return False, f"model {model} is not usable (exit {result.exit_code}): {tail}"
+            return False, f"model {model} is not usable ({assessment.category}): {tail}"
         return True, f"model {model} responds, {free_mb} MB free"
+
+    def _preflight_selected(self, role: str) -> str | None:
+        if not self._in_run:
+            return None
+        pair = (self.cfg.adapter_for(role), self.cfg.model_for(role))
+        if pair in self._preflight_pairs:
+            return None
+        self._preflight_role = role
+        self._preflight_category = None
+        self._preflight_diagnostic = ""
+        self._preflight_pairs.add(pair)
+        try:
+            ok, detail = self.preflight()
+        except Exception as exc:
+            # Adapters may fail before producing a SessionResult.  Typed
+            # provider evidence has the same timer-deferral policy as a turn.
+            assessment = turn._exception_assessment(exc)
+            if assessment is None:
+                self.state.incident("preflight", str(exc))
+                log.exception("preflight failed")
+                return "preflight_failed"
+            self._preflight_category = assessment.category
+            self._preflight_diagnostic = assessment.diagnostic
+            ok, detail = False, f"model {pair[1]} is not usable ({assessment.category}): {assessment.diagnostic}"
+        if ok:
+            return None
+        # Preflight output is host diagnostics.  It has no task/agent effects.
+        # A supported temporary terminal category is deferred by the timer;
+        # unknown/permanent readiness failures retain the existing incident path.
+        if self._preflight_category in {
+            "subscription_limit", "throttled", "overloaded", "transient",
+        }:
+            self.state.record_preflight_attempt(role, pair[0], pair[1],
+                                                self._preflight_category, detail,
+                                                self._defer_until(self._preflight_diagnostic))
+            log.warning("temporary %s preflight failure: %s", role, detail)
+            return "deferred"
+        self.state.incident("preflight", detail)
+        log.error("preflight failed: %s", detail)
+        return "preflight_failed"
 
     def readiness(self) -> tuple[bool, str]:
         """Check host tools and each project's base checkout once per invocation."""
@@ -206,21 +263,30 @@ class Scheduler:
             proposal = self.state.one(
                 "SELECT p.* FROM proposal p WHERE p.status='pending'"
                 " AND NOT EXISTS (SELECT 1 FROM plan_review r"
-                " WHERE r.proposal_id=p.id AND r.spec=p.spec) ORDER BY p.id LIMIT 1"
+                " WHERE r.proposal_id=p.id AND r.spec=p.spec AND r.status IN ('running','done','failed'))"
+                " ORDER BY p.id LIMIT 1"
             )
             if proposal:
+                preflight = self._preflight_selected("plan_critic")
+                if preflight is not None:
+                    return preflight
                 outcome = turn.run_plan_critic_turn(
                     self.state, self.cfg, proposal, self._adapter_for("plan_critic"),
                 )
                 # Advisory failures must not trip the workers' circuit breaker.
-                return outcome.kind
+                return "deferred" if outcome.deferred else outcome.kind
         if agent is None:
             return "idle"
 
         if agent["role"] == "planner" and agent["task_id"] is None:
+            preflight = self._preflight_selected("planner")
+            if preflight is not None:
+                return preflight
             outcome = turn.run_planner_turn(
                 self.state, self.cfg, agent, self._adapter_for("planner"),
             )
+            if outcome.deferred:
+                return "deferred"
             if outcome.kind in (protocol.NO_OUTCOME, protocol.FAIL):
                 self.consecutive_failures += 1
             else:
@@ -243,6 +309,9 @@ class Scheduler:
             return self._task_turn(current, latest, project, repo)
 
     def _task_turn(self, agent, task, project, repo):
+        preflight = self._preflight_selected(agent["role"])
+        if preflight is not None:
+            return preflight
         if agent["turns"] >= task["budget_turns"]:
             self._block(task, agent, f"turn budget ({task['budget_turns']}) exhausted")
             return "budget_exhausted"
@@ -266,6 +335,8 @@ class Scheduler:
                  outcome.summary[:200])
 
         if outcome.kind in (protocol.NO_OUTCOME, protocol.FAIL):
+            if outcome.deferred:
+                return "deferred"
             self.consecutive_failures += 1
         else:
             self.consecutive_failures = 0
@@ -464,12 +535,10 @@ class Scheduler:
                 log.warning("%s", detail)
 
     def run(self, max_turns: int = 0) -> bool:
-        ok, detail = self.preflight()
-        if not ok:
-            self.state.incident("preflight", detail)
-            log.error("preflight failed: %s", detail)
-            return False
-        log.info("preflight ok: %s", detail)
+        # `nc run` exit status describes host readiness/scheduler operation,
+        # not an individual child CLI exit or agent outcome.  Each child run
+        # records its own evidence; a temporary provider failure returns from
+        # this timer invocation so the normal five-minute timer retries it.
         ok, detail = self.readiness()
         if not ok:
             self._host_environment_incident(detail)
@@ -478,28 +547,50 @@ class Scheduler:
         log.info("host environment readiness ok: %s", detail)
 
         turns = 0
-        while max_turns == 0 or turns < max_turns:
-            if (self.cfg.home / "STOP").exists():
-                log.info("stop file present, exiting")
-                return True
-            self._escalate_unanswered_questions()
-            result = self.step()
-            if result == "idle":
-                log.info("no runnable agents; exiting (idle is a valid outcome)")
-                return True
-            turns += 1
-            if self.consecutive_failures >= self.cfg.max_consecutive_failures:
-                self.state.incident(
+        # A Scheduler object can serve more than one timer invocation in tests
+        # and embedded callers.  The probe bound is per invocation, not for
+        # the lifetime of that object.
+        self._preflight_pairs.clear()
+        self._in_run = True
+        try:
+            while max_turns == 0 or turns < max_turns:
+                deferred = self.state.one(
+                    "SELECT MAX(defer_until) AS until FROM ("
+                    " SELECT defer_until FROM run WHERE defer_until > ?"
+                    " UNION ALL SELECT defer_until FROM preflight_attempt WHERE defer_until > ?"
+                    ")", (time.time(), time.time()),
+                )
+                if deferred is not None and deferred["until"] is not None:
+                    log.info("provider retry is deferred until %s", deferred["until"])
+                    return True
+                if (self.cfg.home / "STOP").exists():
+                    log.info("stop file present, exiting")
+                    return True
+                self._escalate_unanswered_questions()
+                result = self.step()
+                if result == "deferred":
+                    log.info("temporary provider failure deferred to next timer invocation")
+                    return True
+                if result == "preflight_failed":
+                    return False
+                if result == "idle":
+                    log.info("no runnable agents; exiting (idle is a valid outcome)")
+                    return True
+                turns += 1
+                if self.consecutive_failures >= self.cfg.max_consecutive_failures:
+                    self.state.incident(
                     "circuit_breaker",
                     f"{self.consecutive_failures} consecutive failed turns; stopping",
                 )
                 # The timer would otherwise restart us straight into the same
                 # failure every few minutes. Stay down until a human says go.
-                (self.cfg.home / "STOP").write_text(
+                    (self.cfg.home / "STOP").write_text(
                     f"circuit breaker: {self.consecutive_failures} consecutive failed turns\n"
                 )
-                log.error("circuit breaker tripped after %d failed turns; wrote STOP",
-                          self.consecutive_failures)
-                return True
-            time.sleep(1)
-        return True
+                    log.error("circuit breaker tripped after %d failed turns; wrote STOP",
+                              self.consecutive_failures)
+                    return True
+                time.sleep(1)
+            return True
+        finally:
+            self._in_run = False

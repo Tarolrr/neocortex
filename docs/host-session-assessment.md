@@ -67,3 +67,21 @@ Execution precedence is: timeout/host-signal kill, structured terminal failure, 
 then parsed outcome. A host failure records usage and run evidence but cannot
 acknowledge inbox/memo, create a proposal or question, apply a task verdict,
 or complete an advisory plan review.
+
+## Timer deferral and exit semantics
+
+`nc run` exits successfully when the scheduler itself is healthy, including
+when it defers a classified resettable allowance, throttle, overload, or
+transient provider failure to the next timer firing.  That exit status is not
+the child CLI exit code and is not an agent outcome.  The child run retains its
+exit/usage/diagnostic evidence; the logical worker, critic, planner, or plan
+review remains eligible with the same memo, undelivered feedback, worktree and
+phase.  There is no in-process retry loop.
+
+The durable mapping is deliberately small: a task plus its role agent is
+logical work, each `run` is an execution attempt, and messages/proposal
+revisions are feedback.  Plan advice uses one `(proposal, spec)` `plan_review`
+identity; `plan_review_attempt` links its distinct attempts to runs.  A
+temporary provider failure changes that review to `retryable`; only one later
+attempt may complete it.  This is local scheduler state, not adoption of a
+common bus or queue.

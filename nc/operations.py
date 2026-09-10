@@ -172,6 +172,12 @@ def unfinished_runs(state: State) -> list[dict]:
     return result
 
 
+def latest_preflight_attempt(state: State) -> dict | None:
+    """Return host-only readiness evidence without creating an incident."""
+    row = state.one("SELECT * FROM preflight_attempt ORDER BY id DESC LIMIT 1")
+    return dict(row) if row is not None else None
+
+
 def recover_runs(state: State, run_ids: list[int], reason: str,
                  acknowledge_quiescence: bool = False) -> list[dict]:
     """Explicitly close selected interrupted records, without replaying an outcome.
@@ -238,6 +244,16 @@ def recover_runs(state: State, run_ids: list[int], reason: str,
                 raise ValueError(f"run {row['id']} changed before recovery; retry inspection")
             state.db.execute("UPDATE agent SET state='blocked', updated_at=? WHERE id=?",
                              (now, row["agent_id"]))
+            # A plan-review claim has no task agent to wake.  Once ownership is
+            # proven quiescent, release only this exact interrupted attempt;
+            # the unique (proposal,spec) review identity remains intact.
+            attempt = state.one("SELECT review_id FROM plan_review_attempt WHERE run_id=?"
+                                " AND status='running'", (row["id"],))
+            if attempt is not None:
+                state.db.execute("UPDATE plan_review_attempt SET status='retryable'"
+                                 " WHERE run_id=? AND status='running'", (row["id"],))
+                state.db.execute("UPDATE plan_review SET status='retryable' WHERE id=?"
+                                 " AND status='running'", (attempt["review_id"],))
         return rows
 
 

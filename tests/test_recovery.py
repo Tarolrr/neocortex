@@ -197,6 +197,32 @@ def test_incomplete_new_ownership_is_not_overridable(recovery_state):
         operations.recover_runs(state, [run], "operator checked", True)
 
 
+def test_recovery_releases_only_interrupted_plan_review_attempt(recovery_state):
+    """Quiescent recovery preserves the review identity for a later timer claim."""
+    _cfg, state, _task = recovery_state
+    proposal = state.add_proposal("one", "planner", "", [{"project": "one"}])
+    spec = state.one("SELECT spec FROM proposal WHERE id=?", (proposal,))["spec"]
+    review_id = state.claim_plan_review(proposal, spec, "one", "m")
+    assert review_id is not None
+    agent_id = f"plan-critic-{review_id}"
+    run = state.start_run(agent_id, None, "plan_critic", "m", "log")
+    state.x("INSERT INTO plan_review_attempt(review_id,run_id,status,created_at) VALUES(?,?,?,?)",
+            (review_id, run, "running", time.time()))
+    # This is the explicit legacy/quiescent-recovery boundary, not a claim
+    # while a current adapter might still own the review.
+    state.x("UPDATE run SET owner_pid=NULL, owner_start=NULL, ownership_version=0 WHERE id=?",
+            (run,))
+
+    operations.recover_runs(state, [run], "verified quiescence", True)
+
+    review = state.one("SELECT status FROM plan_review WHERE id=?", (review_id,))
+    attempt = state.one("SELECT status FROM plan_review_attempt WHERE run_id=?", (run,))
+    assert (review["status"], attempt["status"]) == ("retryable", "retryable")
+    # The next process claims the same logical review, not a duplicate.
+    assert state.claim_plan_review(proposal, spec, "one", "m") == review_id
+    assert state.one("SELECT COUNT(*) FROM plan_review WHERE proposal_id=?", (proposal,))[0] == 1
+
+
 def test_blocker_diagnostic_includes_cross_project_and_taskless_rows(recovery_state):
     cfg, state, task = recovery_state
     state.add_project("two", "Two", str(cfg.home), None)

@@ -41,6 +41,14 @@ class Outcome:
     verdict: str = ""
     findings: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    # Set only by host orchestration after adapter evidence is assessed.
+    # It is intentionally never decoded from an agent-authored outcome file.
+    host_deferred: bool = False
+
+    @property
+    def deferred(self) -> bool:
+        """True only for a host-classified, timer-retryable provider session."""
+        return self.host_deferred
 
     @property
     def ok(self) -> bool:

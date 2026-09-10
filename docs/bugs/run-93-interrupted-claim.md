@@ -10,9 +10,14 @@ that collection time, not asserted to have existed at the interruption.
 
 ## Evidence and timeline
 
-The deployed unit, read without changing it, had `TimeoutStartSec=3600`.  Its
-comment says a crashed turn costs one cycle, but that is not true for a claimed
-worker under the current recovery code.  The journal records systemd's
+The deployed unit source was read as `/etc/systemd/system/neocortex.service`
+via `systemctl cat neocortex.service`, without changing it. It had
+`TimeoutStartSec=3600`. The tracked
+[`deploy/neocortex.service`](https://github.com/Tarolrr/neocortex/blob/735907fe6afb6f635e3e02cfaa1e361d06c70128/deploy/neocortex.service)
+also specifies 3600 seconds, but differs from that deployed source in its
+`PATH` (it includes the runner venv) and its updated explanatory comment. The
+deployed comment says a crashed turn costs one cycle; that is not true for a
+claimed worker under the current recovery code. The journal records systemd's
 `start operation timed out. Terminating`, then main process `status=15/TERM`
 and `result 'timeout'` at **2026-09-09T21:42:09Z**.  This is evidence that the
 *service main process* was terminated for its start timeout; it is not, by
@@ -34,6 +39,12 @@ database recovery reason is an owner-entered audit reason, **not independently
 verified termination evidence**.  The incident table has no `task_id` column,
 so no task-filtered incident query is possible; the read transaction found no
 separate incident that establishes why NC or a descendant exited.
+
+Related message history was read in that same transaction: four T008
+worker-directed `review_verdict` messages (IDs 76--79) were present. IDs 76
+and 77 were delivered; IDs 78 and 79 were undelivered. They are historical
+critic/arbiter feedback, not termination evidence, and no separate T008 worker
+message establishes an exit cause.
 
 The full investigated code commit is
 [`735907fe6afb6f635e3e02cfaa1e361d06c70128`](https://github.com/Tarolrr/neocortex/blob/735907fe6afb6f635e3e02cfaa1e361d06c70128/nc/operations.py#L175).
@@ -81,14 +92,18 @@ T009 or its local provider-retry work depend on implementing recovery changes.
 Current `recover-runs` is safe only as a *record closure*: it refuses live or
 ambiguous current ownership, needs an explicit quiescence acknowledgement only
 for legacy evidence, retains the contemporaneous `detail`, and does not replay
-the attempt.  It has the side effect of blocking the agent.  It does **not**
-resume work.  `nc resume --retry` separately resolves every open incident and
-moves **all** blocked tasks to `in_progress`, resets attempts to zero, and makes
-their conventional worker runnable; it can therefore resume T008 but is broad
-and has those side effects.  `nc requeue T008` is also separate, requires no
-unfinished run, queues the task/reset attempts and allows spawn; fresh requeue
-can discard a worktree/branch after confirmation.  Neither action was run for
-this investigation.
+the attempt. It has the side effect of blocking the agent. It does **not**
+resume work. `nc resume --retry` separately removes STOP, resolves every open
+incident, and moves only tasks already in `blocked` to `in_progress`, resetting
+their attempts and making their conventional workers runnable. It does **not**
+select or wake the observed T008: T008 is `in_progress` and only its agent is
+blocked. For this exact observed state, the existing eligibility-restoring owner
+action is `nc requeue neocortex-T008` (after confirming there is no unfinished
+run). It queues T008, resets its attempts, writes its result as owner-requeued,
+marks its task agents blocked, and marks owner-directed task messages delivered;
+the scheduler can subsequently make the queued work claimable/spawn it. A
+`--fresh` requeue can additionally discard a worktree/branch after confirmation.
+Neither action was run for this investigation.
 
 ## Findings and hypotheses
 

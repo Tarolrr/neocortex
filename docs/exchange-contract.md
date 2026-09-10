@@ -123,13 +123,31 @@ no-op: no new attempt, message, wake, or budget charge.
    logical `blocked` with that durable reason and exact owner recovery path;
    do not wake it.  Deliberate cancellation remains cancelled and STOP remains
    stopped.
-4. Otherwise atomically make T008's existing worker phase `retryable`, create
-   its next fenced attempt, and make exactly its worker eligible.  Do not reset
-   attempts/budget or discard its branch.  Scheduler may claim it once.
-5. On the next completion, persist result first, then apply it once (arbiter for
+4. Otherwise atomically release T008's **interrupted existing attempt** to
+   `retryable`, retain its phase and partial state, clear only that attempt's
+   active fence, and make exactly its worker eligible for a retry claim. Do not
+   create a next attempt here, reset attempts/budget, or discard its branch.
+5. The scheduler, not recovery, may select that retryable work. In one separate
+   claim transaction it rechecks STOP/cancellation/owner-block and eligibility,
+   creates the next attempt and its new fence, and changes the worker to claimed
+   or running. A failed recheck leaves it retryable or records the specified
+   actionable block; it never creates a second active attempt.
+6. On the next completion, persist result first, then apply it once (arbiter for
    worker acceptance), write receipt, then acknowledge rendered inbox.  Restart
    reconciliation completes any missing later idempotent step; it never reruns
    an accepted result.
+
+The recovery and scheduler transitions are deliberately separate and each is
+idempotent. `retryable` has no active fence and is eligible but unclaimed;
+`claimed`/`running` has exactly one new active fence. Recovery never creates a
+future attempt, and the scheduler never closes the interrupted attempt.
+
+| Actor / boundary | prior durable state | one transaction writes | resulting eligibility / fence |
+| --- | --- | --- | --- |
+| recovery after positive quiescence | attempt N `running`, logical work in its existing phase | mark run and attempt N `interrupted`; preserve state; release fence N; logical work `retryable` | exact role eligible; no active fence; no attempt N+1 |
+| recovery with STOP/cancel/owner block/ambiguous survivor | attempt N nonterminal | close only if ownership allows; otherwise retain evidence; write or retain durable block reason/action | not eligible; no active fence only after positive quiescence |
+| scheduler claim | `retryable`, no active fence, role eligible | recheck exclusion and logical state; create attempt N+1/fence N+1; mark claim | one active fence, one claimed/running role |
+| duplicate recovery or scheduler race | recovery receipt or active fence exists | find receipt / conditional claim fails | no new attempt, wake, or budget charge |
 
 | Event/role | durable logical work and partial state | eligibility / retry | feedback and budget |
 | --- | --- | --- | --- |

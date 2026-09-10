@@ -35,21 +35,23 @@ host evidence. Old rows display as `legacy/unknown`.
 The real adapters request machine-readable streams: Codex uses `codex exec
 --json` (the non-interactive guide) and Claude uses `-p --output-format
 stream-json --verbose` ([Claude CLI reference](https://code.claude.com/docs/en/cli-reference),
-retrieved 2026-09-10). However, the versioned publisher artifacts establish
-only that bootstrap pins Codex 0.86.0 and Claude Code 2.1.76; they do **not**
-provide a version-specific primary-source terminal-event schema. Therefore the
-runner deliberately does **not** classify JSON records scraped from either
-combined session log. This makes a truncated record, a tool JSON payload, and
-a quoted JSON-looking string unsupported evidence rather than a provider
-failure. `SessionResult.terminal_category` is reserved for an adapter that
-supplies independently structured terminal evidence with its own verified,
-version-specific contract; that evidence wins even with exit zero.
+retrieved 2026-09-10). The adapters accept only a complete final, top-level
+terminal record: Codex `error`/`turn.failed`, or Claude `result` with
+`is_error: true`. Its direct `code`, `message`, `error`, and `result` fields
+are bounded/sanitized and categorized. A later terminal success wins; a
+truncated final record, a non-JSON tail, a tool record, or a quoted
+JSON-looking string is unsupported evidence and remains `unknown` after a bad
+exit. Thus a structured terminal error also fails a zero-exit session.
 
-The JSONL fixtures are **synthetic and unverified** examples only. They are
-not captures, not evidence that either pinned version emits those shapes, and
-are not classified by the runner. They exist to ensure unsupported and
-truncated streams remain harmless. No retained capture provenance or
-version-specific primary-source terminal-event schema is currently available.
+The versioned publisher artifacts prove that the installed bootstrap targets
+are Codex **0.86.0** and Claude Code **2.1.76**; they do not publish a stable
+terminal-event grammar for those exact releases. The parser is therefore a
+conservative compatibility implementation of the two requested machine-stream
+formats, not an assertion that every future or historical version emits every
+accepted shape. The JSONL fixtures are **synthetic**: they exercise those
+envelopes but are not retained captures and do not independently verify either
+pinned release. Any unrecognized shape is explicitly **unverified** and is
+not categorized as a provider failure.
 
 The old `Codex API Error: <code>` / `Claude API Error: <code>` text envelopes
 are **synthetic, unverified** and are no longer classified. Any arbitrary

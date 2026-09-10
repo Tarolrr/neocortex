@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -133,11 +134,119 @@ def _fallback_terminal(adapter: str, log_path: Path) -> tuple[str, str]:
         text = log_path.read_text(errors="replace")[-16000:]
     except OSError:
         return "unknown", "terminal diagnostic unavailable"
+    structured = _structured_terminal(adapter, text)
+    if structured is not None:
+        return structured
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     # The narrow fallback deliberately reports no provider category.  A
     # non-JSON final line can establish that the launcher failed, but cannot
     # establish whose service failed or what a quoted API-looking phrase means.
     return "unknown", sanitize_diagnostic(lines[-1] if lines else "")
+
+
+def _structured_terminal_from_log(adapter: str, log_path: Path) -> tuple[str, str] | None:
+    try:
+        return _structured_terminal(adapter, log_path.read_text(errors="replace")[-16000:])
+    except OSError:
+        return None
+
+
+def _error_text(event: dict[str, object]) -> str:
+    """Extract only fields owned by a terminal stream event.
+
+    Do not recursively walk an event: tool input/output and assistant prose are
+    deliberately arbitrary and must never become provider evidence.
+    """
+    bits: list[str] = []
+    for key in ("code", "message", "error", "result"):
+        value = event.get(key)
+        if isinstance(value, str):
+            bits.append(value)
+        elif key == "error" and isinstance(value, dict):
+            for error_key in ("code", "message", "type"):
+                error_value = value.get(error_key)
+                if isinstance(error_value, str):
+                    bits.append(error_value)
+    return " ".join(bits)
+
+
+def _category_from_terminal(text: str) -> str:
+    """Map a *structured terminal* provider diagnostic to the runner taxonomy."""
+    value = text.lower()
+    # Ordered from specific product/account states to broad HTTP-style errors.
+    if any(token in value for token in (
+        "subscription limit", "usage limit", "plan limit", "limit resets",
+        "resets at", "resets on", "weekly limit", "monthly limit",
+    )):
+        return "subscription_limit"
+    if any(token in value for token in (
+        "insufficient_quota", "billing", "credit balance", "credits exhausted",
+        "quota exceeded",
+    )):
+        return "billing_credits"
+    if any(token in value for token in (
+        "permission_denied", "permission denied", "forbidden", "not authorized",
+    )):
+        return "permission"
+    if any(token in value for token in (
+        "authentication", "unauthenticated", "invalid api key", "login required",
+        "not logged in", "expired token",
+    )):
+        return "authentication"
+    if any(token in value for token in (
+        "invalid_request", "invalid request", "bad request", "model_not_found",
+        "model not found", "unsupported model", "unknown model",
+    )):
+        return "invalid_request"
+    if any(token in value for token in (
+        "rate_limit", "rate limit", "too many requests", "http 429", "status 429",
+    )):
+        return "throttled"
+    if any(token in value for token in (
+        "overloaded", "overload", "capacity", "http 529", "status 529",
+    )):
+        return "overloaded"
+    if any(token in value for token in (
+        "server_error", "internal server error", "connection", "network",
+        "transport", "temporarily unavailable", "http 5", "status 5",
+    )):
+        return "transient"
+    return "unknown"
+
+
+def _structured_terminal(adapter: str, text: str) -> tuple[str, str] | None:
+    """Return a final failure event from the requested adapter stream.
+
+    ``stdout`` and ``stderr`` share one log, so accepting a JSON record in the
+    middle would let a tool or quoted transcript masquerade as terminal
+    evidence.  We accept only a complete JSON object on the final nonblank
+    line, with the terminal shape emitted by that adapter.  A later successful
+    terminal event therefore wins over a recovered intermediate failure.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        event = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    event_type = event.get("type")
+    if adapter == "codex":
+        # codex exec --json emits a terminal error record (and turn.failed in
+        # newer compatible streams).  item.* records are intentionally absent.
+        failed = event_type == "error" or event_type == "turn.failed"
+    elif adapter == "claude":
+        # Claude -p stream-json's terminal result uses is_error; do not infer
+        # failure from assistant/tool records that merely contain error prose.
+        failed = event_type == "result" and event.get("is_error") is True
+    else:
+        return None
+    if not failed:
+        return None
+    diagnostic = _error_text(event)
+    return _category_from_terminal(diagnostic), sanitize_diagnostic(diagnostic)
 
 
 def assess_session(result: SessionResult, _adapter: str) -> HostAssessment:
@@ -149,6 +258,13 @@ def assess_session(result: SessionResult, _adapter: str) -> HostAssessment:
         category = terminal_category if terminal_category in _TERMINAL_CATEGORIES else "unknown"
         return HostAssessment("FAILED", category,
                               sanitize_diagnostic(getattr(result, "terminal_diagnostic", "")))
+    # Older/custom adapters may not have populated SessionResult, but their
+    # log is still the requested machine stream.  Preserve terminal failure
+    # precedence even when it exited zero.
+    structured = _structured_terminal_from_log(_adapter, result.log_path)
+    if structured is not None:
+        category, diagnostic = structured
+        return HostAssessment("FAILED", category, diagnostic)
     if result.exit_code != 0:
         category, diagnostic = _fallback_terminal(_adapter, result.log_path)
         return HostAssessment("FAILED", category, diagnostic or f"CLI exited {result.exit_code}")
@@ -171,6 +287,9 @@ def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionRe
     env = dict(os.environ, PATH=f"{Path.home()}/.local/bin:{os.environ.get('PATH', '')}")
     timed_out = False
     cgroup = _adapter_cgroup()
+    adapter = Path(cmd[0]).name
+    if adapter not in {"codex", "claude"}:
+        adapter = ""
     with log_path.open("w") as log:
         try:
             proc = subprocess.Popen(
@@ -197,6 +316,13 @@ def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionRe
                         pass
                     raise
             code = proc.wait(timeout=timeout_s)
+        except OSError as exc:
+            # Popen's launcher/filesystem errors are host evidence, distinct
+            # from an agent-authored FAIL or a provider terminal diagnostic.
+            diagnostic = sanitize_diagnostic(str(exc))
+            log.write(f"local launcher error: {diagnostic}\n")
+            _remove_cgroup(cgroup)
+            return SessionResult(127, log_path, None, False, "local_error", diagnostic)
         except subprocess.TimeoutExpired:
             timed_out = True
             code = 124
@@ -208,9 +334,12 @@ def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionRe
     _remove_cgroup(cgroup)
     text = log_path.read_text(errors="replace")
     tokens = parse_tokens(text)
-    # The stream is retained as a log reference, but is not classified without
-    # a verified terminal-event contract for this pinned CLI version.
-    return SessionResult(exit_code=code, log_path=log_path, tokens=tokens, timed_out=timed_out)
+    terminal = _structured_terminal(adapter, text[-16000:])
+    return SessionResult(
+        exit_code=code, log_path=log_path, tokens=tokens, timed_out=timed_out,
+        terminal_category=terminal[0] if terminal else None,
+        terminal_diagnostic=terminal[1] if terminal else "",
+    )
 
 
 class CodexAdapter(Adapter):

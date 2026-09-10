@@ -74,16 +74,16 @@ def test_legacy_text_envelope_is_not_terminal_evidence(tmp_path):
 
 
 @pytest.mark.parametrize(("adapter", "fixture", "expected"), [
-    ("codex", "codex-terminal-error.synthetic.jsonl", "none"),
-    ("claude", "claude-terminal-error.synthetic.jsonl", "none"),
+    ("codex", "codex-terminal-error.synthetic.jsonl", "throttled"),
+    ("claude", "claude-terminal-error.synthetic.jsonl", "authentication"),
 ])
-def test_synthetic_unverified_jsonl_is_not_terminal_evidence(tmp_path, adapter, fixture, expected):
-    """Unsupported stream shapes cannot turn output into provider evidence."""
+def test_adapter_terminal_stream_is_terminal_evidence(tmp_path, adapter, fixture, expected):
+    """Synthetic fixtures exercise the documented terminal event envelopes."""
     path = tmp_path / "session.log"
     path.write_text((Path(__file__).parent / "fixtures" / fixture).read_text())
     assessment = assess_session(SessionResult(0, path, None, False), adapter)
     assert assessment.category == expected
-    assert not assessment.failed
+    assert assessment.failed
 
 
 @pytest.mark.parametrize("adapter", ["codex", "claude"])
@@ -131,6 +131,46 @@ def test_successful_retry_output_is_not_terminal_evidence(tmp_path, adapter):
     path.write_text("Codex API Error: rate_limit_exceeded\nretry succeeded\n")
     assessment = assess_session(SessionResult(0, path, None, False), adapter)
     assert assessment.status == "SUCCESS"
+
+
+@pytest.mark.parametrize(("adapter", "events"), [
+    ("codex", [
+        '{"type":"error","message":"rate_limit_exceeded"}',
+        '{"type":"turn.completed"}',
+    ]),
+    ("claude", [
+        '{"type":"result","is_error":true,"result":"rate_limit_exceeded"}',
+        '{"type":"result","subtype":"success","is_error":false,"result":"ok"}',
+    ]),
+])
+def test_successful_structured_retry_wins_over_intermediate_error(tmp_path, adapter, events):
+    path = tmp_path / "session.log"
+    path.write_text("\n".join(events) + "\n")
+    assert not assess_session(SessionResult(0, path, None, False), adapter).failed
+
+
+@pytest.mark.parametrize(("adapter", "event", "category"), [
+    ("codex", '{"type":"error","message":"insufficient_quota"}', "billing_credits"),
+    ("codex", '{"type":"turn.failed","error":{"code":"model_not_found"}}', "invalid_request"),
+    ("claude", '{"type":"result","is_error":true,"result":"service overloaded"}', "overloaded"),
+    ("claude", '{"type":"result","is_error":true,"result":"permission_denied"}', "permission"),
+])
+def test_run_populates_terminal_evidence_from_adapter_stream(tmp_path, monkeypatch, adapter, event, category):
+    class Proc:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(cmd, **kwargs):
+        kwargs["stdout"].write(event + "\n")
+        return Proc()
+
+    monkeypatch.setattr("nc.adapters.subprocess.Popen", popen)
+    command = [adapter if adapter == "codex" else "/usr/bin/claude", "exec"]
+    result = _run(command, tmp_path, tmp_path / "session.log", 10)
+    assert (result.exit_code, result.terminal_category) == (0, category)
+    assert assess_session(result, adapter).failed
 
 
 @pytest.mark.parametrize("category", [

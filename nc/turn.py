@@ -371,6 +371,9 @@ def run_plan_critic_turn(state: State, cfg: Config, proposal: sqlite3.Row,
             state.x("UPDATE plan_review SET status='failed', recommendation=? WHERE id=?",
                     (f"host session failed: {assessment.category}", review_id))
             state.end_run(run_id, outcome.kind, outcome.summary, tokens)
+            # This advisory agent has completed its one attempt even though
+            # the review itself must remain failed and unapplied.
+            state.set_agent(agent_id, state="done", turns=1)
             return _host_failure("Plan review", assessment)
         recommendation = outcome.raw.get("recommendation")
         if outcome.kind != protocol.DONE or not isinstance(recommendation, str):

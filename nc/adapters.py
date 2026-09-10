@@ -74,6 +74,65 @@ def parse_tokens(text: str) -> int | None:
     return int(matches[-1].group(1).replace(",", "")) if matches else None
 
 
+def _usage_total(usage: object, adapter: str) -> int | None:
+    """Return the token total from an adapter-owned terminal usage object.
+
+    The two CLIs use different accounting shapes.  Codex's cached input is a
+    detail of its input total, whereas Claude reports cache reads/creation as
+    separate billable input fields.  Prefer an explicit total when supplied;
+    malformed or incomplete usage remains unknown rather than guessing.
+    """
+    if not isinstance(usage, dict):
+        return None
+    total = usage.get("total_tokens")
+    if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+        return total
+    if adapter == "codex":
+        fields = ("input_tokens", "output_tokens")
+    elif adapter == "claude":
+        fields = (
+            "input_tokens", "output_tokens", "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+    else:
+        return None
+    values = [usage.get(field) for field in fields]
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+               for value in values[:2]):
+        return None
+    # Claude's cache fields are optional in older stream-json versions.
+    if adapter == "claude":
+        values = values[:2] + [value for value in values[2:] if value is not None]
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+               for value in values):
+        return None
+    return sum(values)
+
+
+def parse_stream_tokens(adapter: str, text: str) -> int | None:
+    """Read usage only from the final machine-stream terminal event.
+
+    This intentionally mirrors terminal-failure parsing: stream records in
+    tool output or an earlier failed retry are not session accounting.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        event = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    if adapter == "codex" and event.get("type") not in {"turn.completed", "turn.failed"}:
+        return None
+    if adapter == "claude" and event.get("type") != "result":
+        return None
+    if adapter not in {"codex", "claude"}:
+        return None
+    return _usage_total(event.get("usage"), adapter)
+
+
 @dataclass
 class SessionResult:
     exit_code: int
@@ -362,7 +421,10 @@ def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionRe
             proc.wait()
     _remove_cgroup(cgroup)
     text = log_path.read_text(errors="replace")
-    tokens = parse_tokens(text)
+    # Current adapters run in JSON/stream-json mode.  Retain their terminal
+    # usage independently of outcome parsing, while preserving old text logs.
+    stream_tokens = parse_stream_tokens(adapter, text)
+    tokens = stream_tokens if stream_tokens is not None else parse_tokens(text)
     terminal = _structured_terminal(adapter, text[-16000:])
     return SessionResult(
         exit_code=code, log_path=log_path, tokens=tokens, timed_out=timed_out,

@@ -1283,6 +1283,8 @@ def test_plan_critic_host_failure_with_done_cannot_complete_review(setup, failur
     )
     review = state.one("SELECT * FROM plan_review WHERE proposal_id=?", (proposal,))
     assert outcome.kind == protocol.FAIL and review["status"] == "failed"
+    agent = state.one("SELECT state, turns FROM agent WHERE role='plan_critic' ORDER BY id DESC")
+    assert (agent["state"], agent["turns"]) == ("done", 1)
 
 
 @pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])

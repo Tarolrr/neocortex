@@ -10,6 +10,7 @@ from nc.adapters import (
     _run,
     adapter_ownership,
     assess_session,
+    parse_stream_tokens,
     parse_tokens,
     sanitize_diagnostic,
 )
@@ -86,6 +87,42 @@ def test_registration_failure_kills_and_reaps_untracked_adapter(tmp_path):
 ])
 def test_parse_tokens(text, expected):
     assert parse_tokens(text) == expected
+
+
+@pytest.mark.parametrize(("adapter", "event", "expected"), [
+    ("codex", '{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":80,"output_tokens":30}}', 150),
+    ("claude", '{"type":"result","is_error":false,"usage":{"input_tokens":120,"output_tokens":30,"cache_creation_input_tokens":40,"cache_read_input_tokens":50}}', 240),
+])
+def test_parse_stream_tokens_from_terminal_usage(adapter, event, expected):
+    """Synthetic current machine-stream terminal records retain usage."""
+    assert parse_stream_tokens(adapter, event + "\n") == expected
+
+
+@pytest.mark.parametrize(("adapter", "event", "expected"), [
+    ("codex", '{"type":"turn.completed","usage":{"total_tokens":77}}', 77),
+    ("claude", '{"type":"result","usage":{"total_tokens":88}}', 88),
+])
+def test_run_retains_terminal_stream_usage(tmp_path, monkeypatch, adapter, event, expected):
+    """Both forced machine-stream adapter paths retain terminal token usage."""
+    class Proc:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(cmd, **kwargs):
+        kwargs["stdout"].write(event + "\n")
+        return Proc()
+
+    monkeypatch.setattr("nc.adapters.subprocess.Popen", popen)
+    command = [adapter if adapter == "codex" else "/usr/bin/claude", "exec"]
+    assert _run(command, tmp_path, tmp_path / "session.log", 10).tokens == expected
+
+
+def test_stream_usage_ignores_nonterminal_and_truncated_records():
+    """Synthetic arbitrary stream-like content is never token evidence."""
+    assert parse_stream_tokens("codex", '{"type":"item.completed","usage":{"total_tokens":99}}\n') is None
+    assert parse_stream_tokens("claude", '{"type":"result","usage":{"total_tokens":99}}\n{"type":') is None
 
 
 def test_legacy_text_envelope_is_not_terminal_evidence(tmp_path):

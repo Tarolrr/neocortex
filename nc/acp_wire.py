@@ -57,6 +57,33 @@ class AcpProcessTimeout(AcpProcessError):
     pass
 
 
+class _SupervisedStream:
+    """Translate wire failures into evidence from its owning process.
+
+    Keeping this as a small proxy leaves the wire deliberately process-free,
+    while making the process distinctions unavoidable for normal ACP calls.
+    """
+
+    def __init__(self, owner: AcpSubprocess, wire: AcpJsonRpcStream) -> None:
+        self._owner, self._wire = owner, wire
+
+    def __getattr__(self, name: str) -> object:
+        member = getattr(self._wire, name)
+        if not callable(member):
+            return member
+
+        def supervised(*args: object, **kwargs: object) -> object:
+            self._owner._check_before_wire()
+            try:
+                return member(*args, **kwargs)
+            except AcpEofError as exc:
+                self._owner.transport_eof(exc)
+            except AcpDeadlineExpired as exc:
+                self._owner.deadline_expired(exc)
+
+        return supervised
+
+
 class _PipeReader:
     def __init__(self, pipe: object, clock: Callable[[], float]) -> None:
         self._pipe = pipe
@@ -153,23 +180,17 @@ class AcpSubprocess:
                 stderr=subprocess.PIPE, env=env, start_new_session=True,
                 preexec_fn=(lambda: _join_cgroup(self._cgroup)) if self._cgroup else None,  # noqa: PLW1509 - containment before ACP exec
             )
+            # Ownership is recorded immediately after launch, before even a
+            # protocol-pipe object is made.  The failure path cannot use
+            # ``close`` yet, so it invokes the same containment sequence.
             callback = _on_adapter_started.get()
             if callback is not None:
                 try:
                     callback(self.proc.pid)
                 except BaseException:
-                    self._terminate(force=True)
-                    if not self._wait_for_exit(self._grace):
-                        # Do not mask the ownership-recording error.  The
-                        # cgroup deliberately remains evidence if containment
-                        # itself is uncertain.
-                        self.cleanup_uncertain = True
-                    for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
-                        if pipe is not None:
-                            try:
-                                pipe.close()
-                            except OSError:
-                                pass
+                    self._cleanup_process(close_pipes=True)
+                    self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                    self.log_path.write_text("")
                     raise
         except OSError as exc:
             _remove_cgroup(self._cgroup)
@@ -199,12 +220,13 @@ class AcpSubprocess:
     def diagnostics(self) -> str:
         return sanitize_diagnostic(b"".join(self._stderr).decode(errors="replace"))
 
-    def stream(self, **kwargs: object) -> AcpJsonRpcStream:
+    def stream(self, **kwargs: object) -> _SupervisedStream:
         """Make the existing wire over this process's deadline-aware pipes."""
-        return AcpJsonRpcStream(
+        wire = AcpJsonRpcStream(
             self.reader, self.writer, clock=self._clock,
             default_deadline=self.deadline, **kwargs,
         )
+        return _SupervisedStream(self, wire)
 
     def check(self) -> None:
         if self._clock() >= self.deadline:
@@ -212,6 +234,16 @@ class AcpSubprocess:
         code = self.proc.poll()
         if code is not None:
             raise AcpUnexpectedExit(self._exit_message(code))
+
+    def _check_before_wire(self) -> None:
+        """Do not allow a known local death to look like a wire failure."""
+        self.check()
+
+    def deadline_expired(self, exc: AcpDeadlineExpired) -> None:
+        """Translate expiration of this supervisor's total deadline."""
+        if self._clock() >= self.deadline:
+            raise AcpProcessTimeout("ACP total deadline expired") from exc
+        raise exc
 
     def transport_eof(self, exc: AcpEofError) -> None:
         """Convert wire EOF to local transport evidence, preserving exit state."""
@@ -285,6 +317,35 @@ class AcpSubprocess:
         except OSError:
             return None
 
+    def _cleanup_process(self, *, close_pipes: bool) -> None:
+        """Run the containment cleanup sequence, including launch failures."""
+        if self.proc.stdin is not None:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+        self._wait_for_exit(self._grace)
+        self._terminate()
+        self._wait_for_exit(self._grace)
+        self._terminate(force=True)
+        self._terminate_cgroup()
+        reaped = self._wait_for_exit(self._grace)
+        cgroup_empty = self._cgroup_empty()
+        self.cleanup_uncertain = (
+            not reaped
+            or self._process_group_alive()
+            or (self._cgroup is not None and cgroup_empty is not True)
+        )
+        if close_pipes:
+            for pipe in (self.proc.stdout, self.proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+        if not self.cleanup_uncertain:
+            _remove_cgroup(self._cgroup)
+
     def close(self) -> None:
         """Boundedly close, terminate and reap; retained cgroup is survivor evidence."""
         if self._closed:
@@ -292,32 +353,7 @@ class AcpSubprocess:
         self._closed = True
         # EOF is the ACP stdio closure/cancellation signal.  Give a compliant
         # server a small, independent grace period before containment signals.
-        if self.proc.stdin is not None:
-            try:
-                self.proc.stdin.close()
-            except OSError:
-                pass
-        self._wait_for_exit(self._grace)
-
-        # Even if the leader honoured EOF, it may have left descendants in the
-        # owned session.  Escalate the complete group, not just the leader.
-        self._terminate()
-        self._wait_for_exit(self._grace)
-        self._terminate(force=True)
-        # A descendant may have escaped the original process group.  Its
-        # dedicated cgroup still owns it, provided the host made one.
-        self._terminate_cgroup()
-        reaped = self._wait_for_exit(self._grace)
-        cgroup_empty = self._cgroup_empty()
-        # Without a cgroup, process-group liveness is the best available
-        # containment evidence; it cannot prove an escaped descendant died.
-        # With one, uninspectable or nonempty membership is deliberately kept
-        # as recovery evidence instead of inferring tree death from the leader.
-        self.cleanup_uncertain = (
-            not reaped
-            or self._process_group_alive()
-            or (self._cgroup is not None and cgroup_empty is not True)
-        )
+        self._cleanup_process(close_pipes=False)
         if self.proc.stdout is not None:
             try:
                 self.proc.stdout.close()
@@ -327,10 +363,6 @@ class AcpSubprocess:
         self._drainer.join(timeout=self._grace)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.write_text(self.diagnostics + ("\n" if self.diagnostics else ""))
-        # A parent exit is not proof that the owned session/cgroup is empty.
-        # Leave cgroup evidence intact when forced reaping was not confirmed.
-        if not self.cleanup_uncertain:
-            _remove_cgroup(self._cgroup)
 
     def __enter__(self) -> Self:
         return self

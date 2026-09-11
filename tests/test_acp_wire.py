@@ -11,8 +11,14 @@ from pathlib import Path
 import pytest
 
 from nc import acp_wire
-from nc.acp_stream import AcpCancelled, AcpDeadlineExpired, AcpEofError
-from nc.acp_wire import AcpLaunchError, AcpSubprocess, AcpTransportEof, AcpUnexpectedExit
+from nc.acp_stream import AcpCancelled, AcpEofError
+from nc.acp_wire import (
+    AcpLaunchError,
+    AcpProcessTimeout,
+    AcpSubprocess,
+    AcpTransportEof,
+    AcpUnexpectedExit,
+)
 from nc.adapters import adapter_ownership
 
 
@@ -66,7 +72,7 @@ def test_stream_uses_total_deadline_for_hung_request(tmp_path: Path) -> None:
         deadline=time.monotonic() + 0.2, log_path=tmp_path / "log",
     )
     try:
-        with pytest.raises(AcpDeadlineExpired, match="deadline"):
+        with pytest.raises(AcpProcessTimeout, match="total deadline"):
             child.stream().request("hung")
     finally:
         child.close()
@@ -99,7 +105,7 @@ def test_full_stdin_pipe_expires_at_total_deadline_and_is_reaped(tmp_path: Path)
     )
     try:
         started = time.monotonic()
-        with pytest.raises(AcpDeadlineExpired, match="deadline"):
+        with pytest.raises(AcpProcessTimeout, match="total deadline"):
             child.stream().send_request("blocked", {"payload": "x" * 128_000})
         assert time.monotonic() - started < 0.8
     finally:
@@ -176,6 +182,34 @@ def test_exit_and_live_stdout_eof_are_not_provider_or_success(tmp_path: Path) ->
         pytest.raises(AcpTransportEof, match="transport EOF"),
     ):
         child.transport_eof(AcpEofError("stdout EOF"))
+
+
+def test_stream_request_automatically_translates_exit_and_eof(tmp_path: Path) -> None:
+    with (
+        AcpSubprocess(helper("import sys; sys.exit(7)"), cwd=tmp_path,
+                      deadline=time.monotonic() + 2, log_path=tmp_path / "exit.log") as child,
+        pytest.raises(AcpUnexpectedExit, match="status 7"),
+    ):
+        # Normal request use, rather than caller-side error translation.
+        child.stream().request("request")
+    with (
+        AcpSubprocess(helper("import os,time; os.close(1); time.sleep(2)"), cwd=tmp_path,
+                      deadline=time.monotonic() + 3, log_path=tmp_path / "eof.log") as child,
+        pytest.raises(AcpTransportEof, match="transport EOF"),
+    ):
+        child.stream().request("request")
+
+
+def test_stream_request_automatically_translates_total_timeout(tmp_path: Path) -> None:
+    child = AcpSubprocess(
+        helper("import sys,time; sys.stdin.readline(); time.sleep(30)"), cwd=tmp_path,
+        deadline=time.monotonic() + 0.1, log_path=tmp_path / "timeout.log",
+    )
+    try:
+        with pytest.raises(AcpProcessTimeout, match="total deadline"):
+            child.stream().request("hung")
+    finally:
+        child.close()
 
 
 def test_signal_exit_is_reported_as_local_process_evidence(tmp_path: Path) -> None:
@@ -299,6 +333,53 @@ def test_cgroup_cleanup_catches_descendant_escaped_from_session(
     assert killed == [cgroup / "cgroup.kill"]
     assert not child.cleanup_uncertain
     _assert_helpers_gone([escaped])
+
+
+def test_callback_failure_uses_cgroup_cleanup_for_escaped_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callback errors retain containment semantics before they are re-raised."""
+    cgroup = tmp_path / "mock-cgroup"
+    cgroup.mkdir()
+    (cgroup / "cgroup.procs").write_text("")
+    (cgroup / "cgroup.kill").write_text("")
+    pid_file = tmp_path / "escaped.pid"
+    monkeypatch.setattr(acp_wire, "_adapter_cgroup", lambda: cgroup)
+    monkeypatch.setattr(acp_wire, "_join_cgroup", lambda _path: None)
+    original_write_text = Path.write_text
+    killed: list[Path] = []
+    escaped: list[int] = []
+
+    def mock_cgroup_kill(path: Path, data: str, *args: object, **kwargs: object) -> int:
+        if path == cgroup / "cgroup.kill" and data == "1":
+            killed.append(path)
+            os.kill(escaped[0], 9)
+            original_write_text(cgroup / "cgroup.procs", "")
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", mock_cgroup_kill)
+
+    def fail(_pid: int) -> None:
+        for _ in range(100):
+            if pid_file.exists():
+                escaped.append(int(pid_file.read_text()))
+                original_write_text(cgroup / "cgroup.procs", f"{escaped[0]}\n")
+                raise RuntimeError("recording failed")
+            time.sleep(0.01)
+        raise AssertionError("escaped helper did not start")
+
+    code = (
+        "import subprocess,sys,time; "
+        f"pidfile={str(pid_file)!r}; "
+        "child=\"import os,time; os.setsid(); open(" + repr(str(pid_file))
+        + ", 'w').write(str(os.getpid())); time.sleep(30)\"; "
+        "subprocess.Popen([sys.executable, '-c', child]); time.sleep(30)"
+    )
+    with adapter_ownership(fail), pytest.raises(RuntimeError, match="recording failed"):
+        AcpSubprocess(helper(code), cwd=tmp_path, deadline=time.monotonic() + 3,
+                      log_path=tmp_path / "log", grace_s=0.05)
+    assert killed == [cgroup / "cgroup.kill"]
+    _assert_helpers_gone(escaped)
 
 
 def test_uninspectable_owned_cgroup_is_retained_as_uncertain(

@@ -7,7 +7,7 @@ ownership, Claude paths, or role `outcome.json` processing.
 ## Pinned evidence and installation gate
 
 The review target is the published `@agentclientprotocol/codex-acp` **1.11.0**
-release, annotated tag `v1.11.0`, peeled commit
+release, lightweight tag `v1.11.0` resolving directly to commit
 `51d6247ac7448485bfcf534b813196fafc26df59`. This is deliberately neither
 `main`, `latest`, nor a preview. The release's npm tarball integrity is
 `sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ==`.
@@ -22,11 +22,12 @@ future implementation must generate/validate App Server types from that same
 Codex binary; OpenAI's [App Server documentation](https://learn.chatgpt.com/docs/app-server)
 states generated schemas are specific to the Codex version.
 
-Primary protocol context: ACP [v1 overview](https://agentclientprotocol.com/protocol/v1/overview),
+Primary protocol context (the following protocol and App Server pages are
+mutable documentation, so are retrieval-date-only evidence): ACP [v1 overview](https://agentclientprotocol.com/protocol/v1/overview),
 [initialization](https://agentclientprotocol.com/protocol/v1/initialization),
 [session setup](https://agentclientprotocol.com/protocol/v1/session-setup), and
 [prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turns).
-The old zed-industries location redirects development to
+The old zed-industries location is a mutable redirect (retrieved 2026-09-11) to
 [agentclientprotocol/codex-acp](https://github.com/agentclientprotocol/codex-acp).
 
 ## Required wire profile
@@ -54,6 +55,17 @@ The tagged server returns AIR at **top-level** `InitializeResponse._meta`
 typed failures when the client request has integer AIR version >= 1 and names
 `sessionFailure` ([initialize source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexAcpServer.ts), [detector source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AirExtension.ts)).
 
+Pinned server-requests are `session/request_permission` (MCP/tool approval)
+and `elicitation/create` (form or URL), with `elicitation/complete` as its
+follow-up notification; these are the client-directed request paths in the
+tagged implementation ([handler source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexElicitationHandler.ts)).
+This profile advertises neither elicitation nor MCP servers, so an unexpected
+permission request receives **deny** and an unexpected elicitation receives
+**cancel**: never open a URL, solicit input, or persist a choice. `mode=agent`
+maps only to Codex non-interactive `approval_policy=never`, never owner
+approval. An unavailable policy-owner response, unknown/malformed request, or
+attempt to broaden cwd/sandbox is fail-closed and non-completing.
+
 Cancellation is bounded: send `session/cancel`; wait at most **10 seconds**
 for the correlated prompt response; then, if `sessionCapabilities.close` was
 advertised, issue `session/close` and wait at most **5 seconds**. If either
@@ -63,17 +75,19 @@ late response is a completion. This is transport cleanup, not authority.
 
 The future transport-facing interfaces are `AcpProcessFact` (pid/exit/signal,
 timeout, stderr availability), `AcpPromptFact` (request/session/prompt ids,
-JSON-RPC result/error, stop reason, AIR updates), and `AcpCorrelation`
+lossless JSON-RPC result/error, raw AIR observations and validated AIR updates),
+and `AcpCorrelation`
 (prompt fact plus one agent-authored `outcome.json`). They are facts: only the
 existing role parser decides DONE/ASK/YIELD/FAIL and only owner/arbiter retain
 their authority.
 
 | Concern | ACP profile | NC status |
 |---|---|---|
-| sandbox/cwd | explicit `session/new` cwd and policy | map from current adapter; no widening |
-| model | explicit configured model | map; reject missing/rerouted value |
-| web search | no client tool grant | unsupported |
-| client tools/MCP | no client tools | unsupported |
+| worker | worktree cwd only; no widened sandbox | configured worker model only; `mode=agent` + non-interactive deny | rejected: no web-search client tool |
+| critic | worktree cwd only; no widened sandbox | configured critic model only; `mode=agent` + non-interactive deny | rejected: no web-search client tool |
+| owner/planner | no ACP role mapping | reject before `session/new` | rejected |
+| model | selected `model` option must return configured value | reject missing, different, or unadvertised value | n/a |
+| client tools/MCP | empty `mcpServers`; no client tool capability | reject required MCP/client tools | unsupported |
 | resume | server supports it | unsupported |
 
 ## Completion, failures, and recovery
@@ -94,8 +108,9 @@ generic AIR record, omitted severity is conservatively `error`, as the tagged
 source does ([failure construction source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexEventHandler.ts)). Terminal failures occur at
 `PromptResponse._meta.jetbrains.air.sessionFailure`; recoverable warnings occur
 in `session/update` `params.update._meta.jetbrains.air.sessionFailure` before a
-later prompt result. Retain every AIR record in observation order, including
-`id` and `revision`; revisions update the same id. Recovery is represented by a
+  later prompt result. Retain every raw AIR observation in observation order,
+including malformed values, alongside validated records with `id` and
+`revision`; revisions update the same id. Recovery is represented by a
 later revision plus a valid supported successful prompt, never an assumed reset.
 
 Conservative lossy mapping: the Codex `quota_exhausted` kind is emitted as

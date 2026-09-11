@@ -15,14 +15,18 @@ class AcpProcessFact(TypedDict):
 
 
 class AcpPromptFact(TypedDict):
-    """One correlated, schema-valid ACP prompt response and ordered AIR evidence."""
+    """One correlated ACP prompt response and lossless ordered AIR evidence."""
 
     request_id: str
     session_id: str
     prompt_id: str
     prompt_response_valid: bool
     stop_reason: str | None
+    jsonrpc_result: NotRequired[dict[str, object]]
     jsonrpc_error: NotRequired[dict[str, object]]
+    # Unvalidated values from every discovered AIR sessionFailure in wire order.
+    # ``session_failures`` is the separately validated typed view.
+    air_observations: list[object]
     session_failures: list[dict[str, object]]
 
 
@@ -38,8 +42,9 @@ def is_completion_candidate(prompt: AcpPromptFact) -> bool:
     """Return transport-only eligibility; role parsing makes the final decision."""
     return (
         prompt["prompt_response_valid"]
-        and
-        "jsonrpc_error" not in prompt
+        and "jsonrpc_error" not in prompt
+        and all(isinstance(observation, dict)
+                for observation in prompt["air_observations"])
         and prompt.get("stop_reason") == "end_turn"
         and all(failure.get("severity", "error") != "error"
                 for failure in prompt["session_failures"])

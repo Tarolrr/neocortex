@@ -5,9 +5,20 @@ from pathlib import Path
 
 import pytest
 
-from nc.acp_decoder import decode_acp_prompt_result
+from nc.acp_decoder import decode_acp_prompt_result as _decode_acp_prompt_result
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def decode_acp_prompt_result(wire, *, request_id, session_id, air_version=1):
+    """Add the request omitted by compact one-prompt unit wires."""
+    if not any(isinstance(item, dict) and item.get("id") == request_id
+               and item.get("method") == "session/prompt" for item in wire):
+        wire = [{"id": request_id, "method": "session/prompt",
+                 "params": {"sessionId": session_id}}, *wire]
+    return _decode_acp_prompt_result(
+        wire, request_id=request_id, session_id=session_id, air_version=air_version
+    )
 
 
 def decode(name):
@@ -107,14 +118,61 @@ def test_wire_air_versions_fail_closed_but_retain_terminal_facts(version):
     assert result.usage and result.usage.total_tokens == 5
 
 
-def test_wire_air_update_version_is_validated_without_a_failure():
+def test_air_update_without_a_correlated_incident_is_not_terminal_evidence():
     wire = [
         {"method": "session/update", "params": {"sessionId": "s", "update": {
             "_meta": {"jetbrains": {"air": {"version": 2}}},
         }}},
         {"id": "p", "result": {"stopReason": "end_turn"}},
     ]
-    assert decode_acp_prompt_result(wire, request_id="p", session_id="s").kind == "protocol_invalid"
+    assert decode_acp_prompt_result(wire, request_id="p", session_id="s").kind == "success"
+
+
+def test_active_prompt_interval_excludes_stale_usage_and_malformed_air():
+    stale_failure = {"severity": "warning"}
+    wire = [
+        {"id": "prior", "method": "session/prompt", "params": {"sessionId": "s"}},
+        {"method": "session/update", "params": {"sessionId": "s", "update": {
+            "sessionUpdate": "usage_update", "usage": {"inputTokens": 40, "outputTokens": 2},
+        }}},
+        {"method": "session/update", "params": {"sessionId": "s", "update": {
+            "_meta": {"jetbrains": {"air": {"version": 1, "sessionFailure": stale_failure}}},
+        }}},
+        {"id": "prior", "result": {"stopReason": "end_turn"}},
+        {"id": "p", "method": "session/prompt", "params": {"sessionId": "s"}},
+        {"id": "p", "result": {"stopReason": "end_turn"}},
+    ]
+    result = _decode_acp_prompt_result(wire, request_id="p", session_id="s")
+    assert result.kind == "success" and result.usage is None
+
+
+def test_only_defined_usage_updates_are_correlated():
+    wire = [
+        {"method": "session/update", "params": {"sessionId": "s", "update": {
+            "usage": {"inputTokens": 40, "outputTokens": 2},
+        }}},
+        {"id": "p", "result": {"stopReason": "end_turn"}},
+    ]
+    result = decode_acp_prompt_result(wire, request_id="p", session_id="s")
+    assert result.kind == "success" and result.usage is None
+
+
+def test_unrelated_incident_with_unsupported_version_cannot_poison_success():
+    wire = [
+        {"method": "session/update", "params": {"sessionId": "s", "update": {
+            "_meta": {"jetbrains": {"air": {"version": 2, "sessionFailure": {
+                "id": "prior:error", "revision": 1, "category": "service",
+                "severity": "error", "title": "old", "actions": [],
+            }}}},
+        }}},
+        {"id": "p", "result": {"stopReason": "end_turn"}},
+    ]
+    assert decode_acp_prompt_result(wire, request_id="p", session_id="s").kind == "success"
+
+
+def test_active_prompt_request_is_required_before_its_response():
+    wire = [{"id": "p", "result": {"stopReason": "end_turn"}}]
+    assert _decode_acp_prompt_result(wire, request_id="p", session_id="s").kind == "protocol_invalid"
 
 
 @pytest.mark.parametrize("usage", [

@@ -134,7 +134,8 @@ def _usage(value: object) -> AcpUsage | None:
     return AcpUsage(input_tokens, output_tokens, cached, total)
 
 
-def _notification_usage(wire: Sequence[object], response_index: int, session_id: str) -> AcpUsage | None:
+def _notification_usage(wire: Sequence[object], start_index: int, response_index: int,
+                        session_id: str) -> AcpUsage | None:
     """Return the final direct usage snapshot from this prompt's updates.
 
     ``session/update`` usage reports are snapshots, not increments.  Reading
@@ -143,14 +144,15 @@ def _notification_usage(wire: Sequence[object], response_index: int, session_id:
     """
     reported = False
     usage: AcpUsage | None = None
-    for item in wire[:response_index]:
+    for item in wire[start_index:response_index]:
         if not isinstance(item, dict) or item.get("method") != "session/update":
             continue
         params = item.get("params")
         if not isinstance(params, dict) or params.get("sessionId") != session_id:
             continue
         update = params.get("update")
-        if isinstance(update, dict) and "usage" in update:
+        if (isinstance(update, dict) and update.get("sessionUpdate") == "usage_update"
+                and "usage" in update):
             reported = True
             usage = _usage(update["usage"])
     return usage if reported else None
@@ -199,18 +201,33 @@ def decode_acp_prompt_result(
 ) -> AcpPromptResult:
     """Decode a single active prompt from its JSON-RPC wire records.
 
-    Only the response whose id is ``request_id`` and prior updates for
-    ``session_id`` whose AIR incident id starts with ``request_id + ':'`` are
-    considered.  Duplicate equal revisions are ignored; a lower revision is
-    stale, while divergent duplicate revisions are protocol-invalid.
+    Only the active ``session/prompt`` request-to-response interval is read.
+    Within it, updates must match ``session_id`` and AIR incidents must start
+    with ``request_id + ':'``.  Duplicate equal revisions are ignored; a
+    lower revision is stale, while divergent duplicate revisions are
+    protocol-invalid.
     """
+    requests = [
+        (index, item) for index, item in enumerate(wire)
+        if isinstance(item, dict) and item.get("id") == request_id
+        and item.get("method") == "session/prompt"
+        and isinstance(item.get("params"), dict)
+        and item["params"].get("sessionId") == session_id
+    ]
+    if len(requests) != 1:
+        return AcpPromptResult("protocol_invalid", None,
+                               "conflicting active prompt request identity", (), None)
+    request_index, _ = requests[0]
     responses = [item for item in wire if isinstance(item, dict) and item.get("id") == request_id
                  and "method" not in item]
     if len(responses) != 1:
         return AcpPromptResult("protocol_invalid", None, "conflicting prompt response identity", (), None)
     response = responses[0]
     response_index = next(index for index, item in enumerate(wire) if item is response)
-    notified_usage = _notification_usage(wire, response_index, session_id)
+    if response_index <= request_index:
+        return AcpPromptResult("protocol_invalid", None,
+                               "prompt response precedes active request", (), None)
+    notified_usage = _notification_usage(wire, request_index + 1, response_index, session_id)
     if ("result" in response) == ("error" in response):
         return AcpPromptResult("protocol_invalid", None, "prompt response must have exactly one result or error", (), None)
     if "error" in response:
@@ -232,21 +249,23 @@ def decode_acp_prompt_result(
     if air_version != 1:
         return AcpPromptResult("protocol_invalid", stop_reason, "unsupported AIR extension version", (), usage)
     raw_failures: list[object] = []
-    for item in wire[:response_index]:
+    for item in wire[request_index + 1:response_index]:
         if not isinstance(item, dict) or item.get("method") != "session/update":
             continue
         params = item.get("params")
         if isinstance(params, dict) and params.get("sessionId") == session_id:
             update = params.get("update")
-            if _has(update, "_meta", "jetbrains", "air"):
-                problem = _air_version_problem(_at(update, "_meta", "jetbrains", "air"))
-                if problem:
-                    return AcpPromptResult("protocol_invalid", stop_reason, problem, (), usage)
             if _has(update, "_meta", "jetbrains", "air", "sessionFailure"):
                 failure = _at(update, "_meta", "jetbrains", "air", "sessionFailure")
-                # A well-formed incident for another prompt is not evidence for this one.
+                # Establish incident ownership before treating its envelope as
+                # protocol evidence.  Another prompt may have emitted a late
+                # update in this session; its unsupported extension must not
+                # poison the active prompt.
                 if isinstance(failure, dict) and isinstance(failure.get("id"), str):
                     if failure["id"].startswith(request_id + ":"):
+                        problem = _air_version_problem(_at(update, "_meta", "jetbrains", "air"))
+                        if problem:
+                            return AcpPromptResult("protocol_invalid", stop_reason, problem, (), usage)
                         raw_failures.append(failure)
                 else:
                     return AcpPromptResult("protocol_invalid", stop_reason,

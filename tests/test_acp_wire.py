@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from nc import acp_wire
-from nc.acp_stream import AcpDeadlineExpired, AcpEofError
+from nc.acp_stream import AcpCancelled, AcpDeadlineExpired, AcpEofError
 from nc.acp_wire import AcpLaunchError, AcpSubprocess, AcpTransportEof, AcpUnexpectedExit
 from nc.adapters import adapter_ownership
 
@@ -74,6 +74,20 @@ def test_stream_uses_total_deadline_for_hung_request(tmp_path: Path) -> None:
     assert child.proc.returncode is not None
     with pytest.raises(ChildProcessError):
         os.waitpid(child.proc.pid, os.WNOHANG)
+
+
+def test_pipe_cancellation_remains_distinct_from_deadline_or_write_failure(tmp_path: Path) -> None:
+    child = AcpSubprocess(helper("import time; time.sleep(30)"), cwd=tmp_path,
+                          deadline=time.monotonic() + 2, log_path=tmp_path / "log")
+    try:
+        with pytest.raises(AcpCancelled, match="cancelled"):
+            child.reader.read_with_deadline(1, time.monotonic() + 1, lambda: True)
+        with pytest.raises(AcpCancelled, match="cancelled"):
+            child.writer.write_with_deadline(b"x", time.monotonic() + 1, lambda: True)
+        with pytest.raises(AcpCancelled, match="cancelled"):
+            child.writer.flush_with_deadline(time.monotonic() + 1, lambda: True)
+    finally:
+        child.close()
 
 
 def test_close_escalates_hung_graceful_shutdown_and_reaps(tmp_path: Path) -> None:
@@ -192,3 +206,52 @@ def test_close_kills_descendant_after_parent_already_exited(tmp_path: Path) -> N
         time.sleep(0.02)
     else:
         pytest.fail("ACP descendant survived after parent exit")
+
+
+def test_cgroup_cleanup_catches_descendant_escaped_from_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cgroup path is mocked: tests never create or alter host cgroups."""
+    cgroup = tmp_path / "mock-cgroup"
+    cgroup.mkdir()
+    (cgroup / "cgroup.procs").write_text("")
+    (cgroup / "cgroup.kill").write_text("")
+    monkeypatch.setattr(acp_wire, "_adapter_cgroup", lambda: cgroup)
+    monkeypatch.setattr(acp_wire, "_join_cgroup", lambda _path: None)
+    child = AcpSubprocess(
+        helper(
+            "import subprocess,sys,time; "
+            "code=\"import os,time; os.setsid(); print(os.getpid(), flush=True); time.sleep(30)\"; "
+            "subprocess.Popen([sys.executable, '-c', code]); time.sleep(30)"
+        ),
+        cwd=tmp_path, deadline=time.monotonic() + 3, log_path=tmp_path / "log", grace_s=0.05,
+    )
+    escaped = int(child.reader.read_with_deadline(40, time.monotonic() + 2, None))
+    (cgroup / "cgroup.procs").write_text(f"{escaped}\n")
+    original_write_text = Path.write_text
+    killed: list[Path] = []
+
+    def mock_cgroup_kill(path: Path, data: str, *args: object, **kwargs: object) -> int:
+        if path == cgroup / "cgroup.kill" and data == "1":
+            killed.append(path)
+            os.kill(escaped, 9)
+            original_write_text(cgroup / "cgroup.procs", "")
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", mock_cgroup_kill)
+    child.close()
+    assert killed == [cgroup / "cgroup.kill"]
+    assert not child.cleanup_uncertain
+    _assert_helpers_gone([escaped])
+
+
+def test_uninspectable_owned_cgroup_is_retained_as_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cgroup = tmp_path / "missing-cgroup"
+    monkeypatch.setattr(acp_wire, "_adapter_cgroup", lambda: cgroup)
+    monkeypatch.setattr(acp_wire, "_join_cgroup", lambda _path: None)
+    child = AcpSubprocess(helper("pass"), cwd=tmp_path, deadline=time.monotonic() + 2,
+                          log_path=tmp_path / "log")
+    child.close()
+    assert child.cleanup_uncertain

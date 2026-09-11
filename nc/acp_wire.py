@@ -18,7 +18,12 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Self
 
-from .acp_stream import AcpDeadlineExpired, AcpEofError, AcpJsonRpcStream, AcpWriteError
+from .acp_stream import (
+    AcpCancelled,
+    AcpDeadlineExpired,
+    AcpEofError,
+    AcpJsonRpcStream,
+)
 from .adapters import (
     _adapter_cgroup,
     _join_cgroup,
@@ -58,7 +63,7 @@ class _PipeReader:
                            cancelled: Callable[[], bool] | None) -> bytes:
         while True:
             if cancelled is not None and cancelled():
-                raise AcpDeadlineExpired("ACP operation cancelled")
+                raise AcpCancelled("ACP operation cancelled")
             remaining = None if deadline is None else deadline - self._clock()
             if remaining is not None and remaining <= 0:
                 raise AcpDeadlineExpired("ACP process deadline expired")
@@ -76,7 +81,7 @@ class _PipeWriter:
     def write_with_deadline(self, data: bytes, deadline: float | None,
                             cancelled: Callable[[], bool] | None) -> int:
         if cancelled is not None and cancelled():
-            raise AcpWriteError("ACP operation cancelled")
+            raise AcpCancelled("ACP operation cancelled")
         remaining = None if deadline is None else deadline - self._clock()
         if remaining is not None and remaining <= 0:
             raise AcpDeadlineExpired("ACP process deadline expired")
@@ -88,7 +93,7 @@ class _PipeWriter:
     def flush_with_deadline(self, deadline: float | None,
                             cancelled: Callable[[], bool] | None) -> None:
         if cancelled is not None and cancelled():
-            raise AcpWriteError("ACP operation cancelled")
+            raise AcpCancelled("ACP operation cancelled")
         if deadline is not None and self._clock() >= deadline:
             raise AcpDeadlineExpired("ACP process deadline expired")
 
@@ -231,6 +236,31 @@ class AcpSubprocess:
             return True
         return True
 
+    def _terminate_cgroup(self) -> None:
+        """Kill all owned cgroup members when cgroup v2 exposes cgroup.kill.
+
+        The session group is the no-cgroup fallback.  It cannot see a
+        descendant which deliberately escaped with ``setsid``; a dedicated
+        cgroup can, so prefer its kernel containment operation when present.
+        ``cgroup.kill`` is optional on older or constrained cgroup v2 hosts,
+        in which case membership inspection below remains the evidence.
+        """
+        if self._cgroup is None:
+            return
+        try:
+            (self._cgroup / "cgroup.kill").write_text("1")
+        except OSError:
+            pass
+
+    def _cgroup_empty(self) -> bool | None:
+        """Return cgroup membership evidence, or ``None`` if it is unreadable."""
+        if self._cgroup is None:
+            return None
+        try:
+            return not (self._cgroup / "cgroup.procs").read_text().split()
+        except OSError:
+            return None
+
     def close(self) -> None:
         """Boundedly close, terminate and reap; retained cgroup is survivor evidence."""
         if self._closed:
@@ -250,8 +280,20 @@ class AcpSubprocess:
         self._terminate()
         self._wait_for_exit(self._grace)
         self._terminate(force=True)
+        # A descendant may have escaped the original process group.  Its
+        # dedicated cgroup still owns it, provided the host made one.
+        self._terminate_cgroup()
         reaped = self._wait_for_exit(self._grace)
-        self.cleanup_uncertain = not reaped or self._process_group_alive()
+        cgroup_empty = self._cgroup_empty()
+        # Without a cgroup, process-group liveness is the best available
+        # containment evidence; it cannot prove an escaped descendant died.
+        # With one, uninspectable or nonempty membership is deliberately kept
+        # as recovery evidence instead of inferring tree death from the leader.
+        self.cleanup_uncertain = (
+            not reaped
+            or self._process_group_alive()
+            or (self._cgroup is not None and cgroup_empty is not True)
+        )
         if self.proc.stdout is not None:
             try:
                 self.proc.stdout.close()

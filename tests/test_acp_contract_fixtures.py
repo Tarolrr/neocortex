@@ -53,7 +53,10 @@ def prompt_fact(wire):
         assert wire["wire"].index(update) < wire["wire"].index(prompt_response)
     failures = [air_failure(update["params"]["update"]) for update in updates]
     failures = [failure for failure in failures if isinstance(failure, dict)]
-    if terminal is not None:
+    # Invalid AIR metadata makes the response unusable, but is not typed
+    # failure evidence.  Keep malformed values out of the typed list so a
+    # consumer cannot accidentally treat arbitrary JSON as a failure object.
+    if isinstance(terminal, dict):
         failures.append(terminal)
     fact["session_failures"] = failures
     return fact

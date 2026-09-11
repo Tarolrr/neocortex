@@ -10,6 +10,13 @@ from nc.acp_contract import is_air_session_failure, is_completion_candidate
 FIXTURES = Path(__file__).parent / "fixtures"
 AIR = ("_meta", "jetbrains", "air", "sessionFailure")
 VALID_CATEGORIES = {"connection", "access", "limit", "request", "service", "unknown"}
+PINNED_AGENT_MODE = {
+    "mode": "agent",
+    "approvalPolicy": "on-request",
+    "approvalsReviewer": "auto_review",
+    "sandboxPolicy": "workspaceWrite",
+    "permissionRequestDisposition": "deny",
+}
 
 
 def event(wire, *, method=None, request_id=None):
@@ -81,6 +88,10 @@ def prompt_fact(wire):
 def test_synthetic_acp_wire_fixture_shape(name, candidate):
     wire = json.loads((FIXTURES / name).read_text())
     assert wire["attribution"] == "synthetic; not a captured incident"
+    # This is source-derived fixture metadata, not an invented ACP wire field.
+    # Pinned AgentMode.ts makes `agent` on-request/auto-review/workspace-write;
+    # the adapter still fail-closes every resulting permission request.
+    assert wire["pinned_mode_observation"] == PINNED_AGENT_MODE
     initialize = event(wire, method="initialize")
     assert initialize["params"]["clientCapabilities"]["_meta"]["jetbrains"]["air"] == {
         "version": 1, "capabilities": ["sessionFailure"],
@@ -109,6 +120,8 @@ def test_synthetic_acp_wire_fixture_shape(name, candidate):
     assert [(call["params"]["configId"], call["params"]["value"]) for call in config_calls] == [
         ("model", "configured"), ("mode", "agent"),
     ]
+    mode_option = next(option for option in advertised if option["id"] == "mode")
+    assert "agent" in {choice["value"] for choice in mode_option["options"]}
     for call in config_calls:
         assert call["params"]["sessionId"] == session_response["sessionId"]
         response = event(wire, request_id=call["id"])

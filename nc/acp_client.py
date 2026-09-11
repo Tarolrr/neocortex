@@ -8,6 +8,7 @@ It starts one process, makes one fresh session and sends exactly one prompt.
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -20,7 +21,10 @@ from .acp_stream import AcpDeadlineExpired, AcpStreamError
 from .acp_wire import AcpProcessError, AcpProcessTimeout, AcpSubprocess
 
 _MODE = "agent"
-_PROTECTED_ENV = frozenset({"CODEX_CONFIG", "CODEX_PATH", "INITIAL_AGENT_MODE"})
+_PROTECTED_ENV = frozenset({
+    "CODEX_CONFIG", "CODEX_PATH", "INITIAL_AGENT_MODE", "CODEX_HOME", "HOME",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+})
 
 
 class AcpClientRejected(RuntimeError):
@@ -50,10 +54,16 @@ class CodexAcpPolicy:
         return cls("restricted", path, path, public_web_search=True, network_access=True)
 
     def validate(self) -> None:
+        if self.kind not in {"ordinary", "restricted"}:
+            raise AcpClientRejected("unknown ACP policy kind")
         if not self.cwd.is_absolute() or not self.workspace_root.is_absolute():
             raise AcpClientRejected("ACP cwd and workspace root must be absolute")
+        if not self.cwd.is_dir() or not self.workspace_root.is_dir():
+            raise AcpClientRejected("ACP cwd and workspace root must exist")
         if self.kind == "restricted" and self.cwd != self.workspace_root:
             raise AcpClientRejected("restricted ACP must preserve its run-directory cwd")
+        if self.kind == "restricted" and not (self.public_web_search and self.network_access):
+            raise AcpClientRejected("restricted ACP requires pinned web and network settings")
         if self.kind == "ordinary" and (self.public_web_search or self.network_access):
             raise AcpClientRejected("ordinary ACP cannot request web or network access")
 
@@ -69,12 +79,39 @@ class CodexAcpTurn:
     live_sandbox_enforcement_verified: Literal[False] = False
 
 
-def _safe_environment(base: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Do not let per-process config/mode variables alter the pinned setup."""
+def _safe_environment(
+    base: Mapping[str, str] | None = None, *, config_home: Path,
+) -> dict[str, str]:
+    """Isolate Codex configuration without touching inherited credentials."""
     env = dict(os.environ if base is None else base)
     for name in _PROTECTED_ENV:
         env.pop(name, None)
+    # Codex uses this home for both configuration and its auth cache.  This
+    # deliberately does not copy, alter, or authenticate with the caller's
+    # credentials: a future live activation must arrange its own verified auth
+    # boundary.  The isolated config below is the only policy authority.
+    for name in ("HOME", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+        env[name] = str(config_home)
     return env
+
+
+def _write_pinned_config(policy: CodexAcpPolicy, config_home: Path) -> None:
+    """Write the sole Codex configuration consulted by the ACP child.
+
+    These are the source-pinned ``agent`` settings.  ACP config negotiation
+    selects ``agent`` too; this launch boundary prevents a global config from
+    broadening its sandbox or changing its noninteractive behavior.
+    """
+    config_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    network = "true" if policy.network_access else "false"
+    search = '"live"' if policy.public_web_search else '"disabled"'
+    (config_home / "config.toml").write_text(
+        "approval_policy = \"on-request\"\n"
+        "sandbox_mode = \"workspace-write\"\n"
+        f"web_search = {search}\n"
+        "[sandbox_workspace_write]\n"
+        f"network_access = {network}\n"
+    )
 
 
 def _options(response: object) -> list[dict[str, object]]:
@@ -110,14 +147,15 @@ def _air_advertised(response: object) -> bool:
             and "sessionFailure" in air["capabilities"])
 
 
-def _process_fact(child: AcpSubprocess, timed_out: bool) -> AcpProcessFact:
+def _process_fact(child: AcpSubprocess, timed_out: bool,
+                  timeout_phases: Sequence[str] = ()) -> AcpProcessFact:
     code = child.proc.returncode
     return {
         "pid": child.proc.pid,
         "exit_code": code if code is None or code >= 0 else None,
         "signal": -code if isinstance(code, int) and code < 0 else None,
         "timed_out": timed_out,
-        "timeout_phases": ["cancel_response"] if timed_out else [],
+        "timeout_phases": list(timeout_phases) if timed_out else [],
         "stderr_available": bool(child.diagnostics),
     }
 
@@ -167,16 +205,24 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
     def deny_request(value: dict[str, object]) -> object:
         wire.append(value)
         method = value.get("method")
+        params = value.get("params")
+        if not isinstance(params, dict) or params.get("sessionId") != session_id:
+            raise AcpClientRejected("malformed or foreign server request")
         if method == "session/request_permission":
             return {"outcome": {"outcome": "denied"}}
         if method == "elicitation/create":
             return {"action": "cancel", "content": None}
         raise AcpClientRejected("unsupported server request")
 
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    config_home = Path(tempfile.mkdtemp(prefix="nc-acp-codex-", dir=log_path.parent))
+    _write_pinned_config(policy, config_home)
     child = AcpSubprocess(command, cwd=policy.cwd, deadline=deadline, log_path=log_path,
-                          env=_safe_environment(environment))
+                          env=_safe_environment(environment, config_home=config_home))
     result: CodexAcpTurn | None = None
     timed_out = False
+    timeout_phases: list[str] = []
+    timeout_error: AcpProcessTimeout | None = None
     try:
         stream = child.stream(notification_handler=observe_notification, request_handler=deny_request)
 
@@ -222,20 +268,40 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
                      "params": prompt_params})
         try:
             prompt_response = stream.wait_for(prompt_id, deadline=time.monotonic() + timeout_s)
-        except AcpDeadlineExpired as exc:
+        except (AcpDeadlineExpired, AcpProcessTimeout) as exc:
             timed_out = True
+            timeout_phases.append(
+                "total_deadline" if isinstance(exc, AcpProcessTimeout) else "prompt_deadline"
+            )
             cancel_deadline = time.monotonic() + 10
+            # A total-bound expiry during a live prompt still owes the pinned
+            # cancellation sequence.  Temporarily extend only the supervisor
+            # guard through that independently bounded cleanup window; every
+            # following wire operation supplies its shorter own deadline.
+            if isinstance(exc, AcpProcessTimeout):
+                child.deadline = cancel_deadline + 5
             try:
-                stream.notify("session/cancel", {"sessionId": session_id}, deadline=cancel_deadline)
+                stream.notify(
+                    "session/cancel", {"sessionId": session_id}, deadline=cancel_deadline,
+                )
+                timeout_phases.append("cancel_sent")
                 prompt_response = stream.wait_for(prompt_id, deadline=cancel_deadline)
-            except (AcpProcessError, AcpStreamError):
-                if close_advertised:
-                    close_deadline = time.monotonic() + 5
-                    try:
-                        stream.request("session/close", {"sessionId": session_id}, deadline=close_deadline)
-                    except (AcpProcessError, AcpStreamError):
-                        pass
-                raise AcpProcessTimeout("ACP prompt cancellation response expired") from exc
+                timeout_phases.append("cancel_response")
+            except (AcpProcessError, AcpStreamError, AcpDeadlineExpired):
+                timeout_phases.append("cancel_response_expired")
+            if close_advertised:
+                close_deadline = time.monotonic() + 5
+                try:
+                    stream.request(
+                        "session/close", {"sessionId": session_id}, deadline=close_deadline,
+                    )
+                    timeout_phases.append("close_response")
+                except (AcpProcessError, AcpStreamError, AcpDeadlineExpired):
+                    timeout_phases.append("close_response_expired")
+            error = AcpProcessTimeout("ACP prompt deadline expired after bounded cancellation")
+            setattr(error, "timeout_phases", tuple(timeout_phases))
+            timeout_error = error
+            raise error from exc
         wire.append(prompt_response)
         # The transport intentionally uses compact numeric JSON-RPC ids, while
         # AIR incident ownership is text-prefixed.  Give the pure decoder its
@@ -258,8 +324,9 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
         # already failed.  A live server is closed deliberately below.
         child.check()
         result = CodexAcpTurn(decoded, prompt_fact, _process_fact(child, False), None)
-    except AcpProcessTimeout:
+    except AcpProcessTimeout as exc:
         timed_out = True
+        timeout_error = timeout_error or exc
         raise
     except AcpProcessError:
         raise
@@ -267,6 +334,9 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
         raise
     finally:
         child.close()
+        if timeout_error is not None:
+            setattr(timeout_error, "process", _process_fact(child, True, timeout_phases))
+            setattr(timeout_error, "shutdown", child.shutdown_outcome)
     assert result is not None
-    return CodexAcpTurn(result.prompt, result.prompt_fact, _process_fact(child, timed_out),
+    return CodexAcpTurn(result.prompt, result.prompt_fact, _process_fact(child, timed_out, timeout_phases),
                          child.shutdown_outcome)

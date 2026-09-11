@@ -14,8 +14,13 @@ is `agent` (`workspaceWrite`, `on-request`, `auto_review`), while every ACP
 permission request is denied and every elicitation is cancelled.  Live
 sandbox enforcement is explicitly unverified until owner activation.
 
-The client strips `CODEX_CONFIG`, `CODEX_PATH`, and `INITIAL_AGENT_MODE` from
-its child environment, sets model and mode explicitly, validates each response,
+The client strips `CODEX_CONFIG`, `CODEX_PATH`, `INITIAL_AGENT_MODE`, inherited
+`HOME`/`CODEX_HOME`, and XDG configuration homes. It gives the child a fresh,
+private configuration home containing only the pinned `agent` settings:
+workspace-write sandbox, on-request mode, and the selected policy's explicit
+web-search/network values. This neither copies nor changes credentials and
+does not authenticate; live activation must establish a separately verified
+credential boundary. It sets model and mode explicitly, validates each response,
 and returns decoded prompt evidence plus independent process facts and distinct
 intentional-shutdown evidence.  Prompt expiry sends `session/cancel`, permits
 ten seconds for the correlated response, then uses advertised `session/close`

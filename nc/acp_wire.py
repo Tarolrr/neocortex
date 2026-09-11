@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Self
 
@@ -167,7 +167,8 @@ class AcpSubprocess:
 
     def __init__(self, command: Sequence[str], *, cwd: Path, deadline: float,
                  log_path: Path, clock: Callable[[], float] = time.monotonic,
-                 stderr_bytes: int = 32_768, grace_s: float = 2.0) -> None:
+                 stderr_bytes: int = 32_768, grace_s: float = 2.0,
+                 env: Mapping[str, str] | None = None) -> None:
         if not command or stderr_bytes < 0 or grace_s < 0:
             raise ValueError("invalid ACP subprocess bounds")
         self.deadline = deadline
@@ -184,12 +185,13 @@ class AcpSubprocess:
         self.shutdown_outcome: str | None = None
         self.cleanup_uncertain = False
         self._cgroup = _adapter_cgroup()
-        env = dict(os.environ, PATH=f"{Path.home()}/.local/bin:{os.environ.get('PATH', '')}")
+        launch_env = dict(os.environ if env is None else env)
+        launch_env["PATH"] = f"{Path.home()}/.local/bin:{launch_env.get('PATH', '')}"
         launched = False
         try:
             self.proc = subprocess.Popen(
                 list(command), cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, env=env, start_new_session=True,
+                stderr=subprocess.PIPE, env=launch_env, start_new_session=True,
                 preexec_fn=(lambda: _join_cgroup(self._cgroup)) if self._cgroup else None,  # noqa: PLW1509 - containment before ACP exec
             )
             launched = True
@@ -437,6 +439,8 @@ AcpProcessSupervisor = AcpSubprocess
 
 
 def launch_acp(command: Sequence[str], *, cwd: Path, deadline: float, log_path: Path,
-               clock: Callable[[], float] = time.monotonic) -> AcpSubprocess:
+               clock: Callable[[], float] = time.monotonic,
+               env: Mapping[str, str] | None = None) -> AcpSubprocess:
     """Launch an owned ACP subprocess; callers must close it in ``finally``."""
-    return AcpSubprocess(command, cwd=cwd, deadline=deadline, log_path=log_path, clock=clock)
+    return AcpSubprocess(command, cwd=cwd, deadline=deadline, log_path=log_path, clock=clock,
+                         env=env)

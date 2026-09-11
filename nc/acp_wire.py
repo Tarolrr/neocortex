@@ -130,7 +130,7 @@ class AcpSubprocess:
                     callback(self.proc.pid)
                 except BaseException:
                     self._terminate(force=True)
-                    if not self._wait_for_exit():
+                    if not self._wait_for_exit(self._grace):
                         # Do not mask the ownership-recording error.  The
                         # cgroup deliberately remains evidence if containment
                         # itself is uncertain.
@@ -206,13 +206,29 @@ class AcpSubprocess:
         except (ProcessLookupError, PermissionError):
             pass
 
-    def _wait_for_exit(self) -> bool:
-        """Reap only within the remaining total deadline and grace bound."""
-        timeout = min(self._grace, max(0.0, self.deadline - self._clock()))
+    def _wait_for_exit(self, timeout: float) -> bool:
+        """Reap the direct child in a bounded cleanup phase.
+
+        Cleanup has its own bound.  The protocol deadline must not turn a
+        timeout into an unreaped zombie merely because it was already spent.
+        """
         try:
             self.proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             return False
+        return True
+
+    def _process_group_alive(self) -> bool:
+        """Whether the owned session group still has a member.
+
+        A reaped leader is not proof that its descendants are gone.
+        """
+        try:
+            os.killpg(self.proc.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
         return True
 
     def close(self) -> None:
@@ -220,19 +236,29 @@ class AcpSubprocess:
         if self._closed:
             return
         self._closed = True
-        for pipe in (self.proc.stdin, self.proc.stdout):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
+        # EOF is the ACP stdio closure/cancellation signal.  Give a compliant
+        # server a small, independent grace period before containment signals.
+        if self.proc.stdin is not None:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+        self._wait_for_exit(self._grace)
+
+        # Even if the leader honoured EOF, it may have left descendants in the
+        # owned session.  Escalate the complete group, not just the leader.
         self._terminate()
-        if not self._wait_for_exit():
-            self._terminate(force=True)
-            if not self._wait_for_exit():
-                self.cleanup_uncertain = True
-        self._stderr_done.wait(timeout=min(self._grace, max(0.0, self.deadline - self._clock())))
-        self._drainer.join(timeout=0)
+        self._wait_for_exit(self._grace)
+        self._terminate(force=True)
+        reaped = self._wait_for_exit(self._grace)
+        self.cleanup_uncertain = not reaped or self._process_group_alive()
+        if self.proc.stdout is not None:
+            try:
+                self.proc.stdout.close()
+            except OSError:
+                pass
+        self._stderr_done.wait(timeout=self._grace)
+        self._drainer.join(timeout=self._grace)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.write_text(self.diagnostics + ("\n" if self.diagnostics else ""))
         # A parent exit is not proof that the owned session/cgroup is empty.

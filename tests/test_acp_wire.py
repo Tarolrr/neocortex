@@ -69,11 +69,29 @@ def test_stream_uses_total_deadline_for_hung_request(tmp_path: Path) -> None:
             child.stream().request("hung")
     finally:
         child.close()
-    for _ in range(20):
-        if child.proc.poll() is not None:
-            break
-        time.sleep(0.01)
-    assert child.proc.poll() is not None
+    # ``close`` itself reaps after the protocol deadline has expired.  Do not
+    # call poll(): it would hide an unreaped-child bug by doing the reaping.
+    assert child.proc.returncode is not None
+    with pytest.raises(ChildProcessError):
+        os.waitpid(child.proc.pid, os.WNOHANG)
+
+
+def test_close_escalates_hung_graceful_shutdown_and_reaps(tmp_path: Path) -> None:
+    child = AcpSubprocess(
+        helper(
+            "import signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); sys.stdin.read(); time.sleep(30)"
+        ),
+        cwd=tmp_path, deadline=time.monotonic() - 1, log_path=tmp_path / "log",
+        grace_s=0.05,
+    )
+    assert child.reader.read_with_deadline(16, time.monotonic() + 1, None) == b"ready\n"
+    child.close()
+    # SIGKILL is required because EOF and SIGTERM were both deliberately
+    # ignored.  returncode is populated by close's wait, rather than poll().
+    assert child.proc.returncode == -9
+    with pytest.raises(ChildProcessError):
+        os.waitpid(child.proc.pid, os.WNOHANG)
 
 
 def test_exit_and_live_stdout_eof_are_not_provider_or_success(tmp_path: Path) -> None:
@@ -124,24 +142,35 @@ def test_close_kills_hung_session_group(tmp_path: Path) -> None:
     assert child.proc.poll() is not None
 
 
-def test_close_kills_a_descendant_in_the_owned_session(tmp_path: Path) -> None:
+def _assert_helpers_gone(pids: list[int]) -> None:
+    for _ in range(100):
+        survivors = []
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            survivors.append(pid)
+        if not survivors:
+            return
+        time.sleep(0.02)
+    pytest.fail(f"ACP helper descendants survived shutdown: {survivors}")
+
+
+def test_close_kills_child_and_grandchild_in_owned_session(tmp_path: Path) -> None:
     code = (
         "import subprocess,sys,time; "
-        "p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+        "code=\"import subprocess,sys,time; p=subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(30)']); print(p.pid, flush=True); time.sleep(30)\"; "
+        "p=subprocess.Popen([sys.executable, '-c', code], stdout=sys.stdout); "
         "print(p.pid, flush=True); time.sleep(30)"
     )
     child = AcpSubprocess(helper(code), cwd=tmp_path, deadline=time.monotonic() + 3,
                           log_path=tmp_path / "log")
-    descendant = int(child.reader.read_with_deadline(40, time.monotonic() + 2, None))
+    pids = [int(child.reader.read_with_deadline(40, time.monotonic() + 2, None))]
+    pids.append(int(child.reader.read_with_deadline(40, time.monotonic() + 2, None)))
     child.close()
-    for _ in range(20):
-        try:
-            os.kill(descendant, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.02)
-    else:
-        pytest.fail("ACP descendant survived session-group shutdown")
+    _assert_helpers_gone(pids)
 
 
 def test_close_kills_descendant_after_parent_already_exited(tmp_path: Path) -> None:

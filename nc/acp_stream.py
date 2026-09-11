@@ -63,6 +63,10 @@ class AcpPendingLimit(AcpStreamError):
     """The bounded host-generated request table is full."""
 
 
+class AcpDeadlineSupportError(AcpStreamError):
+    """A deadline/cancellation needs a deadline-aware injected operation."""
+
+
 JsonId = str | int
 MessageKind = Literal["request", "notification", "response"]
 
@@ -146,8 +150,6 @@ class AcpJsonRpcStream:
         self._request_handler = request_handler
         self._buffer = b""
         self._pending: dict[JsonId, dict[str, object] | None] = {}
-        self._retired: deque[JsonId] = deque(maxlen=max_pending_requests * 2)
-        self._retired_set: set[JsonId] = set()
         self._diagnostics: deque[str] = deque(maxlen=max_diagnostics)
         self._next_id = 1
 
@@ -170,12 +172,54 @@ class AcpJsonRpcStream:
         # Never retain a peer-controlled transcript without a fixed bound.
         self._diagnostics.append(" ".join(text.split())[:240])
 
-    def _retire(self, request_id: JsonId) -> None:
-        if len(self._retired) == self._retired.maxlen:
-            old = self._retired.popleft()
-            self._retired_set.discard(old)
-        self._retired.append(request_id)
-        self._retired_set.add(request_id)
+    def _read(self, deadline: float | None, cancelled: Callable[[], bool] | None) -> object:
+        """Read once without allowing a deadline to be hidden by blocking I/O.
+
+        Injectable live streams must expose ``read_with_deadline(size, deadline,
+        cancelled)`` when a deadline or cancellation is supplied.  In-memory
+        streams are known nonblocking and remain convenient for offline users.
+        The operation may return after a deadline, in which case the following
+        check turns that into the explicit signal instead of accepting data.
+        """
+        if deadline is not None or cancelled is not None:
+            operation = getattr(self._reader, "read_with_deadline", None)
+            if operation is not None:
+                piece = operation(4096, deadline, cancelled)
+                self._check(deadline, cancelled)
+                return piece
+            if not isinstance(self._reader, (io.BytesIO, io.StringIO, io.TextIOBase)):
+                raise AcpDeadlineSupportError(
+                    "reader must provide read_with_deadline for deadlines or cancellation"
+                )
+        return self._reader.read(4096)
+
+    def _write_operation(
+        self, data: bytes | str, deadline: float | None, cancelled: Callable[[], bool] | None,
+    ) -> int | None:
+        if deadline is not None or cancelled is not None:
+            operation = getattr(self._writer, "write_with_deadline", None)
+            if operation is not None:
+                count = operation(data, deadline, cancelled)
+                self._check(deadline, cancelled)
+                return count
+            if not isinstance(self._writer, (io.BytesIO, io.StringIO, io.TextIOBase)):
+                raise AcpDeadlineSupportError(
+                    "writer must provide write_with_deadline for deadlines or cancellation"
+                )
+        return self._writer.write(data)  # type: ignore[arg-type]
+
+    def _flush(self, deadline: float | None, cancelled: Callable[[], bool] | None) -> None:
+        if deadline is not None or cancelled is not None:
+            operation = getattr(self._writer, "flush_with_deadline", None)
+            if operation is not None:
+                operation(deadline, cancelled)
+                self._check(deadline, cancelled)
+                return
+            if not isinstance(self._writer, (io.BytesIO, io.StringIO, io.TextIOBase)):
+                raise AcpDeadlineSupportError(
+                    "writer must provide flush_with_deadline for deadlines or cancellation"
+                )
+        self._writer.flush()
 
     def _read_frame(self, deadline: float | None, cancelled: Callable[[], bool] | None) -> bytes:
         while True:
@@ -191,7 +235,9 @@ class AcpJsonRpcStream:
             if len(self._buffer) > self._max_message_bytes:
                 raise AcpMalformedFrame("ACP frame exceeds message limit")
             try:
-                piece = self._reader.read(4096)
+                piece = self._read(deadline, cancelled)
+            except AcpStreamError:
+                raise
             except Exception as exc:  # stream implementations have varied exception types
                 raise AcpEofError("ACP read failed") from exc
             if isinstance(piece, str):
@@ -221,7 +267,9 @@ class AcpJsonRpcStream:
         while offset < len(data):
             self._check(deadline, cancelled)
             try:
-                count = self._writer.write(data[offset:])  # type: ignore[arg-type]
+                count = self._write_operation(data[offset:], deadline, cancelled)
+            except AcpStreamError:
+                raise
             except Exception as exc:
                 raise AcpWriteError("ACP write failed") from exc
             if count is None:
@@ -231,7 +279,9 @@ class AcpJsonRpcStream:
             else:
                 offset += count
         try:
-            self._writer.flush()
+            self._flush(deadline, cancelled)
+        except AcpStreamError:
+            raise
         except Exception as exc:
             raise AcpWriteError("ACP flush failed") from exc
 
@@ -244,17 +294,15 @@ class AcpJsonRpcStream:
             raise ValueError("method must be a nonempty string")
         if len(self._pending) >= self._max_pending_requests:
             raise AcpPendingLimit("too many pending ACP requests")
-        if request_id is None:
-            while self._next_id in self._pending or self._next_id in self._retired_set:
-                self._next_id += 1
-            request_id = self._next_id
-            self._next_id += 1
-        if (
-            not _valid_id(request_id)
-            or request_id in self._pending
-            or request_id in self._retired_set
-        ):
-            raise ValueError("request id is invalid or already used")
+        # IDs are generated monotonically for the connection lifetime.  This
+        # avoids retaining an unbounded tombstone table merely to reject a
+        # delayed response after an ID has been recycled.  ``request_id`` is a
+        # narrow test/caller assertion, not an override of generation.
+        generated_id = self._next_id
+        if request_id is not None and request_id != generated_id:
+            raise ValueError("host request ids are generated monotonically")
+        request_id = generated_id
+        self._next_id += 1
         message: dict[str, object] = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             message["params"] = params
@@ -356,7 +404,6 @@ class AcpJsonRpcStream:
             self.pump(deadline=deadline, cancelled=cancelled)
         response = self._pending.pop(request_id)
         assert response is not None
-        self._retire(request_id)
         return response
 
     def request(

@@ -15,14 +15,15 @@ class AcpProcessFact(TypedDict):
 
 
 class AcpPromptFact(TypedDict):
-    """One correlated ACP prompt response and its decoded terminal evidence."""
+    """One correlated, schema-valid ACP prompt response and ordered AIR evidence."""
 
     request_id: str
     session_id: str
     prompt_id: str
+    prompt_response_valid: bool
     stop_reason: str | None
     jsonrpc_error: NotRequired[dict[str, object]]
-    session_failure: NotRequired[dict[str, object]]
+    session_failures: list[dict[str, object]]
 
 
 class AcpCorrelation(TypedDict):
@@ -35,9 +36,11 @@ class AcpCorrelation(TypedDict):
 
 def is_completion_candidate(prompt: AcpPromptFact) -> bool:
     """Return transport-only eligibility; role parsing makes the final decision."""
-    failure = prompt.get("session_failure")
     return (
+        prompt["prompt_response_valid"]
+        and
         "jsonrpc_error" not in prompt
         and prompt.get("stop_reason") == "end_turn"
-        and (failure is None or failure.get("severity", "error") != "error")
+        and all(failure.get("severity", "error") != "error"
+                for failure in prompt["session_failures"])
     )

@@ -37,16 +37,29 @@ Client sends ACP v1 `initialize` with exactly:
 {"clientCapabilities":{"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}}}
 ```
 
-Then create one `session/new` with explicit configured `cwd`, model and
-execution/approval policy; do not accept an agent-selected default. Send one
-`session/prompt`, correlate the request id, session id and prompt id, service
-server requests only through the existing policy owner, and bound cancel then
-close. No session resume, client tools, common bus, or runtime activation is in
-scope. The tagged server does **not** advertise or echo `sessionFailure` in its
-initialize response: `agentCapabilities._meta` contains its `authStatus`
-extension, not AIR. Typed failures are enabled solely because the server detects
-the client's request `_meta.jetbrains.air` integer version >= 1 and named
-`sessionFailure` capability ([initialize source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexAcpServer.ts), [detector source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AirExtension.ts)).
+Then create one `session/new` with only its ACP fields: absolute `cwd` and
+`mcpServers` (empty for this profile). The agent, not NC, allocates its
+`sessionId`. Inspect advertised `configOptions` and `modes`, then set the
+configured model with `session/set_config_option` (`configId: "model"`) and
+the configured execution/approval mode with `session/set_config_option`
+(`configId: "mode"`; `session/set_mode` is also advertised). Reject before a
+prompt if either selected value is absent or rejected; do not accept a default.
+Send `session/prompt`, correlate request id/session id/prompt id, and service
+server requests only through the existing policy owner. No session resume,
+client tools, common bus, or runtime activation is in scope.
+
+The tagged server returns AIR at **top-level** `InitializeResponse._meta`
+(`jetbrains.air.version: 1`, capabilities including `sessionFailure`), while
+`agentCapabilities._meta` carries only its `authStatus` extension. It enables
+typed failures when the client request has integer AIR version >= 1 and names
+`sessionFailure` ([initialize source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexAcpServer.ts), [detector source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AirExtension.ts)).
+
+Cancellation is bounded: send `session/cancel`; wait at most **10 seconds**
+for the correlated prompt response; then, if `sessionCapabilities.close` was
+advertised, issue `session/close` and wait at most **5 seconds**. If either
+bound expires, close stdin/stdout, TERM the ACP process group, wait **5
+seconds**, then KILL if still alive. Record all timeout/exit/signal facts; no
+late response is a completion. This is transport cleanup, not authority.
 
 The future transport-facing interfaces are `AcpProcessFact` (pid/exit/signal,
 timeout, stderr availability), `AcpPromptFact` (request/session/prompt ids,
@@ -65,8 +78,9 @@ their authority.
 
 ## Completion, failures, and recovery
 
-`end_turn` without an error-severity AIR failure is only a **completion
-candidate**, not an NC outcome. `cancelled`, `refusal`, `max_tokens`,
+Only a schema-valid, correlated successful prompt response with `end_turn` and
+no error-severity AIR update is a **completion candidate**, not an NC outcome.
+`cancelled`, `refusal`, `max_tokens`,
 `max_turn_requests`, and every unknown stop reason are non-completions. A
 JSON-RPC error is a transport failure, likewise non-completion. A valid
 successful prompt candidate is correlated with the independently parsed
@@ -80,8 +94,9 @@ generic AIR record, omitted severity is conservatively `error`, as the tagged
 source does ([failure construction source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexEventHandler.ts)). Terminal failures occur at
 `PromptResponse._meta.jetbrains.air.sessionFailure`; recoverable warnings occur
 in `session/update` `params.update._meta.jetbrains.air.sessionFailure` before a
-later prompt result. Revisions update the same failure id; recovery needs a
-later supported successful prompt, never an assumed reset.
+later prompt result. Retain every AIR record in observation order, including
+`id` and `revision`; revisions update the same id. Recovery is represented by a
+later revision plus a valid supported successful prompt, never an assumed reset.
 
 Conservative lossy mapping: the Codex `quota_exhausted` kind is emitted as
 `limit` with no actions, and is only an unknown quota/account condition;

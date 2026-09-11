@@ -38,22 +38,24 @@ def prompt_fact(wire):
         "request_id": prompt_request["id"],
         "session_id": prompt_request["params"]["sessionId"],
         "prompt_id": prompt_request["id"],
+        "prompt_response_valid": "result" in prompt_response,
         "stop_reason": prompt_response.get("result", {}).get("stopReason"),
+        "session_failures": [],
     }
     if "error" in prompt_response:
         fact["jsonrpc_error"] = prompt_response["error"]
     terminal = air_failure(prompt_response.get("result", {}))
+    if terminal is not None and not isinstance(terminal, dict):
+        fact["prompt_response_valid"] = False
     updates = [item for item in wire["wire"] if item.get("method") == "session/update"]
     for update in updates:
         assert update["params"]["sessionId"] == fact["session_id"]
         assert wire["wire"].index(update) < wire["wire"].index(prompt_response)
     failures = [air_failure(update["params"]["update"]) for update in updates]
-    failures = [failure for failure in failures if failure is not None]
+    failures = [failure for failure in failures if isinstance(failure, dict)]
     if terminal is not None:
         failures.append(terminal)
-    if failures:
-        assert len(failures) == 1
-        fact["session_failure"] = failures[0]
+    fact["session_failures"] = failures
     return fact
 
 
@@ -70,6 +72,7 @@ def prompt_fact(wire):
         ("acp-request.synthetic.json", False),
         ("acp-cancelled.synthetic.json", False),
         ("acp-malformed-meta.synthetic.json", False),
+        ("acp-revision-recovery.synthetic.json", True),
     ],
 )
 def test_synthetic_acp_wire_fixture_shape(name, candidate):
@@ -80,16 +83,27 @@ def test_synthetic_acp_wire_fixture_shape(name, candidate):
         "version": 1, "capabilities": ["sessionFailure"],
     }
     initialize_response = event(wire, request_id=initialize["id"])
+    assert initialize_response["result"]["_meta"]["jetbrains"]["air"] == {
+        "version": 1, "capabilities": ["sessionFailure", "agentFileChangeReport",
+        "nativeSubagentSessions", "asyncTasks", "recommendedValue"],
+    }
     assert "sessionFailure" not in initialize_response["result"]["agentCapabilities"].get("_meta", {})
     session = event(wire, method="session/new")
-    assert event(wire, request_id=session["id"])["result"]["sessionId"] == session["params"]["sessionId"]
+    assert set(session["params"]) == {"cwd", "mcpServers"}
+    session_response = event(wire, request_id=session["id"])["result"]
+    assert isinstance(session_response["sessionId"], str)
+    assert session_response["sessionId"] != session["id"]
+    if name == "acp-success.synthetic.json":
+        config_calls = [item for item in wire["wire"] if item.get("method") == "session/set_config_option"]
+        assert [(call["params"]["configId"], call["params"]["value"]) for call in config_calls] == [
+            ("model", "configured"), ("mode", "agent"),
+        ]
+        assert all(call["params"]["sessionId"] == session_response["sessionId"] for call in config_calls)
     fact = prompt_fact(wire)
-    failure = fact.get("session_failure")
+    failures = fact["session_failures"]
     if name == "acp-malformed-meta.synthetic.json":
-        assert not isinstance(failure, dict)
-        fact.pop("session_failure", None)
-        fact["jsonrpc_error"] = {"code": "malformed_air"}
-    elif failure is not None:
+        assert not failures
+    for failure in failures:
         assert failure["category"] in VALID_CATEGORIES
         assert failure["severity"] in {"warning", "error"}
         assert isinstance(failure["actions"], list)
@@ -98,14 +112,22 @@ def test_synthetic_acp_wire_fixture_shape(name, candidate):
 
 def test_emitted_failure_shape_and_quota_mapping_are_not_invented():
     quota = prompt_fact(json.loads((FIXTURES / "acp-quota.synthetic.json").read_text()))
-    assert quota["session_failure"] == {
+    assert quota["session_failures"] == [{
         "id": "p4:error", "revision": 1, "category": "limit", "severity": "error",
         "title": "Quota exhausted", "actions": [],
-    }
+    }]
+
+
+def test_air_revisions_are_ordered_and_recovery_needs_a_valid_success():
+    fact = prompt_fact(json.loads((FIXTURES / "acp-revision-recovery.synthetic.json").read_text()))
+    assert [(item["id"], item["revision"]) for item in fact["session_failures"]] == [
+        ("p11:retry", 1), ("p11:retry", 2),
+    ]
+    assert is_completion_candidate(fact)
 
 
 def test_generic_air_failure_without_severity_is_conservatively_terminal():
     assert not is_completion_candidate({
         "request_id": "p", "session_id": "s", "prompt_id": "p", "stop_reason": "end_turn",
-        "session_failure": {"category": "unknown"},
+        "prompt_response_valid": True, "session_failures": [{"category": "unknown"}],
     })

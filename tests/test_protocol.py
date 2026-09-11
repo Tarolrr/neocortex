@@ -38,13 +38,17 @@ def test_critic_verdict_is_normalised(tmp_path):
         protocol.DONE, "rework", ["criterion 2 unmet"])
 
 
-def test_long_fields_are_truncated(tmp_path):
+def test_long_fields_are_preserved(tmp_path):
+    findings = [f"finding {number}: " + "y" * 9000 for number in range(25)]
     path = write(tmp_path, json.dumps({"outcome": "DONE", "summary": "x" * 9000,
-                                       "findings": ["y" * 9000] * 50}))
+                                       "memo": "memo\n" + "m" * 9000,
+                                       "question": "question " + "q" * 9000,
+                                       "findings": findings}))
     outcome = protocol.read_outcome(path)
-    assert len(outcome.summary) == 2000
-    assert len(outcome.findings) == 20
-    assert all(len(f) == 500 for f in outcome.findings)
+    assert outcome.summary == "x" * 9000
+    assert outcome.memo == "memo\n" + "m" * 9000
+    assert outcome.question == "question " + "q" * 9000
+    assert outcome.findings == findings
 
 
 def test_contract_renders_with_path():

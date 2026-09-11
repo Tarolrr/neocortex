@@ -97,9 +97,9 @@ def bullets(items: list[str], empty: str = "(none)") -> str:
 
 
 def memo_section(memo: str) -> str:
-    if not memo.strip():
+    if not memo:
         return ""
-    return f"## Your memo from the previous turn\n{memo.strip()}\n\n"
+    return f"## Your memo from the previous turn\n{memo}\n\n"
 
 
 def inbox_section(messages: list[str]) -> str:

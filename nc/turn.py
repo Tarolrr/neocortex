@@ -36,7 +36,7 @@ def _inbox_lines(state: State, agent_id: str) -> tuple[list[str], list[int]]:
             )
         else:
             lines.append(f"{msg['kind']} from {msg['sender']}: "
-                         f"{json.dumps(payload, ensure_ascii=False)[:800]}")
+                         f"{json.dumps(payload, ensure_ascii=False)}")
         ids.append(int(msg["id"]))
     return lines, ids
 

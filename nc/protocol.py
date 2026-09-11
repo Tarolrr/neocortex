@@ -75,12 +75,15 @@ def read_outcome(path: Path) -> Outcome:
         findings = [str(findings)]
     return Outcome(
         kind=kind,
-        summary=str(data.get("summary", ""))[:2000],
-        memo=str(data.get("memo", ""))[:2000],
+        # These fields become durable state and recipient-visible messages.
+        # Do not confuse their authoritative payload with bounded host
+        # diagnostics elsewhere in the scheduler.
+        summary=str(data.get("summary", "")),
+        memo=str(data.get("memo", "")),
         to=str(data.get("to", "owner")),
-        question=str(data.get("question", ""))[:2000],
+        question=str(data.get("question", "")),
         verdict=str(data.get("verdict", "")).lower(),
-        findings=[str(f)[:500] for f in findings][:20],
+        findings=[str(f) for f in findings],
         raw=data,
     )
 

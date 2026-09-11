@@ -103,21 +103,45 @@ def _integer(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def _usage_integer(value: dict[object, object], camel: str, snake: str) -> tuple[bool, int | None]:
+    """Read one aliased usage field without letting one spelling hide another."""
+    present = [key for key in (camel, snake) if key in value]
+    if not present:
+        return False, None
+    raw = [value[key] for key in present]
+    if len(raw) == 2 and raw[0] != raw[1]:
+        return True, None
+    return True, _integer(raw[0])
+
+
 def _usage(value: object) -> AcpUsage | None:
     """Decode one complete structured usage report, never notification totals."""
     if not isinstance(value, dict):
         return None
-    get = lambda camel, snake: value.get(camel, value.get(snake))
-    input_tokens = _integer(get("inputTokens", "input_tokens"))
-    output_tokens = _integer(get("outputTokens", "output_tokens"))
-    cached = _integer(get("cachedInputTokens", "cached_input_tokens"))
-    total = _integer(get("totalTokens", "total_tokens"))
-    if total is None:
+    input_present, input_tokens = _usage_integer(value, "inputTokens", "input_tokens")
+    output_present, output_tokens = _usage_integer(value, "outputTokens", "output_tokens")
+    cached_present, cached = _usage_integer(value, "cachedInputTokens", "cached_input_tokens")
+    total_present, total = _usage_integer(value, "totalTokens", "total_tokens")
+    # Input and output are the complete pinned report.  Optional cache and
+    # total fields must also be valid when provided: a malformed partial report
+    # is unknown, not a report with conveniently omitted pieces.
+    if (not input_present or input_tokens is None or not output_present or output_tokens is None
+            or (cached_present and cached is None) or (total_present and total is None)):
+        return None
+    if not total_present:
         # Cached input is normally a subset of input, so it is not added.
-        if input_tokens is None or output_tokens is None:
-            return None
         total = input_tokens + output_tokens
     return AcpUsage(input_tokens, output_tokens, cached, total)
+
+
+def _jsonrpc_error(value: object) -> str | None:
+    """Return a sanitized JSON-RPC error message only for a valid error object."""
+    if not isinstance(value, dict):
+        return None
+    code, message = value.get("code"), value.get("message")
+    if not isinstance(code, int) or isinstance(code, bool) or not isinstance(message, str):
+        return None
+    return _diagnostic(message)
 
 
 def _failure(value: object) -> tuple[AirFailureEvidence | None, str | None]:
@@ -166,8 +190,9 @@ def decode_acp_prompt_result(
     if ("result" in response) == ("error" in response):
         return AcpPromptResult("protocol_invalid", None, "prompt response must have exactly one result or error", (), None)
     if "error" in response:
-        error = response["error"]
-        message = _diagnostic(error.get("message") if isinstance(error, dict) else "")
+        message = _jsonrpc_error(response["error"])
+        if message is None:
+            return AcpPromptResult("protocol_invalid", None, "prompt error is invalid", (), None)
         return AcpPromptResult("failed", None, message or "JSON-RPC prompt error", (), None)
     result = response["result"]
     if not isinstance(result, dict):

@@ -117,6 +117,40 @@ def test_wire_air_update_version_is_validated_without_a_failure():
     assert decode_acp_prompt_result(wire, request_id="p", session_id="s").kind == "protocol_invalid"
 
 
+@pytest.mark.parametrize("usage", [
+    {"inputTokens": "bad", "outputTokens": 2, "totalTokens": 5},
+    {"inputTokens": 2, "totalTokens": 5},
+    {"inputTokens": 2, "outputTokens": 3, "cachedInputTokens": "bad"},
+    {"inputTokens": 2, "outputTokens": 3, "totalTokens": "bad"},
+    {"inputTokens": 2, "input_tokens": 3, "outputTokens": 3},
+])
+def test_malformed_or_incomplete_usage_is_unknown(usage):
+    wire = [{"id": "p", "result": {"stopReason": "end_turn", "usage": usage}}]
+    result = decode_acp_prompt_result(wire, request_id="p", session_id="s")
+    assert result.kind == "success" and result.usage is None
+
+
+def test_matching_usage_aliases_are_a_complete_report():
+    wire = [{"id": "p", "result": {"stopReason": "end_turn", "usage": {
+        "inputTokens": 2, "input_tokens": 2, "outputTokens": 3, "output_tokens": 3,
+    }}}]
+    result = decode_acp_prompt_result(wire, request_id="p", session_id="s")
+    assert result.usage and result.usage.total_tokens == 5
+
+
+@pytest.mark.parametrize("error", ["bad", {}, {"code": "bad", "message": "x"},
+                                  {"code": -1, "message": None}])
+def test_malformed_jsonrpc_error_is_protocol_invalid(error):
+    result = decode_acp_prompt_result([{"id": "p", "error": error}], request_id="p", session_id="s")
+    assert result.kind == "protocol_invalid"
+
+
+def test_valid_jsonrpc_error_is_failed():
+    result = decode_acp_prompt_result([{"id": "p", "error": {"code": -32000, "message": "nope"}}],
+                                      request_id="p", session_id="s")
+    assert result.kind == "failed" and result.diagnostic == "nope"
+
+
 def test_unsupported_wire_version_with_warning_cannot_be_success():
     wire = [{"id": "p", "result": {"stopReason": "end_turn", "_meta": {"jetbrains": {"air": {
         "version": 2, "sessionFailure": {"id": "p:warning", "revision": 1,

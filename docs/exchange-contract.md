@@ -10,6 +10,31 @@ is an execution-record closure, not logical-work restoration.
 
 SQLite (`SCHEMA`/ `State`, `nc/state.py`) is durable truth. `runs/<agent>_<stamp>/outcome.json` is agent-owned, one object per execution, parsed by `protocol.read_outcome` in `turn.run_turn`, `run_planner_turn`, and `run_plan_critic_turn`. Its parsed fields are `outcome`, `summary`, `memo`, `to`, `question`, `verdict`, `findings`; raw planner `proposal` and plan-critic `recommendation` are role-validated later. Missing/malformed/non-object/unknown outcome becomes synthetic `NO_OUTCOME` in a `run`, not a message. Run files/logs are outside SQLite history.
 
+### Payload fidelity in current handoffs
+
+`protocol.read_outcome` preserves complete parsed `summary`, `memo`, `question`,
+and findings in their original list order. This is necessary because `raw` and
+session logs are diagnostic evidence, not the durable source a later recipient
+reads. `Scheduler._apply_verdict` writes the complete critic summary/findings to
+a `review_verdict` through `State.send`; `_rework` does the same for arbiter
+findings. `State.send` stores the full Unicode JSON payload with its existing
+message ID, route, order, and delivery flag. Worker briefs render those verdicts
+and generic inbox payloads in full; generic payload rendering is JSON inline
+with `ensure_ascii=False`, so Unicode is not escaped and embedded newlines remain
+represented in the JSON value. Memo sections retain their full stored text.
+Planner briefs retain full durable feedback/revision records and render their
+decoded string content verbatim as well, so embedded newlines are actionable
+text rather than JSON escape sequences. Plan-critic findings/recommendation
+persist directly in `plan_review`.
+
+The short text slices used in scheduler incidents and host diagnostics remain
+bounded display/diagnostic fields; they are not the only source of actionable
+content. Explicit transport rejection protections are likewise unchanged.
+Content discarded by older versions cannot be reconstructed from historical
+rows or logs; this behavior preserves newly processed payloads and does not
+rewrite history. Host failures still retain the prior memo and undelivered inbox
+rather than treating a partial or failed session as delivery.
+
 | Record | Producer -> consumer | Ownership and lifecycle |
 | --- | --- | --- |
 | `message` | `State.send`/`planner_feedback`/`cancel_task`, scheduler and owner operations -> briefs, owner inbox, handlers | State owns id, sender/recipient/task/reply link, JSON payload, `delivered`, timestamp. Delivery means inbox consumption only, not domain application. |

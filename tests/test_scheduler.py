@@ -489,6 +489,60 @@ def test_rework_verdict_reopens_the_task_with_findings(setup):
     assert "must end with a newline" in scheduler.adapter.briefs[2]
 
 
+def test_critic_findings_survive_rework_persistence_reopen_and_worker_brief(setup):
+    """The verdict message, rather than Outcome.raw, is the worker handoff."""
+    cfg, state, _repo = setup
+    tid = state.add_task("neocortex", "add marker", "create marker.txt", [])
+    summary = "review summary — " + "s" * 9000 + " SUMMARY-TAIL"
+    findings = [f"finding {number} — " + "f" * 9000 + f" FINDING-TAIL-{number}"
+                for number in range(23)]
+    scheduler = sched(cfg, state, [
+        commit_and_emit("marker.txt", "hi\n", {"outcome": "DONE", "summary": "done"}),
+        emit({"outcome": "DONE", "verdict": "rework", "summary": summary,
+              "findings": findings}),
+    ])
+
+    assert scheduler.step() == protocol.DONE
+    assert scheduler.step() == protocol.DONE
+    verdict = state.one("SELECT payload FROM message WHERE kind='review_verdict'")
+    assert json.loads(verdict["payload"]) == {
+        "verdict": "rework", "summary": summary, "findings": findings,
+    }
+
+    # A later worker reads the durable message, not the critic outcome file.
+    state.db.close()
+    reopened = State(cfg.db_path)
+    try:
+        worker = reopened.one("SELECT * FROM agent WHERE id=?", (f"worker-{tid}",))
+        brief, ids = turn.build_brief(reopened, cfg, worker, cfg.work_dir / tid,
+                                      f"nc/{tid}", cfg.runs_dir / "outcome.json")
+        assert ids
+        assert summary in brief
+        assert findings[0] in brief and findings[-1] in brief
+        assert "FINDING-TAIL-22" in brief
+    finally:
+        reopened.db.close()
+
+
+def test_long_ask_memo_and_generic_owner_feedback_are_rendered_in_full(setup):
+    cfg, state, _repo = setup
+    tid = state.add_task("neocortex", "add marker", "create marker.txt", [])
+    question = "Need scope 🌍\n" + "q" * 9000 + " QUESTION-TAIL"
+    memo = "Continue with Unicode ✓\n" + "m" * 9000 + " MEMO-TAIL"
+    scheduler = sched(cfg, state, [emit({"outcome": "ASK", "to": "owner",
+                                         "question": question, "memo": memo})])
+    assert scheduler.step() == protocol.ASK
+    owner_question = json.loads(state.inbox("owner")[0]["payload"])
+    assert owner_question["question"] == question
+    worker = state.one("SELECT * FROM agent WHERE id=?", (f"worker-{tid}",))
+    feedback = "Owner says: café\n" + "o" * 9000 + " FEEDBACK-TAIL"
+    state.send(protocol.FEEDBACK, "owner", worker["id"], {"text": feedback})
+    brief, _ = turn.build_brief(state, cfg, worker, cfg.work_dir / tid, f"nc/{tid}",
+                                cfg.runs_dir / "outcome.json")
+    assert memo in brief
+    assert json.dumps({"text": feedback}, ensure_ascii=False) in brief
+
+
 def test_ask_suspends_the_agent_until_the_owner_answers(setup):
     cfg, state, _repo = setup
     tid = state.add_task("neocortex", "add marker", "create marker.txt", [])
@@ -914,6 +968,40 @@ def test_planner_brief_includes_state(setup):
                   "Waiting for accepted dependencies"):
         assert value in brief
     assert ids == [mid]
+
+
+def test_planner_feedback_and_plan_critic_advice_preserve_long_content(setup):
+    cfg, state, _repo = setup
+    feedback = "Planner feedback λ\n" + "p" * 9000 + " PLANNER-TAIL"
+    aid, _ = state.planner_feedback("neocortex", feedback, cfg.model_for("planner"))
+    planner, _ = turn.build_planner_brief(
+        state, state.one("SELECT * FROM agent WHERE id=?", (aid,)), cfg.runs_dir / "outcome.json",
+    )
+    assert feedback in planner
+
+    proposal = state.add_proposal("neocortex", "planner", "rationale", [planner_spec()])
+    row = state.one("SELECT * FROM proposal WHERE id=?", (proposal,))
+    findings = [f"plan finding {number}\n" + "z" * 9000 + f" PLAN-TAIL-{number}"
+                for number in range(23)]
+    recommendation = "Recommendation ✓\n" + "r" * 9000 + " RECOMMENDATION-TAIL"
+    adapter = ScriptedAdapter([emit({"outcome": "DONE", "findings": findings,
+                                    "recommendation": recommendation})])
+    adapter.run_planner = adapter.run
+    assert turn.run_plan_critic_turn(state, cfg, row, adapter).kind == protocol.DONE
+    review = state.one("SELECT findings, recommendation FROM plan_review")
+    assert json.loads(review["findings"]) == findings
+    assert review["recommendation"] == recommendation
+
+    original = state.add_proposal("neocortex", "planner", "old rationale", [planner_spec()])
+    revision_text = "Revision feedback Ω\n" + "v" * 9000 + " REVISION-TAIL"
+    revision_agent, _ = state.planner_feedback(
+        None, revision_text, cfg.model_for("planner"), proposal_id=original,
+    )
+    revision_brief, _ = turn.build_planner_brief(
+        state, state.one("SELECT * FROM agent WHERE id=?", (revision_agent,)),
+        cfg.runs_dir / "outcome.json",
+    )
+    assert revision_text in revision_brief
 
 
 @pytest.mark.parametrize('verdict', ['pass', 'reject', 'rework'])

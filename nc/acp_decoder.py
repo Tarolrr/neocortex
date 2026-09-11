@@ -7,6 +7,7 @@ text nor makes policy decisions.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -70,7 +71,32 @@ def _diagnostic(value: object) -> str:
     if not isinstance(value, str):
         return ""
     # Keep diagnostics useful in a database/UI without accepting terminal control text.
-    return " ".join("".join(c for c in value if c >= " " or c in "\n\t").split())[:_MAX_DIAGNOSTIC]
+    text = "".join(c for c in value if c >= " " or c in "\n\t")
+    # AIR diagnostics are untrusted provider data.  Keep this local rather
+    # than importing the adapter so the decoder remains an isolated pure fact
+    # parser; the patterns intentionally match the host's diagnostic boundary.
+    text = re.sub(r"(?i)\b(bearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
+    text = re.sub(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", text)
+    text = re.sub(
+        r"(?i)\b([\"']?(?:(?:[a-z][a-z0-9]*_)+)?(?:api[_ -]?key|access[_ -]?token|"
+        r"authorization|password|secret|token|client[_ -]?secret|"
+        r"secret[_ -]?access[_ -]?key)[\"']?)\s*([=:])\s*"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)",
+        r"\1\2[REDACTED]", text,
+    )
+    return " ".join(text.split())[:_MAX_DIAGNOSTIC]
+
+
+def _air_version_problem(value: object) -> str | None:
+    """Validate an observed AIR envelope, even if it has no failure."""
+    if not isinstance(value, dict):
+        return "AIR extension envelope is not an object"
+    version = value.get("version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        return "AIR extension version is invalid"
+    if version != 1:
+        return "unsupported AIR extension version"
+    return None
 
 
 def _integer(value: object) -> int | None:
@@ -132,8 +158,6 @@ def decode_acp_prompt_result(
     considered.  Duplicate equal revisions are ignored; a lower revision is
     stale, while divergent duplicate revisions are protocol-invalid.
     """
-    if air_version != 1:
-        return AcpPromptResult("protocol_invalid", None, "unsupported AIR extension version", (), None)
     responses = [item for item in wire if isinstance(item, dict) and item.get("id") == request_id
                  and "method" not in item]
     if len(responses) != 1:
@@ -149,8 +173,13 @@ def decode_acp_prompt_result(
     if not isinstance(result, dict):
         return AcpPromptResult("protocol_invalid", None, "prompt result is not an object", (), None)
     stop_reason = result.get("stopReason")
+    usage = _usage(result.get("usage"))
     if not isinstance(stop_reason, str):
-        return AcpPromptResult("protocol_invalid", None, "prompt stopReason is invalid", (), _usage(result.get("usage")))
+        return AcpPromptResult("protocol_invalid", None, "prompt stopReason is invalid", (), usage)
+    # A caller's negotiated profile is still an input fact, but do not discard
+    # independently received terminal data when it is unsupported.
+    if air_version != 1:
+        return AcpPromptResult("protocol_invalid", stop_reason, "unsupported AIR extension version", (), usage)
     response_index = next(index for index, item in enumerate(wire) if item is response)
     raw_failures: list[object] = []
     for item in wire[:response_index]:
@@ -159,6 +188,10 @@ def decode_acp_prompt_result(
         params = item.get("params")
         if isinstance(params, dict) and params.get("sessionId") == session_id:
             update = params.get("update")
+            if _has(update, "_meta", "jetbrains", "air"):
+                problem = _air_version_problem(_at(update, "_meta", "jetbrains", "air"))
+                if problem:
+                    return AcpPromptResult("protocol_invalid", stop_reason, problem, (), usage)
             if _has(update, "_meta", "jetbrains", "air", "sessionFailure"):
                 failure = _at(update, "_meta", "jetbrains", "air", "sessionFailure")
                 # A well-formed incident for another prompt is not evidence for this one.
@@ -167,30 +200,32 @@ def decode_acp_prompt_result(
                         raw_failures.append(failure)
                 else:
                     return AcpPromptResult("protocol_invalid", stop_reason,
-                                           "malformed correlated AIR update", (),
-                                           _usage(result.get("usage")))
+                                           "malformed correlated AIR update", (), usage)
+    if _has(result, "_meta", "jetbrains", "air"):
+        problem = _air_version_problem(_at(result, "_meta", "jetbrains", "air"))
+        if problem:
+            return AcpPromptResult("protocol_invalid", stop_reason, problem, (), usage)
     terminal = _at(result, "_meta", "jetbrains", "air", "sessionFailure")
     if _has(result, "_meta", "jetbrains", "air", "sessionFailure"):
         if not isinstance(terminal, dict) or not isinstance(terminal.get("id"), str) or not terminal["id"].startswith(request_id + ":"):
             return AcpPromptResult("protocol_invalid", stop_reason,
                                    "terminal AIR failure identity conflicts with prompt", (),
-                                   _usage(result.get("usage")))
+                                   usage)
         raw_failures.append(terminal)
     failures: dict[str, AirFailureEvidence] = {}
     for raw in raw_failures:
         evidence, problem = _failure(raw)
         if problem:
-            return AcpPromptResult("protocol_invalid", stop_reason, problem, tuple(failures.values()), _usage(result.get("usage")))
+            return AcpPromptResult("protocol_invalid", stop_reason, problem, tuple(failures.values()), usage)
         assert evidence is not None
         old = failures.get(evidence.incident_id)
         if old is not None and evidence.revision == old.revision:
             if evidence != old:
-                return AcpPromptResult("protocol_invalid", stop_reason, "conflicting AIR failure revision", tuple(failures.values()), _usage(result.get("usage")))
+                return AcpPromptResult("protocol_invalid", stop_reason, "conflicting AIR failure revision", tuple(failures.values()), usage)
             continue
         if old is None or evidence.revision > old.revision:
             failures[evidence.incident_id] = evidence
     evidence = tuple(failures.values())
-    usage = _usage(result.get("usage"))
     if stop_reason == "cancelled":
         return AcpPromptResult("cancelled", stop_reason, None, evidence, usage)
     if stop_reason != "end_turn":

@@ -7,9 +7,9 @@ text nor makes policy decisions.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, Sequence
-
+from typing import Literal
 
 ResultKind = Literal["success", "failed", "cancelled", "protocol_invalid"]
 _KNOWN_CATEGORIES = {"connection", "access", "limit", "request", "service", "unknown"}

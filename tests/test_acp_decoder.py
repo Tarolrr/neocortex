@@ -7,7 +7,6 @@ import pytest
 
 from nc.acp_decoder import decode_acp_prompt_result
 
-
 FIXTURES = Path(__file__).parent / "fixtures"
 
 

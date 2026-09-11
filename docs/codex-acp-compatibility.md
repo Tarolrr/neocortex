@@ -74,8 +74,9 @@ seconds**, then KILL if still alive. Record all timeout/exit/signal facts; no
 late response is a completion. This is transport cleanup, not authority.
 
 The future transport-facing interfaces are `AcpProcessFact` (pid/exit/signal,
-timeout, stderr availability), `AcpPromptFact` (request/session/prompt ids,
-lossless JSON-RPC result/error, raw AIR observations and validated AIR updates),
+stderr availability, and ordered `timeout_phases`), `AcpPromptFact`
+(request/session/prompt ids, lossless JSON-RPC result/error, raw AIR
+observations and validated AIR updates),
 and `AcpCorrelation`
 (prompt fact plus one agent-authored `outcome.json`). They are facts: only the
 existing role parser decides DONE/ASK/YIELD/FAIL and only owner/arbiter retain
@@ -109,9 +110,18 @@ source does ([failure construction source](https://github.com/agentclientprotoco
 `PromptResponse._meta.jetbrains.air.sessionFailure`; recoverable warnings occur
 in `session/update` `params.update._meta.jetbrains.air.sessionFailure` before a
   later prompt result. Retain every raw AIR observation in observation order,
-including malformed values, alongside validated records with `id` and
-`revision`; revisions update the same id. Recovery is represented by a
-later revision plus a valid supported successful prompt, never an assumed reset.
+including malformed values, alongside only complete validated records. A
+validated record requires a nonempty string `id`, positive integer `revision`,
+known category/severity, string `title`, and an actions array containing only
+`retry`, `new_session`, or `login` (optional `details` is a string). Revisions
+update the same incident; they do **not** signal recovery. In 1.11.0, turn
+progress or a successful turn clears an active retry warning internally
+(`completeRetryIncidentOnTurnProgress`/`completeSuccessfulTurn`/`clearSessionFailure`)
+without emitting a synthetic “Recovered” revision. Thus recovery evidence is a
+warning followed by progress or success with that warning cleared, never an
+invented AIR clear/update. `timed_out` is true iff `timeout_phases` is nonempty;
+the ordered values record each expired `cancel_response`, `session_close`,
+`term_grace`, or `kill_grace` bound.
 
 Conservative lossy mapping: the Codex `quota_exhausted` kind is emitted as
 `limit` with no actions, and is only an unknown quota/account condition;
@@ -127,4 +137,5 @@ Fixtures in `tests/fixtures/acp-*.synthetic.json` are invented, attributed
 schema examples—not captured incidents. Each is JSON-RPC-shaped and correlates
 request ids with results; fixtures cover success, typed terminal `end_turn`,
 warning then success, quota-as-limit, retryable limit and service, access,
-request, cancellation, and malformed AIR metadata.
+request, cancellation, malformed AIR metadata, a same-incident revision, and
+retry recovery through turn progress (with no invented recovery revision).

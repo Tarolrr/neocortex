@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from nc.acp_contract import is_completion_candidate
+from nc.acp_contract import is_air_session_failure, is_completion_candidate
 
 FIXTURES = Path(__file__).parent / "fixtures"
 AIR = ("_meta", "jetbrains", "air", "sessionFailure")
@@ -56,10 +56,10 @@ def prompt_fact(wire):
     if terminal is not None:
         observations.append(terminal)
     # Invalid AIR metadata is terminal for completion but remains observable.
-    if any(not isinstance(value, dict) for value in observations):
+    if any(not is_air_session_failure(value) for value in observations):
         fact["prompt_response_valid"] = False
     fact["air_observations"] = observations
-    fact["session_failures"] = [value for value in observations if isinstance(value, dict)]
+    fact["session_failures"] = [value for value in observations if is_air_session_failure(value)]
     return fact
 
 
@@ -76,7 +76,6 @@ def prompt_fact(wire):
         ("acp-request.synthetic.json", False),
         ("acp-cancelled.synthetic.json", False),
         ("acp-malformed-meta.synthetic.json", False),
-        ("acp-revision-recovery.synthetic.json", True),
     ],
 )
 def test_synthetic_acp_wire_fixture_shape(name, candidate):
@@ -126,9 +125,14 @@ def test_synthetic_acp_wire_fixture_shape(name, candidate):
         assert fact["air_observations"] == ["invalid"]
         assert fact["jsonrpc_result"]["stopReason"] == "end_turn"
     for failure in failures:
+        assert is_air_session_failure(failure)
+        assert isinstance(failure["id"], str) and failure["id"]
+        assert isinstance(failure["revision"], int) and failure["revision"] > 0
         assert failure["category"] in VALID_CATEGORIES
         assert failure["severity"] in {"warning", "error"}
+        assert isinstance(failure["title"], str)
         assert isinstance(failure["actions"], list)
+        assert all(action in {"retry", "new_session", "login"} for action in failure["actions"])
     assert is_completion_candidate(fact) is candidate
 
 
@@ -140,12 +144,25 @@ def test_emitted_failure_shape_and_quota_mapping_are_not_invented():
     }]
 
 
-def test_air_revisions_are_ordered_and_recovery_needs_a_valid_success():
-    fact = prompt_fact(json.loads((FIXTURES / "acp-revision-recovery.synthetic.json").read_text()))
+def test_air_revisions_are_ordered_but_do_not_signal_recovery():
+    wire = json.loads((FIXTURES / "acp-revision-update.synthetic.json").read_text())
+    assert wire["attribution"] == "synthetic; not a captured incident"
+    fact = prompt_fact(wire)
     assert [(item["id"], item["revision"]) for item in fact["session_failures"]] == [
         ("p11:retry", 1), ("p11:retry", 2),
     ]
     assert is_completion_candidate(fact)
+
+
+def test_retry_recovery_is_turn_progress_then_success_without_air_clear_revision():
+    wire = json.loads((FIXTURES / "acp-retry-recovery.synthetic.json").read_text())
+    assert wire["attribution"] == "synthetic; not a captured incident"
+    updates = [item["params"]["update"] for item in wire["wire"]
+               if item.get("method") == "session/update"]
+    assert is_air_session_failure(air_failure(updates[0]))
+    assert updates[1]["sessionUpdate"] == "agent_message_chunk"
+    assert air_failure(updates[1]) is None
+    assert event(wire, request_id="p12")["result"]["stopReason"] == "end_turn"
 
 
 def test_generic_air_failure_without_severity_is_conservatively_terminal():
@@ -154,3 +171,23 @@ def test_generic_air_failure_without_severity_is_conservatively_terminal():
         "prompt_response_valid": True, "air_observations": [{"category": "unknown"}],
         "session_failures": [{"category": "unknown"}],
     })
+
+
+@pytest.mark.parametrize("malformed", [
+    {"severity": "warning"},
+    {"id": "x", "revision": 1, "category": "unknown", "severity": "warning",
+     "title": "x", "actions": ["owner_approve"]},
+])
+def test_malformed_air_dict_cannot_be_a_completion_candidate(malformed):
+    assert not is_completion_candidate({
+        "request_id": "p", "session_id": "s", "prompt_id": "p", "stop_reason": "end_turn",
+        "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+        "air_observations": [malformed], "session_failures": [malformed],
+    })
+
+
+def test_malformed_air_record_fixture_is_retained_but_non_completing():
+    fact = prompt_fact(json.loads((FIXTURES / "acp-malformed-air-record.synthetic.json").read_text()))
+    assert fact["air_observations"] == [{"severity": "warning"}]
+    assert fact["session_failures"] == []
+    assert not is_completion_candidate(fact)

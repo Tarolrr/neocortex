@@ -16,6 +16,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Self
 
 from .acp_stream import AcpDeadlineExpired, AcpEofError, AcpJsonRpcStream, AcpWriteError
 from .adapters import (
@@ -120,7 +121,7 @@ class AcpSubprocess:
             self.proc = subprocess.Popen(
                 list(command), cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, env=env, start_new_session=True,
-                preexec_fn=(lambda: _join_cgroup(self._cgroup)) if self._cgroup else None,
+                preexec_fn=(lambda: _join_cgroup(self._cgroup)) if self._cgroup else None,  # noqa: PLW1509 - containment before ACP exec
             )
             callback = _on_adapter_started.get()
             if callback is not None:
@@ -224,7 +225,7 @@ class AcpSubprocess:
         self.log_path.write_text(self.diagnostics + ("\n" if self.diagnostics else ""))
         _remove_cgroup(self._cgroup)
 
-    def __enter__(self) -> "AcpSubprocess":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:

@@ -50,10 +50,12 @@ def test_exit_and_live_stdout_eof_are_not_provider_or_success(tmp_path: Path) ->
         child.proc.wait(timeout=1)
         with pytest.raises(AcpUnexpectedExit, match="status 7"):
             child.transport_eof(AcpEofError("stdout EOF"))
-    with AcpSubprocess(helper("import os,time; os.close(1); time.sleep(2)"), cwd=tmp_path,
-                       deadline=time.monotonic() + 3, log_path=tmp_path / "log2") as child:
-        with pytest.raises(AcpTransportEof, match="transport EOF"):
-            child.transport_eof(AcpEofError("stdout EOF"))
+    with (
+        AcpSubprocess(helper("import os,time; os.close(1); time.sleep(2)"), cwd=tmp_path,
+                      deadline=time.monotonic() + 3, log_path=tmp_path / "log2") as child,
+        pytest.raises(AcpTransportEof, match="transport EOF"),
+    ):
+        child.transport_eof(AcpEofError("stdout EOF"))
 
 
 def test_close_kills_hung_session_group(tmp_path: Path) -> None:

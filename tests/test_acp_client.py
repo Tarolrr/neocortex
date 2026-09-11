@@ -122,11 +122,11 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
     with pytest.raises(error) as raised:
         run(tmp_path, scenario, timeout_s=.1 if scenario == "timeout" else 1)
     if scenario == "timeout":
-        assert getattr(raised.value, "timeout_phases") == (
+        assert raised.value.timeout_phases == (
             "prompt_deadline", "cancel_sent", "cancel_response", "close_response",
         )
-        assert getattr(raised.value, "process")["timed_out"] is True
-        assert "intentional shutdown" in getattr(raised.value, "shutdown")
+        assert raised.value.process["timed_out"] is True
+        assert "intentional shutdown" in raised.value.shutdown
 
 
 def test_restricted_policy_and_environment_are_explicit(tmp_path: Path) -> None:

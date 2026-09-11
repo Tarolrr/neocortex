@@ -7,7 +7,6 @@ import pytest
 
 from nc.acp_contract import is_completion_candidate
 
-
 FIXTURES = Path(__file__).parent / "fixtures"
 
 

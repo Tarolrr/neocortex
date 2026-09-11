@@ -22,10 +22,50 @@ from .proposals import check_proposal
 from .state import State
 
 
+def _decoded_payload(payload: str) -> object:
+    """Decode durable message JSON for a human brief without changing storage."""
+    return json.loads(payload)
+
+
+def _payload_for_brief(payload: object) -> str:
+    """Keep the JSON record and render every string leaf verbatim for agents.
+
+    JSON escaping is useful provenance, but it turns embedded newlines into the
+    two-character ``\\n`` sequence.  The verbatim rendering is therefore part
+    of the authoritative handoff, not a shortened display preview.
+    """
+    strings: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, str):
+            strings.append(value)
+        elif isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    record = json.dumps(payload, ensure_ascii=False)
+    if not strings:
+        return record
+    return f"{record}\nverbatim content:\n" + "\n".join(strings)
+
+
+def _message_for_brief(msg: sqlite3.Row) -> str:
+    payload = _decoded_payload(msg["payload"])
+    metadata = dict(msg)
+    metadata.pop("payload", None)
+    return (f"{msg['kind']} from {msg['sender']} (message #{msg['id']}):\n"
+            f"message metadata: {json.dumps(metadata, ensure_ascii=False)}\n"
+            f"{_payload_for_brief(payload)}")
+
+
 def _inbox_lines(state: State, agent_id: str) -> tuple[list[str], list[int]]:
     lines, ids = [], []
     for msg in state.inbox(agent_id):
-        payload = json.loads(msg["payload"])
+        payload = _decoded_payload(msg["payload"])
         if msg["kind"] == protocol.ANSWER:
             lines.append(f"answer from {msg['sender']}: {payload.get('answer', '')}")
         elif msg["kind"] == protocol.REVIEW_VERDICT:
@@ -35,8 +75,7 @@ def _inbox_lines(state: State, agent_id: str) -> tuple[list[str], list[int]]:
                 + (f" Findings: {findings}" if findings else "")
             )
         else:
-            lines.append(f"{msg['kind']} from {msg['sender']}: "
-                         f"{json.dumps(payload, ensure_ascii=False)}")
+            lines.append(_message_for_brief(msg))
         ids.append(int(msg["id"]))
     return lines, ids
 
@@ -112,10 +151,17 @@ def build_planner_brief(state: State, agent: sqlite3.Row,
         " ORDER BY updated_at DESC LIMIT 10", (project["id"],),
     )]
     revision = state.pending_revision(agent["id"])
+    feedback = "\n\n".join(_message_for_brief(message) for message in messages)
+    revision_data = dict(revision) if revision else None
+    revision_text = json.dumps(revision_data, ensure_ascii=False)
+    if revision_data is not None:
+        revision_text += "\nverbatim feedback content:\n" + _payload_for_brief(
+            _decoded_payload(revision_data["payload"])
+        )
     return roles.render(
         roles.PLANNER, project_id=project["id"], repo=str(repo), layout=layout,
-        revision=json.dumps(dict(revision) if revision else None, ensure_ascii=False),
-        feedback=json.dumps([dict(m) for m in messages], ensure_ascii=False),
+        revision=revision_text,
+        feedback=feedback,
         tasks=json.dumps(tasks, ensure_ascii=False),
         accepted=json.dumps(accepted, ensure_ascii=False),
         memo_section=roles.memo_section(agent["memo"]), outcome_path=str(outcome_path),

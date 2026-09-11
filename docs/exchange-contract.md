@@ -22,8 +22,10 @@ message ID, route, order, and delivery flag. Worker briefs render those verdicts
 and generic inbox payloads in full; generic payload rendering is JSON inline
 with `ensure_ascii=False`, so Unicode is not escaped and embedded newlines remain
 represented in the JSON value. Memo sections retain their full stored text.
-Planner briefs serialize their full durable feedback/revision messages, and
-plan-critic findings/recommendation persist directly in `plan_review`.
+Planner briefs retain full durable feedback/revision records and render their
+decoded string content verbatim as well, so embedded newlines are actionable
+text rather than JSON escape sequences. Plan-critic findings/recommendation
+persist directly in `plan_review`.
 
 The short text slices used in scheduler incidents and host diagnostics remain
 bounded display/diagnostic fields; they are not the only source of actionable

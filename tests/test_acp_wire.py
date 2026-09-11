@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 from nc import acp_wire
-from nc.acp_stream import AcpEofError
-from nc.acp_wire import AcpSubprocess, AcpTransportEof, AcpUnexpectedExit
+from nc.acp_stream import AcpDeadlineExpired, AcpEofError
+from nc.acp_wire import AcpLaunchError, AcpSubprocess, AcpTransportEof, AcpUnexpectedExit
 from nc.adapters import adapter_ownership
 
 
@@ -47,8 +47,33 @@ def test_ownership_callback_is_before_wire_and_failure_reaps(tmp_path: Path) -> 
         AcpSubprocess(helper("import time; time.sleep(30)"), cwd=tmp_path,
                       deadline=time.monotonic() + 2, log_path=tmp_path / "log")
     assert seen
-    # ``kill(pid, 0)`` is deliberately avoided: PID reuse would make this
-    # assertion less safe than checking Popen's reap in the implementation.
+    # The callback is invoked by the Popen parent.  ChildProcessError proves
+    # that Popen already reaped that exact child rather than merely killing it.
+    with pytest.raises(ChildProcessError):
+        os.waitpid(seen[0], os.WNOHANG)
+
+
+def test_launcher_failure_is_local_and_has_no_child(tmp_path: Path) -> None:
+    with pytest.raises(AcpLaunchError, match="launcher failure"):
+        AcpSubprocess(["definitely-not-an-acp-helper"], cwd=tmp_path,
+                      deadline=time.monotonic() + 1, log_path=tmp_path / "log")
+
+
+def test_stream_uses_total_deadline_for_hung_request(tmp_path: Path) -> None:
+    child = AcpSubprocess(
+        helper("import sys,time; sys.stdin.readline(); time.sleep(30)"), cwd=tmp_path,
+        deadline=time.monotonic() + 0.2, log_path=tmp_path / "log",
+    )
+    try:
+        with pytest.raises(AcpDeadlineExpired, match="deadline"):
+            child.stream().request("hung")
+    finally:
+        child.close()
+    for _ in range(20):
+        if child.proc.poll() is not None:
+            break
+        time.sleep(0.01)
+    assert child.proc.poll() is not None
 
 
 def test_exit_and_live_stdout_eof_are_not_provider_or_success(tmp_path: Path) -> None:
@@ -63,6 +88,33 @@ def test_exit_and_live_stdout_eof_are_not_provider_or_success(tmp_path: Path) ->
         pytest.raises(AcpTransportEof, match="transport EOF"),
     ):
         child.transport_eof(AcpEofError("stdout EOF"))
+
+
+def test_signal_exit_is_reported_as_local_process_evidence(tmp_path: Path) -> None:
+    code = "import os,signal; os.kill(os.getpid(), signal.SIGTERM)"
+    with AcpSubprocess(helper(code), cwd=tmp_path,
+                       deadline=time.monotonic() + 2, log_path=tmp_path / "log") as child:
+        child.proc.wait(timeout=1)
+        with pytest.raises(AcpUnexpectedExit, match="signal 15"):
+            child.check()
+
+
+def test_normal_reply_is_followed_by_cleanup_of_live_server(tmp_path: Path) -> None:
+    code = (
+        "import sys,time; sys.stdin.readline(); "
+        "print('{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}', flush=True); "
+        "time.sleep(30)"
+    )
+    child = AcpSubprocess(helper(code), cwd=tmp_path,
+                          deadline=time.monotonic() + 2, log_path=tmp_path / "log")
+    try:
+        assert child.stream().request("complete") == {
+            "jsonrpc": "2.0", "id": 1, "result": {},
+        }
+        assert child.proc.poll() is None
+    finally:
+        child.close()
+    assert child.proc.poll() is not None
 
 
 def test_close_kills_hung_session_group(tmp_path: Path) -> None:

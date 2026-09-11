@@ -115,6 +115,7 @@ class AcpSubprocess:
         self._stderr_limit = stderr_bytes
         self._stderr_done = threading.Event()
         self._closed = False
+        self.cleanup_uncertain = False
         self._cgroup = _adapter_cgroup()
         env = dict(os.environ, PATH=f"{Path.home()}/.local/bin:{os.environ.get('PATH', '')}")
         try:
@@ -129,13 +130,11 @@ class AcpSubprocess:
                     callback(self.proc.pid)
                 except BaseException:
                     self._terminate(force=True)
-                    try:
-                        self.proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
+                    if not self._wait_for_exit():
                         # Do not mask the ownership-recording error.  The
                         # cgroup deliberately remains evidence if containment
                         # itself is uncertain.
-                        pass
+                        self.cleanup_uncertain = True
                     for pipe in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
                         if pipe is not None:
                             try:
@@ -147,7 +146,8 @@ class AcpSubprocess:
             _remove_cgroup(self._cgroup)
             raise AcpLaunchError(f"ACP launcher failure: {sanitize_diagnostic(str(exc))}") from exc
         except BaseException:
-            _remove_cgroup(self._cgroup)
+            if not self.cleanup_uncertain:
+                _remove_cgroup(self._cgroup)
             raise
         assert self.proc.stdin and self.proc.stdout and self.proc.stderr
         self.reader = _PipeReader(self.proc.stdout, clock)
@@ -172,7 +172,10 @@ class AcpSubprocess:
 
     def stream(self, **kwargs: object) -> AcpJsonRpcStream:
         """Make the existing wire over this process's deadline-aware pipes."""
-        return AcpJsonRpcStream(self.reader, self.writer, clock=self._clock, **kwargs)
+        return AcpJsonRpcStream(
+            self.reader, self.writer, clock=self._clock,
+            default_deadline=self.deadline, **kwargs,
+        )
 
     def check(self) -> None:
         if self._clock() >= self.deadline:
@@ -203,6 +206,15 @@ class AcpSubprocess:
         except (ProcessLookupError, PermissionError):
             pass
 
+    def _wait_for_exit(self) -> bool:
+        """Reap only within the remaining total deadline and grace bound."""
+        timeout = min(self._grace, max(0.0, self.deadline - self._clock()))
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
     def close(self) -> None:
         """Boundedly close, terminate and reap; retained cgroup is survivor evidence."""
         if self._closed:
@@ -215,16 +227,18 @@ class AcpSubprocess:
                 except OSError:
                     pass
         self._terminate()
-        try:
-            self.proc.wait(timeout=min(self._grace, max(0.0, self.deadline - self._clock())))
-        except subprocess.TimeoutExpired:
+        if not self._wait_for_exit():
             self._terminate(force=True)
-            self.proc.wait()
-        self._stderr_done.wait(timeout=self._grace)
+            if not self._wait_for_exit():
+                self.cleanup_uncertain = True
+        self._stderr_done.wait(timeout=min(self._grace, max(0.0, self.deadline - self._clock())))
         self._drainer.join(timeout=0)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.write_text(self.diagnostics + ("\n" if self.diagnostics else ""))
-        _remove_cgroup(self._cgroup)
+        # A parent exit is not proof that the owned session/cgroup is empty.
+        # Leave cgroup evidence intact when forced reaping was not confirmed.
+        if not self.cleanup_uncertain:
+            _remove_cgroup(self._cgroup)
 
     def __enter__(self) -> Self:
         return self

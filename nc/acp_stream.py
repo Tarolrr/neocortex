@@ -149,6 +149,7 @@ class AcpJsonRpcStream:
         max_pending_requests: int = 64,
         max_diagnostics: int = 32,
         clock: Callable[[], float] = time.monotonic,
+        default_deadline: float | None = None,
         notification_handler: Callable[[dict[str, object]], None] | None = None,
         request_handler: Callable[[dict[str, object]], object] | None = None,
     ) -> None:
@@ -161,6 +162,9 @@ class AcpJsonRpcStream:
         self._max_message_bytes = max_message_bytes
         self._max_pending_requests = max_pending_requests
         self._clock = clock
+        # A process owner may impose one deadline on the complete connection.
+        # Individual callers can only make it sooner, never extend it.
+        self._default_deadline = default_deadline
         self._notification_handler = notification_handler
         self._request_handler = request_handler
         self._buffer = b""
@@ -182,6 +186,13 @@ class AcpJsonRpcStream:
             raise AcpCancelled("ACP operation cancelled")
         if deadline is not None and self._clock() >= deadline:
             raise AcpDeadlineExpired("ACP operation deadline expired")
+
+    def _bound_deadline(self, deadline: float | None) -> float | None:
+        if self._default_deadline is None:
+            return deadline
+        if deadline is None:
+            return self._default_deadline
+        return min(deadline, self._default_deadline)
 
     def _note(self, text: str) -> None:
         # Never retain a peer-controlled transcript without a fixed bound.
@@ -311,6 +322,7 @@ class AcpJsonRpcStream:
         *, request_id: JsonId | None = None,
         deadline: float | None = None, cancelled: Callable[[], bool] | None = None,
     ) -> JsonId:
+        deadline = self._bound_deadline(deadline)
         _validate_outbound_method_params(method, params)
         if len(self._pending) >= self._max_pending_requests:
             raise AcpPendingLimit("too many pending ACP requests")
@@ -334,6 +346,7 @@ class AcpJsonRpcStream:
         self, method: str, params: dict[str, object] | list[object] | None = None,
         *, deadline: float | None = None,
     ) -> None:
+        deadline = self._bound_deadline(deadline)
         _validate_outbound_method_params(method, params)
         message: dict[str, object] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
@@ -395,6 +408,7 @@ class AcpJsonRpcStream:
         self, *, deadline: float | None = None, cancelled: Callable[[], bool] | None = None,
     ) -> AcpMessage:
         """Read and dispatch exactly one peer frame, including peer requests."""
+        deadline = self._bound_deadline(deadline)
         raw = self._read_frame(deadline, cancelled)
         if len(raw) > self._max_message_bytes:
             raise AcpMalformedFrame("ACP frame exceeds message limit")
@@ -424,6 +438,7 @@ class AcpJsonRpcStream:
         cancelled: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         """Pump interleaved traffic until the exact host request has a response."""
+        deadline = self._bound_deadline(deadline)
         if request_id not in self._pending:
             raise ValueError("request id is not pending")
         while self._pending[request_id] is None:
@@ -438,6 +453,7 @@ class AcpJsonRpcStream:
         cancelled: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         """Send one host request and wait while servicing all interleaved traffic."""
+        deadline = self._bound_deadline(deadline)
         request_id = self.send_request(
             method, params, request_id=request_id, deadline=deadline, cancelled=cancelled,
         )

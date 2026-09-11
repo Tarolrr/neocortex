@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -88,6 +89,61 @@ def test_pipe_cancellation_remains_distinct_from_deadline_or_write_failure(tmp_p
             child.writer.flush_with_deadline(time.monotonic() + 1, lambda: True)
     finally:
         child.close()
+
+
+def test_full_stdin_pipe_expires_at_total_deadline_and_is_reaped(tmp_path: Path) -> None:
+    """A large frame cannot make the raw pipe write block past its deadline."""
+    child = AcpSubprocess(
+        helper("import time; time.sleep(30)"), cwd=tmp_path,
+        deadline=time.monotonic() + 0.15, log_path=tmp_path / "log", grace_s=0.05,
+    )
+    try:
+        started = time.monotonic()
+        with pytest.raises(AcpDeadlineExpired, match="deadline"):
+            child.stream().send_request("blocked", {"payload": "x" * 128_000})
+        assert time.monotonic() - started < 0.8
+    finally:
+        child.close()
+    assert child.proc.returncode is not None
+
+
+def test_pipe_cancellation_interrupts_started_read_and_write(tmp_path: Path) -> None:
+    """Cancellation is polled while a pipe is idle/full, not just on entry."""
+    reader_child = AcpSubprocess(
+        helper("import time; time.sleep(30)"), cwd=tmp_path,
+        deadline=time.monotonic() + 2, log_path=tmp_path / "read.log", grace_s=0.05,
+    )
+    cancelled = threading.Event()
+    timer = threading.Timer(0.05, cancelled.set)
+    try:
+        timer.start()
+        with pytest.raises(AcpCancelled, match="cancelled"):
+            reader_child.reader.read_with_deadline(
+                1, time.monotonic() + 1, cancelled.is_set,
+            )
+    finally:
+        timer.cancel()
+        timer.join()
+        reader_child.close()
+
+    writer_child = AcpSubprocess(
+        helper("import time; time.sleep(30)"), cwd=tmp_path,
+        deadline=time.monotonic() + 2, log_path=tmp_path / "write.log", grace_s=0.05,
+    )
+    cancelled = threading.Event()
+    timer = threading.Timer(0.05, cancelled.set)
+    try:
+        timer.start()
+        with pytest.raises(AcpCancelled, match="cancelled"):
+            writer_child.stream().send_request(
+                "blocked", {"payload": "x" * 128_000}, cancelled=cancelled.is_set,
+            )
+    finally:
+        timer.cancel()
+        timer.join()
+        writer_child.close()
+    assert reader_child.proc.returncode is not None
+    assert writer_child.proc.returncode is not None
 
 
 def test_close_escalates_hung_graceful_shutdown_and_reaps(tmp_path: Path) -> None:

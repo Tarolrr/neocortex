@@ -32,6 +32,10 @@ from .adapters import (
     sanitize_diagnostic,
 )
 
+# A cancellation predicate has no file descriptor to wake ``select``.  Keep
+# its observation latency bounded even for an otherwise unbounded connection.
+_CANCELLATION_POLL_S = 0.05
+
 
 class AcpProcessError(RuntimeError):
     """Base class for local ACP process evidence (never provider evidence)."""
@@ -67,7 +71,13 @@ class _PipeReader:
             remaining = None if deadline is None else deadline - self._clock()
             if remaining is not None and remaining <= 0:
                 raise AcpDeadlineExpired("ACP process deadline expired")
-            readable, _, _ = select.select([self._fd], [], [], remaining)
+            # A finite polling interval is required when cancellation changes
+            # after this call has started (and also avoids an infinite select
+            # when no deadline was supplied).
+            wait = _CANCELLATION_POLL_S if remaining is None else min(
+                remaining, _CANCELLATION_POLL_S,
+            )
+            readable, _, _ = select.select([self._fd], [], [], wait)
             if readable:
                 return os.read(self._fd, size)
 
@@ -76,19 +86,33 @@ class _PipeWriter:
     def __init__(self, pipe: object, clock: Callable[[], float]) -> None:
         self._pipe = pipe
         self._fd = pipe.fileno()  # type: ignore[attr-defined]
+        # select only promises that *some* pipe capacity was available.  A
+        # blocking descriptor can still block in os.write for a larger frame.
+        os.set_blocking(self._fd, False)
         self._clock = clock
 
     def write_with_deadline(self, data: bytes, deadline: float | None,
                             cancelled: Callable[[], bool] | None) -> int:
-        if cancelled is not None and cancelled():
-            raise AcpCancelled("ACP operation cancelled")
-        remaining = None if deadline is None else deadline - self._clock()
-        if remaining is not None and remaining <= 0:
-            raise AcpDeadlineExpired("ACP process deadline expired")
-        _, writable, _ = select.select([], [self._fd], [], remaining)
-        if not writable:
-            raise AcpDeadlineExpired("ACP process deadline expired")
-        return os.write(self._fd, data)
+        while True:
+            if cancelled is not None and cancelled():
+                raise AcpCancelled("ACP operation cancelled")
+            remaining = None if deadline is None else deadline - self._clock()
+            if remaining is not None and remaining <= 0:
+                raise AcpDeadlineExpired("ACP process deadline expired")
+            wait = _CANCELLATION_POLL_S if remaining is None else min(
+                remaining, _CANCELLATION_POLL_S,
+            )
+            _, writable, _ = select.select([], [self._fd], [], wait)
+            if not writable:
+                # This can be a cancellation poll rather than deadline expiry.
+                # Recheck both on the next loop before continuing to wait.
+                continue
+            try:
+                return os.write(self._fd, data)
+            except BlockingIOError:
+                # Another write or a readiness race filled the pipe.  Never
+                # turn that into an unbounded blocking write.
+                continue
 
     def flush_with_deadline(self, deadline: float | None,
                             cancelled: Callable[[], bool] | None) -> None:

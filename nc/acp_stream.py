@@ -83,6 +83,16 @@ def _valid_id(value: object) -> bool:
     return isinstance(value, (str, int)) and not isinstance(value, bool)
 
 
+def _validate_outbound_method_params(
+    method: object, params: object,
+) -> None:
+    """Apply the JSON-RPC request/notification shape before writing it."""
+    if not isinstance(method, str) or not method:
+        raise ValueError("method must be a nonempty string")
+    if params is not None and not isinstance(params, (dict, list)):
+        raise ValueError("params must be an object or array")
+
+
 def _reject_json_constant(value: str) -> object:
     """Reject JSON extensions such as NaN and Infinity on the ACP wire."""
     raise ValueError(f"invalid JSON numeric constant: {value}")
@@ -300,8 +310,7 @@ class AcpJsonRpcStream:
         *, request_id: JsonId | None = None,
         deadline: float | None = None, cancelled: Callable[[], bool] | None = None,
     ) -> JsonId:
-        if not isinstance(method, str) or not method:
-            raise ValueError("method must be a nonempty string")
+        _validate_outbound_method_params(method, params)
         if len(self._pending) >= self._max_pending_requests:
             raise AcpPendingLimit("too many pending ACP requests")
         # IDs are generated monotonically for the connection lifetime.  This
@@ -324,6 +333,7 @@ class AcpJsonRpcStream:
         self, method: str, params: dict[str, object] | list[object] | None = None,
         *, deadline: float | None = None,
     ) -> None:
+        _validate_outbound_method_params(method, params)
         message: dict[str, object] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             message["params"] = params

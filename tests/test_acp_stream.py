@@ -122,19 +122,36 @@ def test_clean_eof_write_failures_and_cancellation_are_explicit() -> None:
 
 
 def test_duplicate_and_late_responses_never_complete_another_request() -> None:
-    incoming = b"".join(frame({"jsonrpc": "2.0", "id": ident, "result": {"id": ident}})
-                        for ident in range(1, 6))
+    incoming = frame({"jsonrpc": "2.0", "id": 1, "result": {"id": 1}})
+    incoming += frame({"jsonrpc": "2.0", "id": 1, "result": {"duplicate": True}})
+    incoming += frame({"jsonrpc": "2.0", "id": 2, "result": {"id": 2}})
     incoming += frame({"jsonrpc": "2.0", "id": 1, "result": {"late": True}})
-    incoming += frame({"jsonrpc": "2.0", "id": 6, "result": {"id": 6}})
     stream = AcpJsonRpcStream(io.BytesIO(incoming), io.BytesIO(), max_pending_requests=2)
-    for ident in range(1, 6):
-        assert stream.request("session/prompt")["result"] == {"id": ident}
-    # An old caller-controlled ID cannot recycle the connection's generated ID.
+    stream.send_request("session/prompt", request_id=1)
+    stream.send_request("session/prompt", request_id=2)
+    # The second reply for ID 1 arrives while its first reply is retained in
+    # the pending table.  It must not overwrite it or complete ID 2.
+    stream.pump()
+    stream.pump()
+    stream.pump()
+    assert stream.wait_for(2)["result"] == {"id": 2}
+    assert stream.wait_for(1)["result"] == {"id": 1}
+    assert stream.diagnostics == ("duplicate response id",)
+
+    # After completion, an old caller-controlled ID cannot recycle the
+    # connection's generated ID, and a delayed response remains harmless.
     with pytest.raises(ValueError, match="generated monotonically"):
         stream.send_request("session/prompt", request_id=1)
-    stream.send_request("session/prompt")
-    assert stream.wait_for(6)["result"] == {"id": 6}
-    assert stream.diagnostics == ("late or unexpected response id",)
+    stream.pump()
+    assert stream.diagnostics == ("duplicate response id", "late or unexpected response id")
+
+
+@pytest.mark.parametrize("method, params", [("", None), ("session/update", 1)])
+def test_outbound_notifications_require_json_rpc_method_and_params(
+    method: object, params: object,
+) -> None:
+    with pytest.raises(ValueError):
+        AcpJsonRpcStream(io.BytesIO(), io.BytesIO()).notify(method, params)  # type: ignore[arg-type]
 
 
 def test_deadline_expiring_during_deadline_aware_io_is_observed() -> None:

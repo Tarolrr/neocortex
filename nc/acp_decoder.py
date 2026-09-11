@@ -115,7 +115,7 @@ def _usage_integer(value: dict[object, object], camel: str, snake: str) -> tuple
 
 
 def _usage(value: object) -> AcpUsage | None:
-    """Decode one complete structured usage report, never notification totals."""
+    """Decode one complete structured usage snapshot."""
     if not isinstance(value, dict):
         return None
     input_present, input_tokens = _usage_integer(value, "inputTokens", "input_tokens")
@@ -132,6 +132,28 @@ def _usage(value: object) -> AcpUsage | None:
         # Cached input is normally a subset of input, so it is not added.
         total = input_tokens + output_tokens
     return AcpUsage(input_tokens, output_tokens, cached, total)
+
+
+def _notification_usage(wire: Sequence[object], response_index: int, session_id: str) -> AcpUsage | None:
+    """Return the final direct usage snapshot from this prompt's updates.
+
+    ``session/update`` usage reports are snapshots, not increments.  Reading
+    only the direct ``update.usage`` field deliberately excludes message and
+    tool payloads, which may contain arbitrary provider-shaped JSON.
+    """
+    reported = False
+    usage: AcpUsage | None = None
+    for item in wire[:response_index]:
+        if not isinstance(item, dict) or item.get("method") != "session/update":
+            continue
+        params = item.get("params")
+        if not isinstance(params, dict) or params.get("sessionId") != session_id:
+            continue
+        update = params.get("update")
+        if isinstance(update, dict) and "usage" in update:
+            reported = True
+            usage = _usage(update["usage"])
+    return usage if reported else None
 
 
 def _jsonrpc_error(value: object) -> str | None:
@@ -187,25 +209,28 @@ def decode_acp_prompt_result(
     if len(responses) != 1:
         return AcpPromptResult("protocol_invalid", None, "conflicting prompt response identity", (), None)
     response = responses[0]
+    response_index = next(index for index, item in enumerate(wire) if item is response)
+    notified_usage = _notification_usage(wire, response_index, session_id)
     if ("result" in response) == ("error" in response):
         return AcpPromptResult("protocol_invalid", None, "prompt response must have exactly one result or error", (), None)
     if "error" in response:
         message = _jsonrpc_error(response["error"])
         if message is None:
-            return AcpPromptResult("protocol_invalid", None, "prompt error is invalid", (), None)
-        return AcpPromptResult("failed", None, message or "JSON-RPC prompt error", (), None)
+            return AcpPromptResult("protocol_invalid", None, "prompt error is invalid", (), notified_usage)
+        return AcpPromptResult("failed", None, message or "JSON-RPC prompt error", (), notified_usage)
     result = response["result"]
     if not isinstance(result, dict):
         return AcpPromptResult("protocol_invalid", None, "prompt result is not an object", (), None)
     stop_reason = result.get("stopReason")
-    usage = _usage(result.get("usage"))
+    # The prompt result is the terminal snapshot when it reports usage.  It
+    # replaces, rather than adds to, any earlier update snapshot.
+    usage = _usage(result["usage"]) if "usage" in result else notified_usage
     if not isinstance(stop_reason, str):
         return AcpPromptResult("protocol_invalid", None, "prompt stopReason is invalid", (), usage)
     # A caller's negotiated profile is still an input fact, but do not discard
     # independently received terminal data when it is unsupported.
     if air_version != 1:
         return AcpPromptResult("protocol_invalid", stop_reason, "unsupported AIR extension version", (), usage)
-    response_index = next(index for index, item in enumerate(wire) if item is response)
     raw_failures: list[object] = []
     for item in wire[:response_index]:
         if not isinstance(item, dict) or item.get("method") != "session/update":

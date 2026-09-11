@@ -138,6 +138,43 @@ def test_matching_usage_aliases_are_a_complete_report():
     assert result.usage and result.usage.total_tokens == 5
 
 
+def test_correlated_usage_notification_is_retained_without_a_final_snapshot():
+    wire = [
+        {"method": "session/update", "params": {"sessionId": "s", "update": {
+            "sessionUpdate": "usage_update",
+            "usage": {"inputTokens": 2, "cachedInputTokens": 1, "outputTokens": 3},
+        }}},
+        {"id": "p", "result": {"stopReason": "end_turn"}},
+    ]
+    result = decode_acp_prompt_result(wire, request_id="p", session_id="s")
+    assert result.kind == "success"
+    assert result.usage and result.usage.total_tokens == 5
+
+
+def test_final_usage_snapshot_replaces_matching_notification_without_counting_twice():
+    usage = {"inputTokens": 2, "outputTokens": 3}
+    wire = [
+        {"method": "session/update", "params": {"sessionId": "s", "update": {
+            "sessionUpdate": "usage_update", "usage": usage,
+        }}},
+        {"id": "p", "result": {"stopReason": "end_turn", "usage": usage}},
+    ]
+    result = decode_acp_prompt_result(wire, request_id="p", session_id="s")
+    assert result.usage and result.usage.total_tokens == 5
+
+
+def test_jsonrpc_error_retains_independently_reported_usage():
+    wire = [
+        {"method": "session/update", "params": {"sessionId": "s", "update": {
+            "sessionUpdate": "usage_update", "usage": {"inputTokens": 2, "outputTokens": 3},
+        }}},
+        {"id": "p", "error": {"code": -32000, "message": "nope"}},
+    ]
+    result = decode_acp_prompt_result(wire, request_id="p", session_id="s")
+    assert result.kind == "failed"
+    assert result.usage and result.usage.total_tokens == 5
+
+
 @pytest.mark.parametrize("error", ["bad", {}, {"code": "bad", "message": "x"},
                                   {"code": -1, "message": None}])
 def test_malformed_jsonrpc_error_is_protocol_invalid(error):

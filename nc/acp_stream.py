@@ -302,7 +302,14 @@ class AcpJsonRpcStream:
             return
         try:
             result = self._request_handler(value)
-        except Exception:
+        except (
+            ArithmeticError,
+            AttributeError,
+            LookupError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
             self._write(
                 {"jsonrpc": "2.0", "id": request_id,
                  "error": {"code": -32603, "message": "Client request failed"}}, deadline, None,

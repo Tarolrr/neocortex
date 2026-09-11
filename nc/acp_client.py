@@ -335,8 +335,8 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
     finally:
         child.close()
         if timeout_error is not None:
-            setattr(timeout_error, "process", _process_fact(child, True, timeout_phases))
-            setattr(timeout_error, "shutdown", child.shutdown_outcome)
+            timeout_error.process = _process_fact(child, True, timeout_phases)
+            timeout_error.shutdown = child.shutdown_outcome
     assert result is not None
     return CodexAcpTurn(result.prompt, result.prompt_fact, _process_fact(child, timed_out, timeout_phases),
                          child.shutdown_outcome)

@@ -252,13 +252,16 @@ def run_planner_turn(state: State, cfg: Config, agent: sqlite3.Row,
     run_id = state.start_run(agent["id"], None, "planner", model, str(log_path))
     state.x("UPDATE project SET planner_last_ran_at=?, planner_skip_reason=NULL WHERE id=?",
             (time.time(), agent["project_id"]))
-    run_session = getattr(adapter, "run_planner", adapter.run)
     tokens = None
     result_recorded = False
     outcome_read = False
     host_failure: protocol.Outcome | None = None
     assessment: HostAssessment | None = None
     try:
+        # Advisory roles must have an adapter-specific restricted launch.
+        # Do not alias a missing method to ``run``: supported adapters use an
+        # unrestricted worker policy there.
+        run_session = adapter.run_planner
         with adapter_ownership(lambda pid: state.record_adapter_owner(run_id, pid)):
             result = run_session(brief, run_dir, model, log_path, cfg.turn_timeout_s)
         tokens = result.tokens

@@ -398,6 +398,11 @@ class Adapter:
             timeout_s: int) -> SessionResult:
         raise NotImplementedError
 
+    def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
+                    timeout_s: int) -> SessionResult:
+        """Launch the restricted advisory policy; never alias this to ``run``."""
+        raise NotImplementedError
+
 
 def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionResult:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -487,8 +492,8 @@ class CodexAdapter(Adapter):
             # an exec subcommand option.  It must precede ``exec``.
             "codex", "--search", "exec", "--json", "--model", model, "--sandbox", "workspace-write",
             # These are per-invocation overrides, not changes to the service
-            # account's Codex configuration.  Keep the workspace sandbox: it
-            # gives the run directory its only writable root.
+            # account's Codex configuration.  Keep the workspace sandbox;
+            # its writable roots remain independent of the role instruction.
             "--config", "sandbox_workspace_write.network_access=true",
             "--skip-git-repo-check", prompt,
         ], cwd, log_path, timeout_s)

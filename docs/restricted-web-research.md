@@ -1,10 +1,10 @@
 # Restricted planner web research
 
 Planner and plan-critic runs share the `run_planner` adapter method.  They run
-from their newly-created run directory, not a worktree.  That directory is the
-only place an advisory agent may write: its `outcome.json`.  Workers and change
-critics still use their existing adapter method and policy; this feature does
-not provide an unrestricted fallback when a restricted adapter cannot run.
+from their newly-created run directory, not a worktree.  The role contract
+permits an advisory agent to write only its `outcome.json` there.  Workers and
+change critics still use their existing adapter method and policy; this feature
+does not provide an unrestricted fallback when a restricted adapter cannot run.
 
 ## What the launch permissions mean
 
@@ -17,7 +17,11 @@ codex --search exec --json --model "$MODEL" --sandbox workspace-write \
 ```
 
 `workspace-write` keeps Codex's local filesystem sandbox and does not add a
-writable root for either the repository or the runtime home.  The per-command
+writable root for either the repository or the runtime home.  In pinned Codex
+0.86.0, however, its workspace-write implementation also includes `/tmp` on
+Unix and can include the `TMPDIR` environment value.  NC does not claim that
+the sandbox makes the run directory its sole writable path; the exact
+`outcome.json` restriction is the planner's role instruction.  The per-command
 configuration override permits outbound network connections made by shell tools
 inside that sandbox.  It is deliberately broader than an HTTP-read-only
 guarantee: a shell with network access can use protocols and methods other than
@@ -64,9 +68,9 @@ or advisory finding.  External material cannot approve proposals, authorize
 tasks, disclose private local data, install packages, change the host, or
 publish anything.  If a source cannot be reached or verified, say so plainly;
 do not fabricate a citation.  Planner and plan critic instructions retain the
-outcome-only writing contract.  That instruction is a role constraint; Codex's
-workspace sandbox is the separate technical mechanism that limits its writable
-area to the run directory.
+outcome-only writing contract.  That instruction is a role constraint, not a
+claim that Codex's workspace sandbox has only the run directory as a writable
+area (it may also permit temporary directories as described above).
 
 ## Pinned-version verification
 
@@ -81,7 +85,10 @@ a paid prompt for this verification.
   [config types](https://github.com/openai/codex/blob/rust-v0.86.0/codex-rs/core/src/config/types.rs)
   define `sandbox_workspace_write.network_access`; and its
   [exec source](https://github.com/openai/codex/blob/rust-v0.86.0/codex-rs/exec/src/lib.rs)
-  sets non-interactive approval to `Never`.  This is version-specific evidence;
+  sets non-interactive approval to `Never`.  Its
+  [workspace-write implementation](https://github.com/openai/codex/blob/rust-v0.86.0/codex-rs/core/src/sandboxing.rs)
+  adds `/tmp` on Unix and may add `TMPDIR`; this is why the documentation does
+  not equate the role's outcome-only rule with sandbox writable roots.  This is version-specific evidence;
   the current [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
   is useful context but is not used as proof of 0.86.0 compatibility.
 * Claude Code **2.1.76**: the official
@@ -107,7 +114,8 @@ brief asking it to search public documentation and fetch one result, then write
 only its designated `outcome.json`.  Confirm the log records the search/fetch
 tool activity and the outcome file exists.  In the same brief, ask it to create
 `$REPOSITORY/should-not-exist`; after it exits, verify that path is absent and
-only `$RUN_DIR/outcome.json` changed.  Do not run this against a live scheduler
+that `$RUN_DIR/outcome.json` is the only intended persistent output (Codex may
+also have access to its documented temporary directories).  Do not run this against a live scheduler
 or infer success from mocked tests.  If search/fetch is denied or unavailable,
 record the provider diagnostic and retain the restricted policy rather than
 using a worker adapter or sandbox bypass.

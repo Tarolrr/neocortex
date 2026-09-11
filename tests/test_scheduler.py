@@ -45,6 +45,12 @@ class ScriptedAdapter:
         self.calls.append((model, Path(cwd)))
         return SessionResult(exit_code=0, log_path=log_path, tokens=None, timed_out=False)
 
+    # Scripted advisory cases deliberately opt into the separate restricted
+    # operation.  Production adapters must provide their own policy instead
+    # of inheriting this test convenience alias.
+    def run_planner(self, prompt, cwd, model, log_path, timeout_s) -> SessionResult:
+        return self.run(prompt, cwd, model, log_path, timeout_s)
+
 
 def emit(payload: dict):
     def step(cwd: Path, outcome_path: Path) -> None:
@@ -996,8 +1002,20 @@ def test_plan_critic_requires_restricted_adapter(setup):
     cfg, state, _repo = setup
     state.add_proposal('neocortex', 'planner', 'rationale', [planner_spec()])
     scheduler = sched(cfg, state, [])
+    class UnrestrictedOnly:
+        name = "unrestricted-only"
+
+        def __init__(self):
+            self.calls = 0
+
+        def run(self, *_args):
+            self.calls += 1
+            raise AssertionError("plan critic fell back to adapter.run")
+
+    scheduler.adapter = UnrestrictedOnly()
+    scheduler._adapter_for = lambda _role: scheduler.adapter
     assert scheduler.step() == protocol.NO_OUTCOME
-    assert scheduler.adapter.calls == []
+    assert scheduler.adapter.calls == 0
     assert scheduler.step() == 'idle'
 
 
@@ -1196,6 +1214,27 @@ def test_session_exception_finalizes_planner_and_plan_critic_with_context(setup)
     assert outcome.kind == protocol.NO_OUTCOME and run["outcome"] == protocol.NO_OUTCOME
     assert "critic exploded" in run["detail"]
     assert run["timed_out"] is None and run["exit_code"] is None
+
+
+def test_planner_missing_restricted_operation_fails_closed_without_worker_run(setup):
+    """A configured advisory adapter may never fall back to its worker policy."""
+    cfg, state, _repo = setup
+    planner_id, _ = state.planner_feedback("neocortex", "plan safely", "model")
+
+    class UnrestrictedOnly:
+        name = "unrestricted-only"
+
+        def run(self, *_args):
+            pytest.fail("planner fell back to unrestricted adapter.run")
+
+    outcome = turn.run_planner_turn(
+        state, cfg, state.one("SELECT * FROM agent WHERE id=?", (planner_id,)),
+        UnrestrictedOnly(),
+    )
+    run = state.one("SELECT * FROM run WHERE agent_id=?", (planner_id,))
+    assert outcome.kind == protocol.NO_OUTCOME
+    assert run["outcome"] == protocol.NO_OUTCOME
+    assert "run_planner" in run["detail"]
 
 
 @pytest.mark.parametrize("role", ["worker", "critic"])

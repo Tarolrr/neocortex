@@ -200,6 +200,26 @@ def test_stream_request_automatically_translates_exit_and_eof(tmp_path: Path) ->
         child.stream().request("request")
 
 
+def test_stream_write_error_rechecks_child_exit(tmp_path: Path) -> None:
+    """A death after the proxy poll must not escape as generic AcpWriteError."""
+    child = AcpSubprocess(
+        helper("import time,sys; time.sleep(.1); sys.exit(7)"), cwd=tmp_path,
+        deadline=time.monotonic() + 2, log_path=tmp_path / "exit-write.log",
+    )
+    original_write = child.writer.write_with_deadline
+
+    def write_after_child_exit(*args: object, **kwargs: object) -> int:
+        child.proc.wait(timeout=1)
+        return original_write(*args, **kwargs)
+
+    child.writer.write_with_deadline = write_after_child_exit  # type: ignore[method-assign]
+    try:
+        with pytest.raises(AcpUnexpectedExit, match="status 7"):
+            child.stream().send_request("request")
+    finally:
+        child.close()
+
+
 def test_stream_request_automatically_translates_total_timeout(tmp_path: Path) -> None:
     child = AcpSubprocess(
         helper("import sys,time; sys.stdin.readline(); time.sleep(30)"), cwd=tmp_path,
@@ -296,6 +316,30 @@ def test_close_kills_descendant_after_parent_already_exited(tmp_path: Path) -> N
         time.sleep(0.02)
     else:
         pytest.fail("ACP descendant survived after parent exit")
+
+
+def test_no_cgroup_retains_uncertainty_for_session_escaped_descendant(tmp_path: Path) -> None:
+    """Without cgroups, an escaped session cannot be disproven after close."""
+    child = AcpSubprocess(
+        helper(
+            "import subprocess,sys,time; "
+            "code=\"import os,time; os.setsid(); print(os.getpid(), flush=True); time.sleep(30)\"; "
+            "subprocess.Popen([sys.executable, '-c', code], stdout=sys.stdout); time.sleep(30)"
+        ),
+        cwd=tmp_path, deadline=time.monotonic() + 3, log_path=tmp_path / "log", grace_s=0.05,
+    )
+    escaped = int(child.reader.read_with_deadline(40, time.monotonic() + 2, None))
+    try:
+        child.close()
+        assert child.cleanup_uncertain
+    finally:
+        # This deliberately escaped the unavailable-cgroup fallback.  The
+        # test removes its harmless helper explicitly so no test process leaks.
+        try:
+            os.kill(escaped, 9)
+        except ProcessLookupError:
+            pass
+    _assert_helpers_gone([escaped])
 
 
 def test_cgroup_cleanup_catches_descendant_escaped_from_session(

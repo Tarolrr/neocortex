@@ -23,6 +23,7 @@ from .acp_stream import (
     AcpDeadlineExpired,
     AcpEofError,
     AcpJsonRpcStream,
+    AcpWriteError,
 )
 from .adapters import (
     _adapter_cgroup,
@@ -80,6 +81,8 @@ class _SupervisedStream:
                 self._owner.transport_eof(exc)
             except AcpDeadlineExpired as exc:
                 self._owner.deadline_expired(exc)
+            except AcpWriteError as exc:
+                self._owner.transport_write_error(exc)
 
         return supervised
 
@@ -252,6 +255,19 @@ class AcpSubprocess:
             raise AcpUnexpectedExit(self._exit_message(code)) from exc
         raise AcpTransportEof(f"ACP transport EOF: {sanitize_diagnostic(str(exc))}") from exc
 
+    def transport_write_error(self, exc: AcpWriteError) -> None:
+        """Prefer newly-established local death over a generic pipe error.
+
+        The child can exit after the proxy's pre-operation poll but before its
+        stdin write reaches the kernel.  In that race the stream correctly
+        wraps ``BrokenPipeError`` as ``AcpWriteError``; a second poll preserves
+        the stronger process evidence when it is now available.
+        """
+        code = self.proc.poll()
+        if code is not None:
+            raise AcpUnexpectedExit(self._exit_message(code)) from exc
+        raise exc
+
     def _exit_message(self, code: int) -> str:
         detail = f"; stderr: {self.diagnostics}" if self.diagnostics else ""
         if code < 0:
@@ -334,7 +350,12 @@ class AcpSubprocess:
         self.cleanup_uncertain = (
             not reaped
             or self._process_group_alive()
-            or (self._cgroup is not None and cgroup_empty is not True)
+            # A session group is only a best-effort fallback: a descendant
+            # can call setsid(2) and escape it.  Without cgroup membership
+            # evidence, a reaped leader and empty original group cannot prove
+            # that the whole owned process tree is gone.
+            or self._cgroup is None
+            or cgroup_empty is not True
         )
         if close_pipes:
             for pipe in (self.proc.stdout, self.proc.stderr):

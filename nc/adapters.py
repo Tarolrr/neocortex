@@ -484,6 +484,10 @@ class CodexAdapter(Adapter):
                     timeout_s: int) -> SessionResult:
         return _run([
             "codex", "exec", "--json", "--model", model, "--sandbox", "workspace-write",
+            # These are per-invocation overrides, not changes to the service
+            # account's Codex configuration.  Keep the workspace sandbox: it
+            # gives the run directory its only writable root.
+            "--config", "sandbox_workspace_write.network_access=true", "--search",
             "--skip-git-repo-check", prompt,
         ], cwd, log_path, timeout_s)
 
@@ -508,8 +512,9 @@ class ClaudeAdapter(Adapter):
         binary = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
         cmd = [binary, "-p", prompt, "--output-format", "stream-json", "--verbose",
                "--permission-mode", "dontAsk",
-               "--tools", "Read,Glob,Grep,Write", "--allowedTools",
-               "Read", "Glob", "Grep", f"Write(//{cwd.as_posix().lstrip('/')}/outcome.json)"]
+               "--tools", "Read,Glob,Grep,Write,WebSearch,WebFetch", "--allowedTools",
+               "Read", "Glob", "Grep", "WebSearch", "WebFetch",
+               f"Write(//{cwd.as_posix().lstrip('/')}/outcome.json)"]
         if model:
             cmd += ["--model", model]
         return _run(cmd, cwd, log_path, timeout_s)

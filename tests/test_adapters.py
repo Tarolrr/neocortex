@@ -367,8 +367,32 @@ def test_planner_adapter_restricts_writes(tmp_path, monkeypatch, name):
     cmd = run.call_args.args[0]
     if name == "codex":
         assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
+        assert cmd[cmd.index("--config") + 1] == "sandbox_workspace_write.network_access=true"
+        assert "--search" in cmd
+        assert "--full-auto" not in cmd
+        assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+        assert "--add-dir" not in cmd
     else:
         assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
-        assert cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep,Write"
+        assert cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep,Write,WebSearch,WebFetch"
+        allowed = cmd[cmd.index("--allowedTools") + 1:]
+        assert allowed[:5] == ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
         assert f"Write(//{tmp_path.as_posix().lstrip('/')}/outcome.json)" in cmd
+        assert "Bash" not in cmd and "Edit" not in cmd
+        assert "bypassPermissions" not in cmd
     assert run.call_args.args[1] == tmp_path
+
+
+def test_worker_command_remains_unrestricted_and_has_no_research_flags(tmp_path, monkeypatch):
+    """Web research is intentionally limited to the restricted advisory path."""
+    from unittest.mock import Mock
+
+    from nc.adapters import CodexAdapter
+
+    run = Mock()
+    monkeypatch.setattr("nc.adapters._run", run)
+    CodexAdapter().run("Implement", tmp_path, "model", tmp_path / "session.log", 30)
+    cmd = run.call_args.args[0]
+    assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
+    assert "--search" not in cmd
+    assert "sandbox_workspace_write.network_access=true" not in cmd

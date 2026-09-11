@@ -398,6 +398,11 @@ class Adapter:
             timeout_s: int) -> SessionResult:
         raise NotImplementedError
 
+    def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
+                    timeout_s: int) -> SessionResult:
+        """Launch the restricted advisory policy; never alias this to ``run``."""
+        raise NotImplementedError
+
 
 def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionResult:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -483,7 +488,13 @@ class CodexAdapter(Adapter):
     def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
                     timeout_s: int) -> SessionResult:
         return _run([
-            "codex", "exec", "--json", "--model", model, "--sandbox", "workspace-write",
+            # In pinned Codex 0.86.0 --search is a top-level CLI option, not
+            # an exec subcommand option.  It must precede ``exec``.
+            "codex", "--search", "exec", "--json", "--model", model, "--sandbox", "workspace-write",
+            # These are per-invocation overrides, not changes to the service
+            # account's Codex configuration.  Keep the workspace sandbox;
+            # its writable roots remain independent of the role instruction.
+            "--config", "sandbox_workspace_write.network_access=true",
             "--skip-git-repo-check", prompt,
         ], cwd, log_path, timeout_s)
 
@@ -508,8 +519,9 @@ class ClaudeAdapter(Adapter):
         binary = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
         cmd = [binary, "-p", prompt, "--output-format", "stream-json", "--verbose",
                "--permission-mode", "dontAsk",
-               "--tools", "Read,Glob,Grep,Write", "--allowedTools",
-               "Read", "Glob", "Grep", f"Write(//{cwd.as_posix().lstrip('/')}/outcome.json)"]
+               "--tools", "Read,Glob,Grep,Write,WebSearch,WebFetch", "--allowedTools",
+               "Read", "Glob", "Grep", "WebSearch", "WebFetch",
+               f"Write(//{cwd.as_posix().lstrip('/')}/outcome.json)"]
         if model:
             cmd += ["--model", model]
         return _run(cmd, cwd, log_path, timeout_s)

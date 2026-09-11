@@ -231,6 +231,12 @@ names must suit the selected vendor):
 
 Preflight probes the worker's selected adapter and model.
 
+Planner and advisory plan-critic turns use a separate restricted adapter path:
+they can research public documentation while retaining their run-directory-only
+outcome write contract.  See [restricted planner web research](docs/restricted-web-research.md)
+for the exact pinned-CLI launches, permission boundaries, evidence workflow,
+and an owner-only live smoke procedure.
+
 The Claude adapter's command line was verified against the installed
 `/root/.local/bin/claude`, version **2.1.220 (Claude Code)**, using `--version`
 and `--help` on 2026-09-06:

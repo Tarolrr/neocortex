@@ -483,11 +483,13 @@ class CodexAdapter(Adapter):
     def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
                     timeout_s: int) -> SessionResult:
         return _run([
-            "codex", "exec", "--json", "--model", model, "--sandbox", "workspace-write",
+            # In pinned Codex 0.86.0 --search is a top-level CLI option, not
+            # an exec subcommand option.  It must precede ``exec``.
+            "codex", "--search", "exec", "--json", "--model", model, "--sandbox", "workspace-write",
             # These are per-invocation overrides, not changes to the service
             # account's Codex configuration.  Keep the workspace sandbox: it
             # gives the run directory its only writable root.
-            "--config", "sandbox_workspace_write.network_access=true", "--search",
+            "--config", "sandbox_workspace_write.network_access=true",
             "--skip-git-repo-check", prompt,
         ], cwd, log_path, timeout_s)
 

@@ -356,43 +356,60 @@ def test_claude_command(tmp_path, monkeypatch, binary, model):
 
 
 @pytest.mark.parametrize("name", ["codex", "claude"])
-def test_planner_adapter_restricts_writes(tmp_path, monkeypatch, name):
+def test_restricted_advisory_command_is_exact_for_each_adapter(tmp_path, monkeypatch, name):
+    """Planner and plan critic share this exact restricted launch path."""
     from unittest.mock import Mock
 
-    from nc.adapters import get_adapter
+    from nc.adapters import ClaudeAdapter, CodexAdapter
 
     run = Mock()
     monkeypatch.setattr("nc.adapters._run", run)
-    get_adapter(name).run_planner("Plan", tmp_path, "model", tmp_path / "session.log", 30)
-    cmd = run.call_args.args[0]
+    monkeypatch.setattr("nc.adapters.shutil.which", lambda _name: None)
+    monkeypatch.setattr("nc.adapters.Path.home", lambda: tmp_path)
+    log = tmp_path / "session.log"
+    adapter = CodexAdapter() if name == "codex" else ClaudeAdapter()
+    adapter.run_planner("Plan", tmp_path, "model", log, 30)
     if name == "codex":
-        assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
-        assert cmd[cmd.index("--config") + 1] == "sandbox_workspace_write.network_access=true"
-        assert "--search" in cmd
-        assert "--full-auto" not in cmd
-        assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
-        assert "--add-dir" not in cmd
+        expected = [
+            "codex", "--search", "exec", "--json", "--model", "model",
+            "--sandbox", "workspace-write", "--config",
+            "sandbox_workspace_write.network_access=true", "--skip-git-repo-check", "Plan",
+        ]
     else:
-        assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
-        assert cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep,Write,WebSearch,WebFetch"
-        allowed = cmd[cmd.index("--allowedTools") + 1:]
-        assert allowed[:5] == ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
-        assert f"Write(//{tmp_path.as_posix().lstrip('/')}/outcome.json)" in cmd
-        assert "Bash" not in cmd and "Edit" not in cmd
-        assert "bypassPermissions" not in cmd
-    assert run.call_args.args[1] == tmp_path
+        binary = str(tmp_path / ".local/bin/claude")
+        expected = [
+            binary, "-p", "Plan", "--output-format", "stream-json", "--verbose",
+            "--permission-mode", "dontAsk", "--tools",
+            "Read,Glob,Grep,Write,WebSearch,WebFetch", "--allowedTools", "Read", "Glob",
+            "Grep", "WebSearch", "WebFetch",
+            f"Write(//{tmp_path.as_posix().lstrip('/')}/outcome.json)", "--model", "model",
+        ]
+    run.assert_called_once_with(expected, tmp_path, log, 30)
 
 
-def test_worker_command_remains_unrestricted_and_has_no_research_flags(tmp_path, monkeypatch):
+@pytest.mark.parametrize("name", ["codex", "claude"])
+def test_worker_command_remains_unrestricted_and_has_no_research_flags(tmp_path, monkeypatch, name):
     """Web research is intentionally limited to the restricted advisory path."""
     from unittest.mock import Mock
 
-    from nc.adapters import CodexAdapter
+    from nc.adapters import ClaudeAdapter, CodexAdapter
 
     run = Mock()
     monkeypatch.setattr("nc.adapters._run", run)
-    CodexAdapter().run("Implement", tmp_path, "model", tmp_path / "session.log", 30)
-    cmd = run.call_args.args[0]
-    assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
-    assert "--search" not in cmd
-    assert "sandbox_workspace_write.network_access=true" not in cmd
+    monkeypatch.setattr("nc.adapters.shutil.which", lambda _name: None)
+    monkeypatch.setattr("nc.adapters.Path.home", lambda: tmp_path)
+    log = tmp_path / "session.log"
+    adapter = CodexAdapter() if name == "codex" else ClaudeAdapter()
+    adapter.run("Implement", tmp_path, "model", log, 30)
+    if name == "codex":
+        expected = [
+            "codex", "exec", "--json", "--model", "model", "--sandbox",
+            "danger-full-access", "--skip-git-repo-check", "Implement",
+        ]
+    else:
+        expected = [
+            str(tmp_path / ".local/bin/claude"), "-p", "Implement", "--output-format",
+            "stream-json", "--verbose", "--permission-mode", "bypassPermissions",
+            "--model", "model",
+        ]
+    run.assert_called_once_with(expected, tmp_path, log, 30)

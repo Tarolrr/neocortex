@@ -704,6 +704,48 @@ def test_scheduler_selects_adapter_for_each_role(setup, monkeypatch, overrides, 
     ]
 
 
+@pytest.mark.parametrize("role", ["planner", "plan_critic"])
+@pytest.mark.parametrize("adapter_name", ["codex", "claude"])
+def test_advisory_roles_dispatch_to_configured_restricted_adapter(
+    setup, monkeypatch, role, adapter_name,
+):
+    """Both advisory roles must reach run_planner, never the worker path."""
+    cfg, state, _repo = setup
+    cfg.adapter = "codex" if adapter_name == "claude" else "claude"
+    cfg.adapters = {role: adapter_name}
+    selected = object()
+    requested = []
+
+    def get_adapter(name):
+        requested.append(name)
+        return selected
+
+    monkeypatch.setattr("nc.scheduler.get_adapter", get_adapter)
+    scheduler = Scheduler(cfg, state)
+    monkeypatch.setattr(scheduler, "_preflight_selected", lambda selected_role: None)
+    received = []
+    if role == "planner":
+        state.planner_feedback("neocortex", "plan this", cfg.model_for("planner"))
+
+        def run_planner_turn(_state, _cfg, _agent, adapter):
+            received.append(adapter)
+            return protocol.Outcome(kind=protocol.YIELD, summary="advisory")
+
+        monkeypatch.setattr("nc.scheduler.turn.run_planner_turn", run_planner_turn)
+    else:
+        state.add_proposal("neocortex", "planner", "proposal", [planner_spec()])
+
+        def run_plan_critic_turn(_state, _cfg, _proposal, adapter):
+            received.append(adapter)
+            return protocol.Outcome(kind=protocol.YIELD, summary="advisory")
+
+        monkeypatch.setattr("nc.scheduler.turn.run_plan_critic_turn", run_plan_critic_turn)
+
+    assert scheduler.step() == protocol.YIELD
+    assert requested == [adapter_name]
+    assert received == [selected]
+
+
 def test_preflight_uses_worker_adapter(setup, monkeypatch):
     from unittest.mock import Mock
 

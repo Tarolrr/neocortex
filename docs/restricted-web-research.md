@@ -11,8 +11,8 @@ not provide an unrestricted fallback when a restricted adapter cannot run.
 For Codex, the restricted command is equivalent to:
 
 ```sh
-codex exec --json --model "$MODEL" --sandbox workspace-write \
-  --config sandbox_workspace_write.network_access=true --search \
+codex --search exec --json --model "$MODEL" --sandbox workspace-write \
+  --config sandbox_workspace_write.network_access=true \
   --skip-git-repo-check "$BRIEF"
 ```
 
@@ -76,8 +76,8 @@ a paid prompt for this verification.
 * Codex **0.86.0**: the official
   [npm distribution metadata](https://registry.npmjs.org/@openai/codex/0.86.0)
   identifies the pinned tarball.  The matching official OpenAI source tag,
-  [`rust-v0.86.0` CLI source](https://github.com/openai/codex/blob/rust-v0.86.0/codex-rs/cli/src/main.rs),
-  parses `--search`; its
+  [`rust-v0.86.0` top-level CLI source](https://github.com/openai/codex/blob/rust-v0.86.0/codex-rs/tui/src/cli.rs)
+  defines `--search` (before `exec`; it is not an `exec` option); its
   [config types](https://github.com/openai/codex/blob/rust-v0.86.0/codex-rs/core/src/config/types.rs)
   define `sandbox_workspace_write.network_access`; and its
   [exec source](https://github.com/openai/codex/blob/rust-v0.86.0/codex-rs/exec/src/lib.rs)

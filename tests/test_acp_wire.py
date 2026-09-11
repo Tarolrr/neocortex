@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from nc import acp_wire
 from nc.acp_stream import AcpEofError
 from nc.acp_wire import AcpSubprocess, AcpTransportEof, AcpUnexpectedExit
 from nc.adapters import adapter_ownership
@@ -16,6 +17,12 @@ from nc.adapters import adapter_ownership
 
 def helper(code: str) -> list[str]:
     return [sys.executable, "-c", code]
+
+
+@pytest.fixture(autouse=True)
+def no_host_cgroup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These helpers exercise session containment; cgroup v2 is host-owned."""
+    monkeypatch.setattr(acp_wire, "_adapter_cgroup", lambda: None)
 
 
 def test_stderr_flood_is_drained_and_saved_bounded(tmp_path: Path) -> None:

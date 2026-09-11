@@ -53,9 +53,7 @@ def prompt_fact(wire):
         assert update["params"]["sessionId"] == fact["session_id"]
         assert wire["wire"].index(update) < wire["wire"].index(prompt_response)
     observations = [air_failure(update["params"]["update"]) for update in updates]
-    if isinstance(terminal, dict):
-        observations.append(terminal)
-    elif terminal is not None:
+    if terminal is not None:
         observations.append(terminal)
     # Invalid AIR metadata is terminal for completion but remains observable.
     if any(not isinstance(value, dict) for value in observations):

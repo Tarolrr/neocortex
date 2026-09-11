@@ -42,8 +42,11 @@ execution/approval policy; do not accept an agent-selected default. Send one
 `session/prompt`, correlate the request id, session id and prompt id, service
 server requests only through the existing policy owner, and bound cancel then
 close. No session resume, client tools, common bus, or runtime activation is in
-scope. The tagged server advertises `sessionFailure` in its initialize response
-([source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexAcpServer.ts)); it does **not** echo the client's capability. Its capability detector requires AIR integer version >= 1 and the named capability ([source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AirExtension.ts)).
+scope. The tagged server does **not** advertise or echo `sessionFailure` in its
+initialize response: `agentCapabilities._meta` contains its `authStatus`
+extension, not AIR. Typed failures are enabled solely because the server detects
+the client's request `_meta.jetbrains.air` integer version >= 1 and named
+`sessionFailure` capability ([initialize source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexAcpServer.ts), [detector source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AirExtension.ts)).
 
 The future transport-facing interfaces are `AcpProcessFact` (pid/exit/signal,
 timeout, stderr availability), `AcpPromptFact` (request/session/prompt ids,
@@ -69,21 +72,29 @@ JSON-RPC error is a transport failure, likewise non-completion. A valid
 successful prompt candidate is correlated with the independently parsed
 `outcome.json`; current scheduler/state remains the sole persistence owner.
 
-AIR `sessionFailure` uses category/title/details/id/revision and optional
-severity. In the tagged source, omitted severity means `error`, intentionally
-so older AIR clients render it as failure ([source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexAcpServer.ts)). Revisions are only updates to the same failure id;
-recovery needs a later supported successful prompt, never an assumed reset.
+For this source's emitted records, AIR `sessionFailure` has `id`, `revision`,
+`category`, `severity`, `title`, and `actions` (with optional `details`). Its
+declared categories are `connection`, `access`, `limit`, `request`, `service`,
+and `unknown`; `severity` is required in emitted records. When consuming a
+generic AIR record, omitted severity is conservatively `error`, as the tagged
+source does ([failure construction source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexEventHandler.ts)). Terminal failures occur at
+`PromptResponse._meta.jetbrains.air.sessionFailure`; recoverable warnings occur
+in `session/update` `params.update._meta.jetbrains.air.sessionFailure` before a
+later prompt result. Revisions update the same failure id; recovery needs a
+later supported successful prompt, never an assumed reset.
 
-Conservative lossy mapping: `quota` -> unknown quota/account condition;
+Conservative lossy mapping: the Codex `quota_exhausted` kind is emitted as
+`limit` with no actions, and is only an unknown quota/account condition;
 `limit` without retry -> unknown (not subscription, identity, or reset time);
 `limit` with retry -> retryable throttling only; `service` with retry ->
 retryable service condition (not uniquely overload); `access`/`request` ->
 authentication/permission/invalid-request evidence as named; `connection` ->
 local-or-remote connection failure, including App Server death. Never infer
-from text, and suggested actions are display data, not scheduler/owner
+from text, and AIR `actions` are display data, not scheduler/owner
 authority. Process exit/signal/timeout remains an independent process fact.
 
 Fixtures in `tests/fixtures/acp-*.synthetic.json` are invented, attributed
-schema examples—not captured incidents. They cover success, typed terminal
-`end_turn`, warning then success, quota, retryable limit/service, access and
+schema examples—not captured incidents. Each is JSON-RPC-shaped and correlates
+request ids with results; fixtures cover success, typed terminal `end_turn`,
+warning then success, quota-as-limit, retryable limit and service, access,
 request, cancellation, and malformed AIR metadata.

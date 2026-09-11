@@ -83,6 +83,11 @@ def _valid_id(value: object) -> bool:
     return isinstance(value, (str, int)) and not isinstance(value, bool)
 
 
+def _reject_json_constant(value: str) -> object:
+    """Reject JSON extensions such as NaN and Infinity on the ACP wire."""
+    raise ValueError(f"invalid JSON numeric constant: {value}")
+
+
 def _validated(value: object) -> AcpMessage:
     if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
         raise AcpProtocolError("JSON-RPC version must be exactly 2.0")
@@ -187,7 +192,10 @@ class AcpJsonRpcStream:
                 piece = operation(4096, deadline, cancelled)
                 self._check(deadline, cancelled)
                 return piece
-            if not isinstance(self._reader, (io.BytesIO, io.StringIO, io.TextIOBase)):
+            # TextIOWrapper is a common wrapper for a pipe and is just as
+            # capable of blocking as a binary pipe.  Only the in-memory
+            # standard streams are safe to call directly here.
+            if not isinstance(self._reader, (io.BytesIO, io.StringIO)):
                 raise AcpDeadlineSupportError(
                     "reader must provide read_with_deadline for deadlines or cancellation"
                 )
@@ -202,7 +210,7 @@ class AcpJsonRpcStream:
                 count = operation(data, deadline, cancelled)
                 self._check(deadline, cancelled)
                 return count
-            if not isinstance(self._writer, (io.BytesIO, io.StringIO, io.TextIOBase)):
+            if not isinstance(self._writer, (io.BytesIO, io.StringIO)):
                 raise AcpDeadlineSupportError(
                     "writer must provide write_with_deadline for deadlines or cancellation"
                 )
@@ -215,7 +223,7 @@ class AcpJsonRpcStream:
                 operation(deadline, cancelled)
                 self._check(deadline, cancelled)
                 return
-            if not isinstance(self._writer, (io.BytesIO, io.StringIO, io.TextIOBase)):
+            if not isinstance(self._writer, (io.BytesIO, io.StringIO)):
                 raise AcpDeadlineSupportError(
                     "writer must provide flush_with_deadline for deadlines or cancellation"
                 )
@@ -255,7 +263,9 @@ class AcpJsonRpcStream:
     ) -> None:
         self._check(deadline, cancelled)
         try:
-            raw = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode(
+            raw = json.dumps(
+                message, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+            ).encode(
                 "utf-8"
             ) + b"\n"
         except (TypeError, ValueError) as exc:
@@ -319,7 +329,10 @@ class AcpJsonRpcStream:
             message["params"] = params
         self._write(message, deadline, None)
 
-    def _answer_request(self, value: dict[str, object], deadline: float | None) -> None:
+    def _answer_request(
+        self, value: dict[str, object], deadline: float | None,
+        cancelled: Callable[[], bool] | None,
+    ) -> None:
         request_id = value["id"]
         assert _valid_id(request_id)
         if self._request_handler is None:
@@ -332,7 +345,7 @@ class AcpJsonRpcStream:
                     {"jsonrpc": "2.0", "id": request_id,
                      "result": {"outcome": {"outcome": "cancelled"}}},
                     deadline,
-                    None,
+                    cancelled,
                 )
                 return
             if value["method"] == "elicitation/create":
@@ -340,12 +353,12 @@ class AcpJsonRpcStream:
                     {"jsonrpc": "2.0", "id": request_id,
                      "result": {"action": "cancel", "content": None}},
                     deadline,
-                    None,
+                    cancelled,
                 )
                 return
             self._write(
                 {"jsonrpc": "2.0", "id": request_id,
-                 "error": {"code": -32601, "message": "Method not supported"}}, deadline, None,
+                 "error": {"code": -32601, "message": "Method not supported"}}, deadline, cancelled,
             )
             return
         try:
@@ -360,10 +373,12 @@ class AcpJsonRpcStream:
         ):
             self._write(
                 {"jsonrpc": "2.0", "id": request_id,
-                 "error": {"code": -32603, "message": "Client request failed"}}, deadline, None,
+                 "error": {"code": -32603, "message": "Client request failed"}}, deadline, cancelled,
             )
             return
-        self._write({"jsonrpc": "2.0", "id": request_id, "result": result}, deadline, None)
+        self._write(
+            {"jsonrpc": "2.0", "id": request_id, "result": result}, deadline, cancelled,
+        )
 
     def pump(
         self, *, deadline: float | None = None, cancelled: Callable[[], bool] | None = None,
@@ -373,8 +388,8 @@ class AcpJsonRpcStream:
         if len(raw) > self._max_message_bytes:
             raise AcpMalformedFrame("ACP frame exceeds message limit")
         try:
-            value = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            value = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise AcpMalformedFrame("ACP frame is not valid UTF-8 JSON") from exc
         message = _validated(value)
         if message.kind == "response":
@@ -390,7 +405,7 @@ class AcpJsonRpcStream:
             if self._notification_handler is not None:
                 self._notification_handler(message.value)
         else:
-            self._answer_request(message.value, deadline)
+            self._answer_request(message.value, deadline, cancelled)
         return message
 
     def wait_for(

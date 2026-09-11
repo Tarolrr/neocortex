@@ -10,6 +10,7 @@ import pytest
 from nc.acp_stream import (
     AcpCancelled,
     AcpDeadlineExpired,
+    AcpDeadlineSupportError,
     AcpEofError,
     AcpJsonRpcStream,
     AcpMalformedFrame,
@@ -160,3 +161,57 @@ def test_deadline_expiring_during_deadline_aware_io_is_observed() -> None:
         AcpJsonRpcStream(io.BytesIO(), StalledWriter(), clock=lambda: now[0]).notify(
             "session/update", deadline=1.0
         )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"jsonrpc":"2.0","id":1,"result":NaN}\n',
+        b'{"jsonrpc":"2.0","id":1,"result":Infinity}\n',
+        b'{"jsonrpc":"2.0","method":"x","params":[-Infinity]}\n',
+    ],
+)
+def test_non_json_numeric_constants_are_rejected(raw: bytes) -> None:
+    with pytest.raises(AcpMalformedFrame, match="valid UTF-8 JSON"):
+        AcpJsonRpcStream(io.BytesIO(raw), io.BytesIO()).pump()
+    with pytest.raises(AcpWriteError, match="not JSON serializable"):
+        AcpJsonRpcStream(io.BytesIO(), io.BytesIO()).notify("x", {"number": float("nan")})
+
+
+def test_text_streams_need_deadline_aware_operations() -> None:
+    class BlockingTextReader(io.TextIOBase):
+        def read(self, _: int = -1) -> str:
+            raise AssertionError("potentially blocking read must not be called")
+
+    class BlockingTextWriter(io.TextIOBase):
+        def write(self, _: str) -> int:
+            raise AssertionError("potentially blocking write must not be called")
+
+        def flush(self) -> None:
+            return None
+
+    with pytest.raises(AcpDeadlineSupportError):
+        AcpJsonRpcStream(BlockingTextReader(), io.BytesIO(), clock=lambda: 0.0).pump(deadline=1.0)
+    with pytest.raises(AcpDeadlineSupportError):
+        AcpJsonRpcStream(io.BytesIO(), BlockingTextWriter(), clock=lambda: 0.0).notify(
+            "x", deadline=1.0
+        )
+
+
+def test_cancellation_interrupts_an_interleaved_request_response_write() -> None:
+    cancelled = [False]
+
+    class CancellingWriter:
+        def write_with_deadline(self, data: bytes, deadline: object, callback: object) -> int:
+            cancelled[0] = True
+            return len(data)
+
+        def flush_with_deadline(self, deadline: object, callback: object) -> None:
+            raise AssertionError("write cancellation must stop before flush")
+
+    incoming = frame({"jsonrpc": "2.0", "id": 9, "method": "client/question", "params": {}})
+    stream = AcpJsonRpcStream(
+        io.BytesIO(incoming), CancellingWriter(), request_handler=lambda _: {"answer": "no"},
+    )
+    with pytest.raises(AcpCancelled):
+        stream.pump(cancelled=lambda: cancelled[0])

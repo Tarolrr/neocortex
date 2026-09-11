@@ -1,0 +1,1 @@
+{"attribution":"synthetic; not a captured incident","initialize":{"clientCapabilities":{"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}}},"session":{"method":"session/new","id":"s1","cwd":"/work","model":"configured","policy":"workspace-write"},"prompt":{"method":"session/prompt","id":"p1","response":{"stopReason":"end_turn"}}}

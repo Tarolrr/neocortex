@@ -292,9 +292,10 @@ class AcpJsonRpcStream:
                 raise
             except Exception as exc:
                 raise AcpWriteError("ACP write failed") from exc
-            if count is None:
-                offset = len(data)
-            elif not isinstance(count, int) or count <= 0:
+            # ``None`` is the buffered/nonblocking stream convention for
+            # "would block".  It is not a successful full write: accepting
+            # it here would silently lose this frame (or its remaining tail).
+            if count is None or not isinstance(count, int) or count <= 0:
                 raise AcpWriteBlocked("ACP writer would block")
             else:
                 offset += count

@@ -96,6 +96,31 @@ class BlockedWriter:
         raise AssertionError("must not flush a blocked write")
 
 
+@pytest.mark.parametrize("writes", [[None], [5, None]])
+def test_none_write_result_is_blocked_without_flushing(writes: list[int | None]) -> None:
+    class NoneWriter:
+        def __init__(self) -> None:
+            self.writes = iter(writes)
+            self.output = bytearray()
+
+        def write(self, data: bytes) -> int | None:
+            count = next(self.writes)
+            if count is not None:
+                self.output.extend(data[:count])
+            return count
+
+        def flush(self) -> None:
+            raise AssertionError("must not flush a blocked write")
+
+    writer = NoneWriter()
+    with pytest.raises(AcpWriteBlocked):
+        AcpJsonRpcStream(io.BytesIO(), writer).notify("session/update", {})
+    if writes[0] is None:
+        assert writer.output == b""
+    else:
+        assert writer.output
+
+
 def test_blocked_write_and_deadline_are_explicit() -> None:
     with pytest.raises(AcpWriteBlocked):
         AcpJsonRpcStream(io.BytesIO(), BlockedWriter()).notify("session/update", {})

@@ -195,8 +195,9 @@ class AcpSubprocess:
         return f"ACP child exited unexpectedly with status {code}{detail}"
 
     def _terminate(self, *, force: bool = False) -> None:
-        if self.proc.poll() is not None:
-            return
+        # The direct child can exit before a descendant in its session does.
+        # Signal the process group even in that case: a dead parent is not
+        # evidence that its ACP process tree has gone away.
         try:
             os.killpg(self.proc.pid, signal.SIGKILL if force else signal.SIGTERM)
         except (ProcessLookupError, PermissionError):

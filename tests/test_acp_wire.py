@@ -90,3 +90,24 @@ def test_close_kills_a_descendant_in_the_owned_session(tmp_path: Path) -> None:
         time.sleep(0.02)
     else:
         pytest.fail("ACP descendant survived session-group shutdown")
+
+
+def test_close_kills_descendant_after_parent_already_exited(tmp_path: Path) -> None:
+    code = (
+        "import subprocess,sys; "
+        "p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+        "print(p.pid, flush=True)"
+    )
+    child = AcpSubprocess(helper(code), cwd=tmp_path, deadline=time.monotonic() + 3,
+                          log_path=tmp_path / "log")
+    descendant = int(child.reader.read_with_deadline(40, time.monotonic() + 2, None))
+    child.proc.wait(timeout=1)
+    child.close()
+    for _ in range(20):
+        try:
+            os.kill(descendant, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("ACP descendant survived after parent exit")

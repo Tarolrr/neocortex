@@ -87,18 +87,24 @@ def test_synthetic_acp_wire_fixture_shape(name, candidate):
         "version": 1, "capabilities": ["sessionFailure", "agentFileChangeReport",
         "nativeSubagentSessions", "asyncTasks", "recommendedValue"],
     }
-    assert "sessionFailure" not in initialize_response["result"]["agentCapabilities"].get("_meta", {})
+    agent_meta = initialize_response["result"]["agentCapabilities"].get("_meta", {})
+    assert "sessionFailure" not in agent_meta
     session = event(wire, method="session/new")
     assert set(session["params"]) == {"cwd", "mcpServers"}
     session_response = event(wire, request_id=session["id"])["result"]
     assert isinstance(session_response["sessionId"], str)
     assert session_response["sessionId"] != session["id"]
     if name == "acp-success.synthetic.json":
-        config_calls = [item for item in wire["wire"] if item.get("method") == "session/set_config_option"]
+        config_calls = [
+            item for item in wire["wire"] if item.get("method") == "session/set_config_option"
+        ]
         assert [(call["params"]["configId"], call["params"]["value"]) for call in config_calls] == [
             ("model", "configured"), ("mode", "agent"),
         ]
-        assert all(call["params"]["sessionId"] == session_response["sessionId"] for call in config_calls)
+        assert all(
+            call["params"]["sessionId"] == session_response["sessionId"]
+            for call in config_calls
+        )
     fact = prompt_fact(wire)
     failures = fact["session_failures"]
     if name == "acp-malformed-meta.synthetic.json":

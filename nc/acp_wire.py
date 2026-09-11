@@ -58,6 +58,10 @@ class AcpProcessTimeout(AcpProcessError):
     pass
 
 
+class AcpIntentionalShutdown(AcpProcessError):
+    """The supervisor's own bounded shutdown, never an adapter failure."""
+
+
 class _SupervisedStream:
     """Translate wire failures into evidence from its owning process.
 
@@ -174,15 +178,21 @@ class AcpSubprocess:
         self._stderr_limit = stderr_bytes
         self._stderr_done = threading.Event()
         self._closed = False
+        self._intentional_shutdown = False
+        # This is deliberately separate from a process exit code: closing a
+        # server is cleanup, not a successful ACP result.
+        self.shutdown_outcome: str | None = None
         self.cleanup_uncertain = False
         self._cgroup = _adapter_cgroup()
         env = dict(os.environ, PATH=f"{Path.home()}/.local/bin:{os.environ.get('PATH', '')}")
+        launched = False
         try:
             self.proc = subprocess.Popen(
                 list(command), cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, env=env, start_new_session=True,
                 preexec_fn=(lambda: _join_cgroup(self._cgroup)) if self._cgroup else None,  # noqa: PLW1509 - containment before ACP exec
             )
+            launched = True
             # Ownership is recorded immediately after launch, before even a
             # protocol-pipe object is made.  The failure path cannot use
             # ``close`` yet, so it invokes the same containment sequence.
@@ -195,9 +205,18 @@ class AcpSubprocess:
                     self.log_path.parent.mkdir(parents=True, exist_ok=True)
                     self.log_path.write_text("")
                     raise
-        except OSError as exc:
-            _remove_cgroup(self._cgroup)
-            raise AcpLaunchError(f"ACP launcher failure: {sanitize_diagnostic(str(exc))}") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            if not launched:
+                _remove_cgroup(self._cgroup)
+                raise AcpLaunchError(
+                    f"ACP launcher failure: {sanitize_diagnostic(str(exc))}"
+                ) from exc
+            # An ownership callback may itself choose a subprocess exception;
+            # it is not evidence that the launcher failed.  It has already
+            # run its containment cleanup, so retain its cleanup semantics.
+            if not self.cleanup_uncertain:
+                _remove_cgroup(self._cgroup)
+            raise
         except BaseException:
             if not self.cleanup_uncertain:
                 _remove_cgroup(self._cgroup)
@@ -232,11 +251,18 @@ class AcpSubprocess:
         return _SupervisedStream(self, wire)
 
     def check(self) -> None:
+        self._raise_if_intentional_shutdown()
         if self._clock() >= self.deadline:
             raise AcpProcessTimeout("ACP total deadline expired")
         code = self.proc.poll()
         if code is not None:
             raise AcpUnexpectedExit(self._exit_message(code))
+
+    def _raise_if_intentional_shutdown(self) -> None:
+        if self._intentional_shutdown:
+            raise AcpIntentionalShutdown(
+                self.shutdown_outcome or "ACP intentional shutdown in progress"
+            )
 
     def _check_before_wire(self) -> None:
         """Do not allow a known local death to look like a wire failure."""
@@ -244,12 +270,14 @@ class AcpSubprocess:
 
     def deadline_expired(self, exc: AcpDeadlineExpired) -> None:
         """Translate expiration of this supervisor's total deadline."""
+        self._raise_if_intentional_shutdown()
         if self._clock() >= self.deadline:
             raise AcpProcessTimeout("ACP total deadline expired") from exc
         raise exc
 
     def transport_eof(self, exc: AcpEofError) -> None:
         """Convert wire EOF to local transport evidence, preserving exit state."""
+        self._raise_if_intentional_shutdown()
         code = self.proc.poll()
         if code is not None:
             raise AcpUnexpectedExit(self._exit_message(code)) from exc
@@ -263,6 +291,7 @@ class AcpSubprocess:
         wraps ``BrokenPipeError`` as ``AcpWriteError``; a second poll preserves
         the stronger process evidence when it is now available.
         """
+        self._raise_if_intentional_shutdown()
         code = self.proc.poll()
         if code is not None:
             raise AcpUnexpectedExit(self._exit_message(code)) from exc
@@ -372,6 +401,8 @@ class AcpSubprocess:
         if self._closed:
             return
         self._closed = True
+        self._intentional_shutdown = True
+        self.shutdown_outcome = "ACP intentional shutdown in progress"
         # EOF is the ACP stdio closure/cancellation signal.  Give a compliant
         # server a small, independent grace period before containment signals.
         self._cleanup_process(close_pipes=False)
@@ -384,6 +415,15 @@ class AcpSubprocess:
         self._drainer.join(timeout=self._grace)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.write_text(self.diagnostics + ("\n" if self.diagnostics else ""))
+        code = self.proc.returncode
+        if code is None:
+            evidence = "child not reaped"
+        elif code < 0:
+            evidence = f"child terminated by signal {-code}"
+        else:
+            evidence = f"child exited with status {code}"
+        uncertainty = "; containment uncertain" if self.cleanup_uncertain else ""
+        self.shutdown_outcome = f"ACP intentional shutdown: {evidence}{uncertainty}"
 
     def __enter__(self) -> Self:
         return self

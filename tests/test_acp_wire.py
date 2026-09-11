@@ -13,6 +13,7 @@ import pytest
 from nc import acp_wire
 from nc.acp_stream import AcpCancelled, AcpEofError
 from nc.acp_wire import (
+    AcpIntentionalShutdown,
     AcpLaunchError,
     AcpProcessTimeout,
     AcpSubprocess,
@@ -64,6 +65,22 @@ def test_launcher_failure_is_local_and_has_no_child(tmp_path: Path) -> None:
     with pytest.raises(AcpLaunchError, match="launcher failure"):
         AcpSubprocess(["definitely-not-an-acp-helper"], cwd=tmp_path,
                       deadline=time.monotonic() + 1, log_path=tmp_path / "log")
+
+
+def test_preexec_containment_failure_is_a_launcher_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Popen reports a pre-exec failure as SubprocessError, after reaping it."""
+    cgroup = tmp_path / "mock-cgroup"
+    cgroup.mkdir()
+    monkeypatch.setattr(acp_wire, "_adapter_cgroup", lambda: cgroup)
+
+    def fail_join(_path: Path) -> None:
+        raise RuntimeError("mock containment join failed")
+
+    monkeypatch.setattr(acp_wire, "_join_cgroup", fail_join)
+    with pytest.raises(AcpLaunchError, match="launcher failure"):
+        AcpSubprocess(helper("import time; time.sleep(30)"), cwd=tmp_path,
+                      deadline=time.monotonic() + 1, log_path=tmp_path / "log")
+    assert not cgroup.exists()
 
 
 def test_stream_uses_total_deadline_for_hung_request(tmp_path: Path) -> None:
@@ -168,6 +185,10 @@ def test_close_escalates_hung_graceful_shutdown_and_reaps(tmp_path: Path) -> Non
     assert child.proc.returncode == -9
     with pytest.raises(ChildProcessError):
         os.waitpid(child.proc.pid, os.WNOHANG)
+    with pytest.raises(AcpIntentionalShutdown, match="intentional shutdown.*signal 9"):
+        child.check()
+    with pytest.raises(AcpIntentionalShutdown, match="intentional shutdown.*signal 9"):
+        child.transport_eof(AcpEofError("stdout EOF"))
 
 
 def test_exit_and_live_stdout_eof_are_not_provider_or_success(tmp_path: Path) -> None:

@@ -38,6 +38,12 @@ if scenario in {"restricted", "isolated"}:
 if scenario == "eof":
     import os
     os.close(1); time.sleep(2); sys.exit(0)
+if scenario == "unsupported_profile":
+    # Negotiation is validated before a session can be created.  EOF proves
+    # the client did not send session/new (and therefore cannot prompt).
+    response(init, {"protocolVersion":2, "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}})
+    assert sys.stdin.readline() == ""
+    sys.exit(0)
 response(init, {"protocolVersion":1, "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}})
 new = read()
 options = [{"id":"model","options":[{"value":"model"}],"currentValue":"x"}, {"id":"mode","options":[{"value":"agent"}],"currentValue":"x"}]
@@ -154,7 +160,8 @@ def test_fake_client_requests_are_cancelled_or_fail_closed(tmp_path: Path, scena
     assert run(tmp_path, scenario).prompt.kind == "success"
 
 
-@pytest.mark.parametrize("scenario,error", [("unsupported", AcpClientRejected), ("reset_model", AcpClientRejected),
+@pytest.mark.parametrize("scenario,error", [("unsupported_profile", AcpClientRejected),
+                                               ("unsupported", AcpClientRejected), ("reset_model", AcpClientRejected),
                                                ("eof", AcpTransportEof), ("timeout", AcpProcessTimeout)])
 def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: str, error: type[Exception]) -> None:
     with pytest.raises(error) as raised:

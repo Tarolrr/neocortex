@@ -21,7 +21,6 @@ from .acp_stream import AcpDeadlineExpired, AcpStreamError
 from .acp_wire import AcpProcessError, AcpProcessTimeout, AcpSubprocess
 
 _ORDINARY_MODE = "agent"
-_RESTRICTED_MODE = "nc-workspace-network"
 # These are the effective sandbox values of ``AgentMode.Agent`` in the pinned
 # ACP artifact, not desired values supplied by an incoming request.  They are
 # kept beside the selected mode so that a policy whose requirements conflict
@@ -145,11 +144,10 @@ def _write_pinned_config(policy: CodexAcpPolicy, config_home: Path) -> None:
     """Write the sole Codex configuration consulted by the ACP child.
 
     ACP config negotiation explicitly selects the pinned execution policy too.
-    This launch boundary prevents global configuration from
-    changing the requested web/network settings, or changing the
-    noninteractive request handler.  The restricted profile is intentionally
-    separately named and bound by launch evidence: it preserves the workspace
-    sandbox while enabling only the documented public-web/network setting.
+    This launch boundary prevents global configuration from changing the
+    requested web/network settings or the noninteractive request handler.
+    Restricted invocations are rejected before this function is reached: the
+    pinned artifact contains no source-backed mode with its required tuple.
     """
     config_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     network = "true" if policy.network_access else "false"
@@ -167,21 +165,28 @@ def _validate_pinned_mode_for_policy(policy: CodexAcpPolicy) -> None:
     """Fail before dispatch when the selected ACP mode weakens a policy.
 
     ``agent`` is source-pinned as workspaceWrite with network disabled.  The
-    restricted profile is separately bound by launch evidence and its private
-    config below; it may not be substituted by ``agent`` or caller input.
+    pinned 1.11.0 source contains no restricted mode that can establish the
+    required workspace-write, on-request, public-web/network tuple.  A config
+    echo or caller-provided profile name cannot prove those semantics, so do
+    not launch a child for restricted work until a pinned artifact supports it.
     """
     if policy.kind == "ordinary" and (_PINNED_MODE_SANDBOX != "workspaceWrite"
                                       or _PINNED_MODE_NETWORK_ACCESS):
         raise AcpClientRejected(
             "pinned ordinary ACP mode cannot preserve workspace-write policy"
         )
-    if policy.kind == "restricted" and (not policy.public_web_search
-                                         or not policy.network_access):
-        raise AcpClientRejected("restricted ACP profile cannot weaken pinned web/network policy")
+    if policy.kind == "restricted":
+        raise AcpClientRejected(
+            "restricted ACP profile is unsupported by the pinned artifact"
+        )
 
 
 def _mode_for(policy: CodexAcpPolicy) -> str:
-    return _ORDINARY_MODE if policy.kind == "ordinary" else _RESTRICTED_MODE
+    if policy.kind == "restricted":
+        # Keep this guard local too, so future callers cannot accidentally use
+        # a fabricated config value after the validation gate above.
+        raise AcpClientRejected("restricted ACP profile is unsupported by the pinned artifact")
+    return _ORDINARY_MODE
 
 
 def _options(response: object) -> list[dict[str, object]]:

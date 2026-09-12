@@ -67,6 +67,30 @@ def test_launcher_failure_is_local_and_has_no_child(tmp_path: Path) -> None:
                       deadline=time.monotonic() + 1, log_path=tmp_path / "log")
 
 
+def test_explicit_path_is_not_shadowed_by_runtime_home_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relative verified command resolves only through the supplied PATH."""
+    runtime_home = tmp_path / "runtime-home"
+    conflict = runtime_home / ".local" / "bin"
+    selected = tmp_path / "verified-bin"
+    conflict.mkdir(parents=True)
+    selected.mkdir()
+    name = "acp-path-helper"
+    bad_marker = tmp_path / "runtime-home-was-launched"
+    (conflict / name).write_text(f"#!/bin/sh\ntouch {bad_marker}\n")
+    (selected / name).write_text("#!/bin/sh\nprintf 'selected\\n'")
+    (conflict / name).chmod(0o755)
+    (selected / name).chmod(0o755)
+    # This models the parent runtime home the old launcher prepended.
+    monkeypatch.setattr(acp_wire.Path, "home", lambda: runtime_home)
+    with AcpSubprocess([name], cwd=tmp_path, deadline=time.monotonic() + 2,
+                       log_path=tmp_path / "log",
+                       env={"PATH": str(selected), "HOME": str(runtime_home)}) as child:
+        assert child.reader.read_with_deadline(16, time.monotonic() + 1, None) == b"selected\n"
+    assert not bad_marker.exists()
+
+
 def test_preexec_containment_failure_is_a_launcher_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Popen reports a pre-exec failure as SubprocessError, after reaping it."""
     cgroup = tmp_path / "mock-cgroup"

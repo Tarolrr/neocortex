@@ -193,8 +193,11 @@ class AcpSubprocess:
         self.timeout_phases: list[str] = []
         self.cleanup_uncertain = False
         self._cgroup = _adapter_cgroup()
+        # ``env`` is an isolation boundary.  In particular, do not prepend a
+        # runtime-home bin directory: a relative verified command must resolve
+        # only through the explicitly supplied PATH, not a parent-controlled
+        # same-named executable.
         launch_env = dict(os.environ if env is None else env)
-        launch_env["PATH"] = f"{Path.home()}/.local/bin:{launch_env.get('PATH', '')}"
         launched = False
         try:
             self.proc = subprocess.Popen(

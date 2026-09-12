@@ -71,6 +71,10 @@ workspace-write sandbox; `agent-full-access` is the only tagged `never` mode
 and it selects `dangerFullAccess`, so it is rejected for NC's no-widened-
 sandbox profile. Validate the selected `agent` config response and this
 source-pinned policy tuple before a prompt; the tuple is not an ACP wire echo.
+The artifact provides no source-backed workspace-write mode with public web
+search/network enabled. Therefore the explicitly represented restricted input
+is rejected before launch; an offered mode string, current option value, or
+caller-provided launch profile cannot substitute for source-backed semantics.
 For `agent`, every `session/request_permission` is fail-closed with the ACP
 v1 **cancelled** outcome even if Codex asks after auto-review/on-request, and every elicitation is
 **cancel**. An unavailable policy-owner response, unknown/malformed request,

@@ -29,9 +29,9 @@ def read(): return json.loads(sys.stdin.readline())
 def send(value): print(json.dumps(value), flush=True)
 def response(request, result): send({"jsonrpc":"2.0", "id":request["id"], "result":result})
 init = read()
-if scenario in {"agent_tool", "restricted"}:
+if scenario == "agent_tool":
     assert set(init["params"]["clientCapabilities"]) == {"_meta"}
-if scenario in {"restricted", "isolated"}:
+if scenario == "isolated":
     home = os.environ["HOME"]
     config = open(os.path.join(home, "config.toml")).read()
     assert os.environ["CODEX_HOME"] == home
@@ -39,14 +39,8 @@ if scenario in {"restricted", "isolated"}:
     assert "CODEX_PATH" not in os.environ
     assert "INITIAL_AGENT_MODE" not in os.environ
     assert "sandbox_mode = \"workspace-write\"" in config
-    if scenario == "restricted":
-        assert os.getcwd() == os.environ["EXPECTED_CWD"]
-        assert "web_search = \"live\"" in config and "network_access = true" in config
-        assert "approval_policy = \"on-request\"" in config
-        assert home != os.environ.get("INHERITED_HOME")
-    else:
-        assert "web_search = \"disabled\"" in config and "network_access = false" in config
-        assert home != os.environ.get("INHERITED_HOME")
+    assert "web_search = \"disabled\"" in config and "network_access = false" in config
+    assert home != os.environ.get("INHERITED_HOME")
 if scenario == "eof":
     import os
     os.close(1); time.sleep(2); sys.exit(0)
@@ -58,7 +52,7 @@ if scenario == "unsupported_profile":
     sys.exit(0)
 response(init, {"protocolVersion":1, "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}})
 new = read()
-mode = "nc-workspace-network" if scenario == "restricted" else "agent"
+mode = "agent"
 options = [{"id":"model","options":[{"value":"model"}],"currentValue":"x"}, {"id":"mode","options":[{"value":mode}],"currentValue":"x"}]
 if scenario == "unsupported": options[0]["options"] = []
 response(new, {"sessionId":"fresh", "configOptions":options,
@@ -95,7 +89,7 @@ if scenario == "timeout":
     assert close["method"] == "session/close"
     response(close, {})
     time.sleep(.1); sys.exit(0)
-if scenario in {"permission", "restricted"}:
+if scenario == "permission":
     send({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{"sessionId":"fresh"}})
     assert read()["result"] == {"outcome":{"outcome":"cancelled"}}
 if scenario == "elicitation":
@@ -237,15 +231,6 @@ def test_source_pinned_agent_owned_tool_update_needs_no_client_tools(tmp_path: P
     # initialize shape; this update is the source-backed server-to-client
     # agent tool path, not a capability advertised by NC.
     assert turn.live_sandbox_enforcement_verified is False
-    restricted_command = fake_server("restricted")
-    restricted = run_codex_acp_turn(
-        restricted_command,
-        launch=verified_launch(restricted_command, profile="nc-workspace-network"),
-        policy=CodexAcpPolicy.restricted(tmp_path), model="model", prompt="hello",
-        log_path=tmp_path / "restricted-agent-tool.log",
-        environment={"EXPECTED_CWD": str(tmp_path.resolve())},
-    )
-    assert restricted.prompt.kind == "success"
 
 
 def test_fake_late_foreign_incident_is_not_prompt_evidence(tmp_path: Path) -> None:
@@ -301,29 +286,18 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
         assert raised.value.process["timed_out"] is False
 
 
-def test_restricted_policy_uses_pinned_workspace_network_profile(tmp_path: Path) -> None:
+def test_restricted_policy_is_explicit_but_fails_closed_without_source_backing(tmp_path: Path) -> None:
     policy = CodexAcpPolicy.restricted(tmp_path)
     assert policy.cwd == tmp_path.resolve()
     assert policy.public_web_search and policy.network_access
-    command = fake_server("restricted")
-    turn = run_codex_acp_turn(
-        command, launch=verified_launch(command, profile="nc-workspace-network"), policy=policy,
-        model="model", prompt="hello", log_path=tmp_path / "restricted.log",
-        environment={"EXPECTED_CWD": str(tmp_path.resolve()), "INHERITED_HOME": "/runtime-home"},
-    )
-    assert turn.prompt.kind == "success"
-    assert turn.live_sandbox_enforcement_verified is False
-
-
-def test_restricted_profile_rejects_when_server_cannot_enforce_its_mode(tmp_path: Path) -> None:
-    # A launch-evidence profile cannot compensate for a server that does not
-    # advertise the exact restricted execution policy.
-    command = fake_server("success")
-    with pytest.raises(AcpClientRejected, match="execution policy is unsupported"):
+    marker = tmp_path / "restricted-server-started"
+    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
+    with pytest.raises(AcpClientRejected, match="unsupported by the pinned artifact"):
         run_codex_acp_turn(
-            command, launch=verified_launch(command, profile="nc-workspace-network"), policy=CodexAcpPolicy.restricted(tmp_path),
-            model="model", prompt="hello", log_path=tmp_path / "rejected.log",
+            command, launch=verified_launch(command, profile="agent"), policy=policy,
+            model="model", prompt="hello", log_path=tmp_path / "restricted.log",
         )
+    assert not marker.exists()
 
 
 def test_global_config_and_invalid_policy_cannot_override_pinned_launch(tmp_path: Path) -> None:

@@ -258,6 +258,20 @@ def _category_from_terminal(text: str) -> str:
     """Map a *structured terminal* provider diagnostic to the runner taxonomy."""
     value = text.lower()
     # Ordered from specific product/account states to broad HTTP-style errors.
+    # Captured Codex terminal evidence (owner feedback 245, T013 run 174)
+    # names neither a "subscription" nor a "plan". Require every distinct,
+    # provider-owned clause so general mentions of usage, Pro, or retry dates
+    # cannot become subscription evidence. Its human date is not parsed.
+    captured_codex_usage_limit = re.search(
+        r"\byou['’]ve\s+hit\s+your\s+usage\s+limit\b", value,
+    )
+    captured_consumer_product = (
+        re.search(r"\bupgrade\s+to\s+pro\s*\(\s*https://chatgpt\.com/explore/pro\s*\)", value)
+        and re.search(r"https://chatgpt\.com/codex/settings/usage\b", value)
+    )
+    captured_retry = re.search(r"\btry\s+again\s+at\s+\S+", value)
+    if captured_codex_usage_limit and captured_consumer_product and captured_retry:
+        return "subscription_limit"
     # A bare "usage limit" or "plan limit" also occurs for API organization
     # spend limits.  It cannot establish a resettable end-user subscription
     # allowance.  Require both an explicit consumer subscription/product plan

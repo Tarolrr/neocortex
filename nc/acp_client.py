@@ -348,8 +348,8 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
         timeout_phases.extend(child.timeout_phases)
         if failure is not None:
             process = _process_fact(child, bool(timeout_phases), timeout_phases)
-            setattr(failure, "process", process)
-            setattr(failure, "shutdown", child.shutdown_outcome)
+            failure.process = process
+            failure.shutdown = child.shutdown_outcome
             if isinstance(failure, AcpProcessTimeout):
                 failure.timeout_phases = tuple(timeout_phases)
     assert result is not None

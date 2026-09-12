@@ -136,8 +136,10 @@ def _write_pinned_config(policy: CodexAcpPolicy, config_home: Path) -> None:
 
     ACP config negotiation explicitly selects the pinned ``agent`` execution
     policy too.  This launch boundary prevents global configuration from
-    broadening the sandbox, changing the requested web/network settings, or
-    changing the noninteractive request handler.
+    changing the requested web/network settings, or changing the
+    noninteractive request handler.  The source-pinned ACP mode subsequently
+    owns its live sandbox tuple; this client records no claim that its private
+    config request has been enforced by a real Codex process.
     """
     config_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     network = "true" if policy.network_access else "false"

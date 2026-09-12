@@ -280,6 +280,12 @@ def test_restricted_policy_launches_an_isolated_child_with_its_pinned_settings(
     policy = CodexAcpPolicy.restricted(tmp_path)
     assert policy.cwd == tmp_path.resolve()
     assert policy.public_web_search and policy.network_access
+    # The private launch request is intentionally distinct from a verified
+    # live sandbox: the source-pinned ``agent`` mode owns a false effective
+    # networkAccess value when ACP applies that mode.
+    source = json.loads((Path(__file__).parent / "fixtures" /
+                         "codex-acp-agent-tool-path.source.json").read_text())
+    assert source["selected_mode"]["sandboxPolicy"]["networkAccess"] is False
     command = fake_server("restricted")
     turn = run_codex_acp_turn(command, launch=verified_launch(command), policy=policy,
                                model="model", prompt="hello", log_path=tmp_path / "restricted.log",

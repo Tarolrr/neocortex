@@ -21,7 +21,7 @@ host evidence. Old rows display as `legacy/unknown`.
 
 | Category | Meaning and evidence |
 | --- | --- |
-| `subscription_limit` | A resettable product/subscription allowance only when a terminal CLI diagnostic explicitly identifies the subscription/product plan **and** a reset or cadence. Bare `usage limit`, `plan limit`, `insufficient_quota`, or HTTP 429 do not establish it. |
+| `subscription_limit` | A resettable product/subscription allowance only when a terminal CLI diagnostic explicitly identifies the subscription/product plan **and** a reset or cadence. One bounded captured Codex grammar is also recognized: `You've hit your usage limit` + `Upgrade to Pro (https://chatgpt.com/explore/pro)` + `https://chatgpt.com/codex/settings/usage` + `try again at ...`. Bare `usage limit`, `plan limit`, `insufficient_quota`, or HTTP 429 do not establish it. |
 | `throttled` | Rate limiting. A 429 alone has no reset schedule. |
 | `overloaded`, `transient` | Provider capacity or transport failures; neither is authorization. |
 | `authentication`, `permission` | Login/key/authorization failure. |
@@ -62,6 +62,27 @@ followed by a successful final event and exit zero is success.
 Fixtures in tests are synthetic unless a test says otherwise. No historical
 owner incident is called verified without its original run log and terminal
 evidence; no such incident is asserted here.
+
+## Captured legacy Codex compatibility evidence
+
+Owner feedback **245** supplied the terminal tail from
+`/root/.neocortex/runs/worker-neocortex-T013_20260911T092118Z/session.log`.
+The minimal sanitized fixture
+`tests/fixtures/codex-usage-limit.owner-feedback-245.run-174.captured.jsonl`
+retains only the observed top-level `error` and final `turn.failed` envelopes
+from run **174**, including its message. It is not a full session transcript.
+The read-only owner evidence for runs **174–176** was `NO_OUTCOME`, child exit
+**1**, host assessment `FAILED`, and terminal category `unknown`; it does not
+establish that a paid subscription expired. It establishes a resettable usage
+allowance only when this terminal grammar is present. The fixture is captured
+evidence; changed date, case, and spacing examples in tests are explicitly
+synthetic grammar variants.
+
+The human `try again at Sep 15th, 2026 6:19 AM` text has no timezone. It is
+retry evidence, never an absolute reset timestamp: timer fallback remains in
+effect. Existing trustworthy epoch-form `retry at`/`reset at` evidence may
+still set `defer_until`; this compatibility matcher adds neither a natural
+language date parser nor an internal retry loop.
 
 Execution precedence is: timeout/host-signal kill, structured terminal failure, nonzero exit,
 then parsed outcome. A host failure records usage and run evidence but cannot

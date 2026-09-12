@@ -1327,15 +1327,20 @@ def test_planner_missing_restricted_operation_fails_closed_without_worker_run(se
 
 @pytest.mark.parametrize("role", ["worker", "critic"])
 @pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
-def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role, failure):
-    """Synthetic terminal evidence must beat a valid agent-authored DONE."""
+@pytest.mark.parametrize(("payload", "kind"), [
+    ({"outcome": "DONE", "verdict": "pass", "memo": "lose"}, protocol.DONE),
+    ({"outcome": "ASK", "to": "owner", "question": "discard", "memo": "lose"}, protocol.ASK),
+])
+def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role, failure,
+                                                                   payload, kind):
+    """Synthetic host evidence must beat valid agent-authored DONE and ASK."""
     cfg, state, repo = setup
     task = state.add_task("neocortex", "host evidence", "objective", [])
     state.set_task(task, status="in_review" if role == "critic" else "in_progress")
     agent_id = state.add_agent(f"{role}-host", role, "neocortex", task, "model")
     state.set_agent(agent_id, memo="keep")
     state.send("feedback", "owner", agent_id, {"text": "keep inbox"}, task)
-    adapter = ScriptedAdapter([emit({"outcome": "DONE", "verdict": "pass", "memo": "lose"})])
+    adapter = ScriptedAdapter([emit(payload)])
     original = adapter.run
 
     def failed_session(*args):
@@ -1353,7 +1358,7 @@ def test_host_failure_with_valid_outcome_keeps_task_inbox_and_memo(setup, role, 
     outcome = turn.run_turn(state, cfg, adapter, agent, repo, "main")
     run = state.one("SELECT * FROM run WHERE agent_id=?", (agent_id,))
     assert outcome.kind == protocol.FAIL
-    assert run["outcome"] == protocol.DONE and run["host_assessment"] == "FAILED"
+    assert run["outcome"] == kind and run["host_assessment"] == "FAILED"
     assert state.one("SELECT memo FROM agent WHERE id=?", (agent_id,))[0] == "keep"
     assert state.inbox(agent_id)
     assert state.one("SELECT turns FROM agent WHERE id=?", (agent_id,))[0] == (
@@ -1616,10 +1621,14 @@ def test_typed_preflight_exception_defers_without_incident_and_retries(setup, mo
 class TimerFlakyAdapter(ScriptedAdapter):
     """A fake provider which fails completed sessions before later recovery."""
 
-    def __init__(self, script, temporary_failures=1, *, permanent=False):
+    def __init__(self, script, temporary_failures=1, *, permanent=False,
+                 captured_codex_limit=False):
         super().__init__(script)
         self.temporary_failures = temporary_failures
         self.permanent = permanent
+        self.captured_codex_limit = captured_codex_limit
+        if captured_codex_limit:
+            self.name = "codex"
 
     def run(self, *args, **kwargs):
         result = super().run(*args, **kwargs)
@@ -1627,6 +1636,12 @@ class TimerFlakyAdapter(ScriptedAdapter):
             self.temporary_failures -= 1
             if self.permanent:
                 result.exit_code = 1
+            elif self.captured_codex_limit:
+                # The first offline dispatch uses the captured terminal
+                # envelope; assessment, rather than an adapter test hook,
+                # must select subscription-limit deferral.
+                result.log_path.write_text((Path(__file__).parent / "fixtures" /
+                    "codex-usage-limit.owner-feedback-245.run-174.captured.jsonl").read_text())
             else:
                 # This is adapter-owned terminal evidence, after the agent has
                 # made a partial change/written an outcome, not agent JSON.
@@ -1658,7 +1673,7 @@ def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
         adapter = TimerFlakyAdapter([
             partial,
             commit_and_emit("complete", "ok\n", {"outcome": "DONE", "summary": "done"}),
-        ])
+        ], captured_codex_limit=True)
         # Undelivered feedback must survive the failed host session.
         state.add_agent(f"worker-{task}", "worker", "neocortex", task, "model")
         state.set_task(task, status="in_progress")
@@ -1673,19 +1688,19 @@ def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
         adapter = TimerFlakyAdapter([
             partial,
             emit({"outcome": "DONE", "verdict": "rework", "findings": ["fix"]}),
-        ])
+        ], captured_codex_limit=True)
     elif role == "planner":
         planner, _ = state.planner_feedback(None, "retain revision wake", "model")
         adapter = TimerFlakyAdapter([
             partial,
             emit({"outcome": "DONE", "summary": "proposal", "proposal": [planner_spec()]}),
-        ])
+        ], captured_codex_limit=True)
     else:
         proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
         adapter = TimerFlakyAdapter([
             partial,
             emit({"outcome": "DONE", "recommendation": "keep", "findings": ["sound"]}),
-        ])
+        ], captured_codex_limit=True)
         adapter.run_planner = adapter.run
 
     # The first invocation makes exactly one dispatch and returns on deferral.

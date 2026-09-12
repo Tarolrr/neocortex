@@ -45,6 +45,10 @@ class AcpPromptFact(TypedDict):
     prompt_id: str
     prompt_response_valid: bool
     stop_reason: str | None
+    # The last complete structured usage snapshot observed for this prompt.
+    # It is independent of a terminal response, so local transport failure
+    # cannot erase provider accounting already received.
+    usage: NotRequired[dict[str, int]]
     jsonrpc_result: NotRequired[dict[str, object]]
     jsonrpc_error: NotRequired[dict[str, object]]
     # Raw values from every discovered AIR sessionFailure in wire order.
@@ -99,14 +103,15 @@ def is_completion_candidate(prompt: AcpPromptFact) -> bool:
     failures = prompt.get("session_failures")
     if not isinstance(observations, list) or not isinstance(failures, list):
         return False
-    if not all(is_air_session_failure(observation) for observation in observations):
-        return False
-    if not all(is_air_session_failure(failure) for failure in failures):
-        return False
     return (
         prompt.get("prompt_response_valid") is True
         and isinstance(prompt.get("jsonrpc_result"), dict)
         and "jsonrpc_error" not in prompt
         and prompt.get("stop_reason") == "end_turn"
-        and all(failure["severity"] != "error" for failure in failures)
+        # ``failures`` is the decoder's revision-reconciled effective view.
+        # Do not revalidate raw observations here: stale records and unknown
+        # extensions are intentionally decoder semantics, not a second route
+        # to completion or rejection.
+        and all(isinstance(failure, dict) and failure.get("severity") != "error"
+                for failure in failures)
     )

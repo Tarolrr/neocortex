@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Literal
 
 from .acp_contract import AcpProcessFact, AcpPromptFact
-from .acp_decoder import AcpPromptResult, decode_acp_prompt_result
+from .acp_decoder import AcpPromptResult, _usage, decode_acp_prompt_result
 from .acp_stream import AcpDeadlineExpired, AcpStreamError
 from .acp_wire import AcpProcessError, AcpProcessTimeout, AcpSubprocess
 
@@ -47,11 +47,11 @@ _PROTECTED_ENV = frozenset({
 class AcpClientRejected(RuntimeError):
     """A profile, policy, or server capability was rejected before prompting."""
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, log_path: str = "") -> None:
         super().__init__(message)
         # Pre-launch rejection has no child facts, but consumers still get a
         # stable envelope instead of scraping an exception string.
-        self.evidence = AcpTurnEvidence(None, None, None, False, "", "setup_rejected")
+        self.evidence = AcpTurnEvidence(None, None, None, None, False, log_path, "setup_rejected")
 
 
 class AcpEvidenceOverflow(RuntimeError):
@@ -148,6 +148,7 @@ class AcpTurnEvidence:
     """
 
     prompt: AcpPromptFact | None
+    usage: dict[str, int] | None
     process: AcpProcessFact | None
     shutdown: str | None
     cleanup_uncertain: bool
@@ -164,6 +165,8 @@ class _TurnEvidenceCollector:
         self.session_id: str | None = None
         self.bytes = 0
         self.overflow = False
+        self.air_observations: list[object] = []
+        self.usage: dict[str, int] | None = None
 
     def _add(self, value: object) -> None:
         try:
@@ -179,7 +182,9 @@ class _TurnEvidenceCollector:
 
     def prompt_request(self, value: dict[str, object], prompt_id: int, session_id: str) -> None:
         self.prompt_id, self.session_id = prompt_id, session_id
-        self._add(value)
+        # Never retain caller prompt text.
+        self._add({"jsonrpc": value.get("jsonrpc"), "id": prompt_id,
+                   "method": "session/prompt", "params": {"sessionId": session_id}})
 
     def notification(self, value: dict[str, object]) -> None:
         """Keep only update fields which the decoder is allowed to inspect."""
@@ -191,11 +196,23 @@ class _TurnEvidenceCollector:
         update = params.get("update")
         if not isinstance(update, dict):
             return
-        # Tool/transcript payloads are intentionally not copied.
-        if not (_has_air(update) or (update.get("sessionUpdate") == "usage_update" and "usage" in update)):
+        air = _project_air(update)
+        usage = _project_usage(update.get("usage")) if update.get("sessionUpdate") == "usage_update" else None
+        if air is None and usage is None:
             return
+        projected: dict[str, object] = {}
+        raw_failure: object | None = None
+        if air is not None:
+            projected["_meta"] = {"jetbrains": {"air": air}}
+            raw_failure = air.get("sessionFailure")
+        if usage is not None:
+            projected["sessionUpdate"] = "usage_update"
+            projected["usage"] = usage
+            self.usage = usage
         self._add({"jsonrpc": value.get("jsonrpc"), "method": "session/update",
-                   "params": {"sessionId": self.session_id, "update": update}})
+                   "params": {"sessionId": self.session_id, "update": projected}})
+        if raw_failure is not None and _incident_owned(raw_failure, self.prompt_id):
+            self.air_observations.append(raw_failure)
 
     def prompt_response(self, value: object) -> None:
         if not isinstance(value, dict):
@@ -204,15 +221,75 @@ class _TurnEvidenceCollector:
         # Prompt result extensions may carry arbitrary content too.  The
         # decoder has authority only over these terminal fields.
         retained: dict[str, object] = {key: value[key] for key in ("jsonrpc", "id") if key in value}
+        raw_failure: object | None = None
         if "result" in value:
             result = value["result"]
             if isinstance(result, dict):
-                retained["result"] = {key: result[key] for key in ("stopReason", "usage", "_meta") if key in result}
+                terminal: dict[str, object] = {}
+                if "stopReason" in result:
+                    terminal["stopReason"] = result["stopReason"]
+                usage = _project_usage(result.get("usage"))
+                if usage is not None:
+                    terminal["usage"] = usage
+                    self.usage = usage
+                air = _project_air(result)
+                if air is not None:
+                    terminal["_meta"] = {"jetbrains": {"air": air}}
+                    raw_failure = air.get("sessionFailure")
+                else:
+                    raw_failure = None
+                retained["result"] = terminal
             else:
                 retained["result"] = result
         if "error" in value:
-            retained["error"] = value["error"]
+            error = value["error"]
+            if isinstance(error, dict):
+                retained["error"] = {key: error[key] for key in ("code", "message") if key in error}
+            else:
+                retained["error"] = error
         self._add(retained)
+        if raw_failure is not None and _incident_owned(raw_failure, self.prompt_id):
+            self.air_observations.append(raw_failure)
+
+
+def _project_usage(value: object) -> dict[str, int] | None:
+    """Keep only a complete, bounded usage snapshot (never provider extras)."""
+    decoded = _usage(value)
+    if decoded is None or decoded.input_tokens is None or decoded.output_tokens is None:
+        return None
+    result = {"inputTokens": decoded.input_tokens, "outputTokens": decoded.output_tokens}
+    if decoded.cached_input_tokens is not None:
+        result["cachedInputTokens"] = decoded.cached_input_tokens
+    if decoded.total_tokens is not None:
+        result["totalTokens"] = decoded.total_tokens
+    return result
+
+
+def _project_air(update: object) -> dict[str, object] | None:
+    if not isinstance(update, dict) or not isinstance(update.get("_meta"), dict):
+        return None
+    try:
+        air = update["_meta"]["jetbrains"]["air"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(air, dict):
+        return {"version": None}
+    projected = {key: air[key] for key in ("version",) if key in air}
+    failure = air.get("sessionFailure")
+    if isinstance(failure, dict):
+        projected["sessionFailure"] = {key: failure[key] for key in
+                                        ("id", "revision", "category", "severity", "title", "details", "actions")
+                                        if key in failure}
+    elif "sessionFailure" in air:
+        # Preserve the decoder-visible malformed fact without retaining an
+        # arbitrary provider object/string as evidence.
+        projected["sessionFailure"] = None
+    return projected
+
+
+def _incident_owned(value: object, prompt_id: int | None) -> bool:
+    return (prompt_id is not None and isinstance(value, dict)
+            and (not isinstance(value.get("id"), str) or value["id"].startswith(f"{prompt_id}:")))
 
 
 def _has_air(value: object) -> bool:
@@ -394,11 +471,25 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
     authentication, outcome-file handling, or role validation is performed
     here.  Exceptions are deliberate fail-closed evidence.
     """
-    policy.validate()
-    _validate_pinned_mode_for_policy(policy)
-    if not command or not model or not prompt or timeout_s <= 0:
-        raise AcpClientRejected("command, model, prompt, and positive timeout are required")
-    launch.validate_for(command, _mode_for(policy))
+    # Setup is fallible too.  Give every setup exception the same stable
+    # envelope as a post-launch failure, including the caller's log reference.
+    try:
+        policy.validate()
+        _validate_pinned_mode_for_policy(policy)
+        if not command or not model or not prompt or timeout_s <= 0:
+            raise AcpClientRejected("command, model, prompt, and positive timeout are required",
+                                    log_path=str(log_path))
+        launch.validate_for(command, _mode_for(policy))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        config_home = Path(tempfile.mkdtemp(prefix="nc-acp-codex-", dir=log_path.parent))
+        _write_pinned_config(policy, config_home)
+    except BaseException as exc:
+        exc.evidence = getattr(exc, "evidence", AcpTurnEvidence(
+            None, None, None, None, False, str(log_path), "setup_failure"))
+        # Rejections made below helpers predate their log_path argument.
+        if isinstance(exc, AcpClientRejected) and not exc.evidence.log_path:
+            exc.evidence = AcpTurnEvidence(None, None, None, None, False, str(log_path), "setup_rejected")
+        raise
     # The prompt budget is separate from the prescribed bounded cancellation
     # and cleanup phases.  The supervisor still owns one outer deadline.
     deadline = time.monotonic() + timeout_s + 15
@@ -435,14 +526,11 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         server_request_rejection = AcpClientRejected("unsupported server request")
         raise server_request_rejection
 
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    config_home = Path(tempfile.mkdtemp(prefix="nc-acp-codex-", dir=log_path.parent))
-    _write_pinned_config(policy, config_home)
     try:
         child = AcpSubprocess(command, cwd=policy.cwd, deadline=deadline, log_path=log_path,
                               env=_safe_environment(environment, config_home=config_home))
     except BaseException as exc:
-        exc.evidence = AcpTurnEvidence(None, None, None, False, str(log_path), "launcher_failure")
+        exc.evidence = AcpTurnEvidence(None, None, None, None, False, str(log_path), "launcher_failure")
         raise
     result: CodexAcpTurn | None = None
     timed_out = False
@@ -498,6 +586,12 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         prompt_id = stream.send_request("session/prompt", prompt_params)
         evidence.prompt_request({"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
                                  "params": prompt_params}, prompt_id, session_id)
+        # This exists before wait_for: local EOF/timeout after an update must
+        # retain correlated prompt identity, raw AIR and latest usage.
+        prompt_fact = {"request_id": str(prompt_id), "session_id": session_id,
+                       "prompt_id": str(prompt_id), "prompt_response_valid": False,
+                       "stop_reason": None, "air_observations": evidence.air_observations,
+                       "session_failures": []}
         try:
             prompt_response = stream.wait_for(prompt_id, deadline=time.monotonic() + timeout_s)
             raise_server_request_rejection()
@@ -541,7 +635,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         decoder_wire = [dict(item, id=str(prompt_id)) if isinstance(item, dict)
                         and item.get("id") == prompt_id else item for item in evidence.records]
         decoded = decode_acp_prompt_result(decoder_wire, request_id=str(prompt_id), session_id=session_id)
-        observations = _air_observations(evidence.records, session_id, prompt_id)
+        observations = evidence.air_observations
         prompt_fact = {
             "request_id": str(prompt_id), "session_id": session_id, "prompt_id": str(prompt_id),
             "prompt_response_valid": decoded.kind != "protocol_invalid",
@@ -558,6 +652,8 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
                 prompt_fact["jsonrpc_result"] = retained_response["result"]
             if isinstance(retained_response.get("error"), dict):
                 prompt_fact["jsonrpc_error"] = retained_response["error"]
+        if evidence.usage is not None:
+            prompt_fact["usage"] = evidence.usage
         # A completed response is not permission to hide a process which has
         # already failed.  Yield briefly so an immediate post-response exit
         # is observed before this client starts deliberate cleanup.
@@ -589,8 +685,14 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
             process = _process_fact(child, timed_out or bool(timeout_phases), timeout_phases)
             failure.process = process
             failure.shutdown = child.shutdown_outcome
+            # Refresh the partial view after every observed notification,
+            # including an overflow raised by notification handling.
+            if prompt_fact is not None:
+                prompt_fact["air_observations"] = evidence.air_observations
+                if evidence.usage is not None:
+                    prompt_fact["usage"] = evidence.usage
             failure.evidence = AcpTurnEvidence(
-                prompt_fact, process, child.shutdown_outcome, child.cleanup_uncertain,
+                prompt_fact, evidence.usage, process, child.shutdown_outcome, child.cleanup_uncertain,
                 str(log_path), "evidence_overflow" if evidence.overflow else "local_failure",
             )
             if child.shutdown_failure is not None:

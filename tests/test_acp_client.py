@@ -80,6 +80,15 @@ if scenario == "reset_model":
     sys.exit(0)
 prompt = read()
 assert prompt["method"] == "session/prompt" and prompt["params"]["sessionId"] == "fresh"
+if scenario in {"usage_eof", "air_overflow"}:
+    failure = {"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"error","title":"retained","actions":[]}
+    if scenario == "usage_eof":
+        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}},"sessionUpdate":"usage_update","usage":{"inputTokens":2,"outputTokens":3},"toolPayload":"must-not-retain"}}})
+        os.close(1); time.sleep(.2); sys.exit(0)
+    for number in range(200):
+        failure["revision"] = number + 1
+        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+    time.sleep(.2); sys.exit(0)
 if scenario == "timeout":
     cancel = read()
     assert cancel["method"] == "session/cancel"
@@ -253,6 +262,26 @@ def test_fake_delayed_shutdown_nonzero_exit_cannot_be_success(tmp_path: Path) ->
         run(tmp_path, "delayed_post_response_exit")
     assert raised.value.process["exit_code"] == 9
     assert "failure during deliberate shutdown" in raised.value.shutdown
+
+
+def test_usage_and_air_are_retained_when_prompt_ends_in_eof(tmp_path: Path) -> None:
+    with pytest.raises(AcpTransportEof) as raised:
+        run(tmp_path, "usage_eof")
+    evidence = raised.value.evidence
+    assert evidence.prompt is not None
+    assert evidence.prompt["air_observations"][0]["id"].endswith(":x")
+    assert evidence.usage == {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5}
+    assert "toolPayload" not in str(evidence.prompt)
+
+
+def test_notification_flood_after_air_failure_fails_closed_with_evidence(tmp_path: Path) -> None:
+    from nc.acp_client import AcpEvidenceOverflow
+
+    with pytest.raises(AcpEvidenceOverflow) as raised:
+        run(tmp_path, "air_overflow")
+    evidence = raised.value.evidence
+    assert evidence.status == "evidence_overflow"
+    assert evidence.prompt is not None and evidence.prompt["air_observations"]
 
 
 def test_fake_elicitation_is_cancelled_noninteractively(tmp_path: Path) -> None:

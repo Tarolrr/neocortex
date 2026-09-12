@@ -21,6 +21,13 @@ from .acp_stream import AcpDeadlineExpired, AcpStreamError
 from .acp_wire import AcpProcessError, AcpProcessTimeout, AcpSubprocess
 
 _MODE = "agent"
+_PINNED_ACP_PACKAGE = "@agentclientprotocol/codex-acp"
+_PINNED_ACP_VERSION = "1.11.0"
+_PINNED_ACP_INTEGRITY = (
+    "sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ=="
+)
+_PINNED_CODEX_VERSION = "0.153.4"
+_PINNED_SDK_VERSION = "1.4.0"
 _PROTECTED_ENV = frozenset({
     "CODEX_CONFIG", "CODEX_PATH", "INITIAL_AGENT_MODE", "CODEX_HOME", "HOME",
     "XDG_CONFIG_HOME", "XDG_DATA_HOME",
@@ -29,6 +36,35 @@ _PROTECTED_ENV = frozenset({
 
 class AcpClientRejected(RuntimeError):
     """A profile, policy, or server capability was rejected before prompting."""
+
+
+@dataclass(frozen=True)
+class CodexAcpLaunchEvidence:
+    """Recorded result of the isolated pinned-artifact launch verification.
+
+    This is deliberately supplied by the future deployment verifier rather
+    than guessed from an executable name.  The client consumes it before it
+    starts a child: it binds the exact command to the artifact integrity and
+    resolved dependency versions.  The initialize response below supplies the
+    remaining, live handshake part of this contract.
+    """
+
+    command: tuple[str, ...]
+    package: str
+    package_version: str
+    artifact_integrity: str
+    codex_version: str
+    sdk_version: str
+
+    def validate_for(self, command: Sequence[str]) -> None:
+        if tuple(command) != self.command:
+            raise AcpClientRejected("launch command does not match verified ACP evidence")
+        if (self.package != _PINNED_ACP_PACKAGE
+                or self.package_version != _PINNED_ACP_VERSION
+                or self.artifact_integrity != _PINNED_ACP_INTEGRITY
+                or self.codex_version != _PINNED_CODEX_VERSION
+                or self.sdk_version != _PINNED_SDK_VERSION):
+            raise AcpClientRejected("launch evidence does not match pinned ACP contract")
 
 
 @dataclass(frozen=True)
@@ -183,18 +219,22 @@ def _air_observations(wire: Sequence[object], session_id: str) -> list[object]:
     return observed
 
 
-def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model: str,
-                       prompt: str, log_path: Path, timeout_s: float = 60,
+def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence,
+                       policy: CodexAcpPolicy, model: str, prompt: str,
+                       log_path: Path, timeout_s: float = 60,
                        environment: Mapping[str, str] | None = None) -> CodexAcpTurn:
     """Run the pinned initialize/new/configure/prompt sequence once.
 
-    ``command`` must name a separately verified codex-acp 1.11.0 launch.  No
-    installation, authentication, outcome-file handling, or role validation is
-    performed here.  Exceptions are deliberate fail-closed evidence.
+    ``launch`` is the verified codex-acp 1.11.0 artifact/dependency evidence
+    bound to ``command``.  It is checked before a child exists; the live ACP
+    v1/AIR handshake is then checked before session creation.  No installation,
+    authentication, outcome-file handling, or role validation is performed
+    here.  Exceptions are deliberate fail-closed evidence.
     """
     policy.validate()
     if not command or not model or not prompt or timeout_s <= 0:
         raise ValueError("command, model, prompt, and positive timeout are required")
+    launch.validate_for(command)
     # The prompt budget is separate from the prescribed bounded cancellation
     # and cleanup phases.  The supervisor still owns one outer deadline.
     deadline = time.monotonic() + timeout_s + 15

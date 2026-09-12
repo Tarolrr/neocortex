@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from nc.acp_client import AcpClientRejected, CodexAcpPolicy, run_codex_acp_turn
+from nc.acp_client import (
+    AcpClientRejected,
+    CodexAcpLaunchEvidence,
+    CodexAcpPolicy,
+    run_codex_acp_turn,
+)
 from nc.acp_wire import AcpProcessTimeout, AcpTransportEof, AcpUnexpectedExit
 
 
@@ -111,8 +116,25 @@ time.sleep(.2)
     return [sys.executable, "-c", code, scenario]
 
 
+def verified_launch(command: list[str], **overrides: str) -> CodexAcpLaunchEvidence:
+    values = {
+        "command": tuple(command),
+        "package": "@agentclientprotocol/codex-acp",
+        "package_version": "1.11.0",
+        "artifact_integrity": (
+            "sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ=="
+        ),
+        "codex_version": "0.153.4",
+        "sdk_version": "1.4.0",
+    }
+    values.update(overrides)
+    return CodexAcpLaunchEvidence(**values)  # type: ignore[arg-type]
+
+
 def run(tmp_path: Path, scenario: str, **kwargs: object):
-    return run_codex_acp_turn(fake_server(scenario), policy=CodexAcpPolicy.ordinary(tmp_path),
+    command = fake_server(scenario)
+    return run_codex_acp_turn(command, launch=verified_launch(command),
+                               policy=CodexAcpPolicy.ordinary(tmp_path),
                                model="model", prompt="hello", log_path=tmp_path / "acp.log",
                                timeout_s=kwargs.pop("timeout_s", 1), **kwargs)
 
@@ -194,7 +216,8 @@ def test_restricted_policy_and_environment_are_explicit(tmp_path: Path) -> None:
     policy = CodexAcpPolicy.restricted(tmp_path)
     assert policy.cwd == tmp_path.resolve()
     assert policy.public_web_search and policy.network_access
-    assert run_codex_acp_turn(fake_server("restricted"), policy=policy, model="model", prompt="hello",
+    command = fake_server("restricted")
+    assert run_codex_acp_turn(command, launch=verified_launch(command), policy=policy, model="model", prompt="hello",
                               log_path=tmp_path / "restricted.log", timeout_s=1).prompt.kind == "success"
 
 
@@ -208,3 +231,32 @@ def test_global_config_and_invalid_policy_cannot_override_pinned_launch(tmp_path
     env = {"HOME": "/global-config", "CODEX_CONFIG": "/global-config/config.toml",
            "CODEX_PATH": "bad", "INITIAL_AGENT_MODE": "full", "INHERITED_HOME": "/global-config"}
     assert run(tmp_path, "isolated", environment=env).prompt.kind == "success"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"package_version": "1.11.1"},
+    {"artifact_integrity": "sha512-unverified"},
+    {"codex_version": "0.86.0"},
+    {"sdk_version": "1.5.0"},
+])
+def test_unverified_launch_contract_is_rejected_before_server_starts(
+    tmp_path: Path, overrides: dict[str, str],
+) -> None:
+    marker = tmp_path / "server-started"
+    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
+    with pytest.raises(AcpClientRejected, match="launch evidence"):
+        run_codex_acp_turn(command, launch=verified_launch(command, **overrides),
+                            policy=CodexAcpPolicy.ordinary(tmp_path), model="model", prompt="hello",
+                            log_path=tmp_path / "unverified.log")
+    assert not marker.exists()
+
+
+def test_launch_evidence_cannot_authorize_a_different_command(tmp_path: Path) -> None:
+    expected = fake_server("success")
+    marker = tmp_path / "wrong-server-started"
+    actual = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
+    with pytest.raises(AcpClientRejected, match="does not match"):
+        run_codex_acp_turn(actual, launch=verified_launch(expected),
+                            policy=CodexAcpPolicy.ordinary(tmp_path), model="model", prompt="hello",
+                            log_path=tmp_path / "wrong.log")
+    assert not marker.exists()

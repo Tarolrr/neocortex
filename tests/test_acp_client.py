@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -120,6 +122,11 @@ if scenario == "delayed_post_response_exit":
     time.sleep(.15); sys.exit(9)
 failure = {"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"warning","title":"retry","actions":["retry"]}
 if scenario == "warning": send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+if scenario == "foreign_incident":
+    # Same session, but a late failure emitted by an earlier prompt.
+    failure["id"] = "previous-prompt:x"
+    failure["severity"] = "error"
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
 if scenario == "terminal":
     failure["severity"] = "error"
     response(prompt, {"stopReason":"end_turn","_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}})
@@ -182,19 +189,43 @@ def test_fake_setup_air_metadata_cannot_taint_prompt_evidence(tmp_path: Path) ->
 
 
 def test_source_pinned_agent_owned_tool_update_needs_no_client_tools(tmp_path: Path) -> None:
-    source = json.loads((Path(__file__).parent / "fixtures" /
-                         "codex-acp-agent-tool-path.source.json").read_text())
-    assert source["commit"] == "51d6247ac7448485bfcf534b813196fafc26df59"
-    assert source["selected_mode"]["id"] == "agent"
-    assert source["selected_mode"]["sandboxPolicy"]["type"] == "workspaceWrite"
-    assert source["selected_mode"]["sandboxPolicy"]["networkAccess"] is False
-    assert source["agent_owned_update"]["sessionUpdate"] == "tool_call_update"
+    fixture = Path(__file__).parent / "fixtures" / "pinned-codex-acp"
+    agent_mode = (fixture / "AgentMode.ts").read_text()
+    event_handler = (fixture / "CodexEventHandler.commandExecution.extract.ts").read_text()
+    # Fixed digests verify the extracted upstream source, independently of
+    # the semantic assertions below.  SOURCE.json binds these extracts to the
+    # pinned commit and the complete files' upstream digests.
+    assert hashlib.sha256(agent_mode.encode()).hexdigest() == "15c942b2dc93075e50dc9f00e01339041f9d4667e5d7f83ebe28240210f4b941"
+    assert hashlib.sha256(event_handler.encode()).hexdigest() == "ea9b6b709c1152487a2264b46a4bafac10d8185ec985ad05fcc357253f70036a"
+    manifest = json.loads((fixture / "SOURCE.json").read_text())
+    assert manifest["commit"] == "51d6247ac7448485bfcf534b813196fafc26df59"
+    assert manifest["AgentMode.ts"]["source_sha256"] == "2c014d971fff367710779f102557dda9ec1a56c4b5faebc745bb2642280388e7"
+    assert manifest["CodexEventHandler.ts"]["source_sha256"] == "42097f14d827e936232188289ea3389c4fbd24b9e826f763a301658e1b745d39"
+    # Derive selected agent policy and its commandExecution ACP mapping from
+    # the integrity-checked TypeScript artifacts.
+    agent = re.search(r'static readonly Agent = new AgentMode\((.*?)\n    \);', agent_mode, re.DOTALL)
+    assert agent and '"agent"' in agent.group(1)
+    assert '"on-request"' in agent.group(1) and '"auto_review"' in agent.group(1)
+    assert 'type: "workspaceWrite"' in agent.group(1)
+    assert 'networkAccess: false' in agent.group(1)
+    assert '"type": "commandExecution"' in event_handler
+    assert 'sessionUpdate: "tool_call_update"' in event_handler
+    assert 'toolCallId: item.id' in event_handler
+    assert 'status: item.status === "completed" ? "completed" : "failed"' in event_handler
     turn = run(tmp_path, "agent_tool")
     assert turn.prompt.kind == "success"
     # The fake server only proceeds if it received the client's exact
     # initialize shape; this update is the source-backed server-to-client
     # agent tool path, not a capability advertised by NC.
     assert turn.live_sandbox_enforcement_verified is False
+
+
+def test_fake_late_foreign_incident_is_not_prompt_evidence(tmp_path: Path) -> None:
+    turn = run(tmp_path, "foreign_incident")
+    assert turn.prompt.kind == "success"
+    assert turn.prompt.failures == ()
+    assert turn.prompt_fact["air_observations"] == []
+    assert turn.prompt_fact["session_failures"] == []
 
 
 def test_fake_post_response_nonzero_exit_cannot_be_success(tmp_path: Path) -> None:

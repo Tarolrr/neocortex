@@ -239,7 +239,12 @@ def _air_observations(wire: Sequence[object], session_id: str,
             failure = value["_meta"]["jetbrains"]["air"]["sessionFailure"]  # type: ignore[index]
         except (KeyError, TypeError):
             continue
-        observed.append(failure)
+        # A session can deliver a late failure from an earlier prompt during
+        # this request's window.  Match the decoder's incident ownership rule
+        # so prompt facts cannot attribute it to this invocation.
+        if (isinstance(failure, dict) and isinstance(failure.get("id"), str)
+                and failure["id"].startswith(f"{prompt_id}:")):
+            observed.append(failure)
     return observed
 
 

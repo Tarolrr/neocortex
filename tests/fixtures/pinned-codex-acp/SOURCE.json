@@ -1,0 +1,14 @@
+{
+  "artifact": "integrity-checked source extracts; not synthetic ACP wire evidence",
+  "commit": "51d6247ac7448485bfcf534b813196fafc26df59",
+  "AgentMode.ts": {
+    "source_url": "https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AgentMode.ts",
+    "source_sha256": "2c014d971fff367710779f102557dda9ec1a56c4b5faebc745bb2642280388e7",
+    "extract_lines": "43-60"
+  },
+  "CodexEventHandler.ts": {
+    "source_url": "https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexEventHandler.ts",
+    "source_sha256": "42097f14d827e936232188289ea3389c4fbd24b9e826f763a301658e1b745d39",
+    "extract_lines": "1008-1020"
+  }
+}

@@ -200,23 +200,36 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
     deadline = time.monotonic() + timeout_s + 15
     wire: list[object] = []
     session_id: str | None = None
+    # AcpJsonRpcStream must reply to a peer request before it can resume the
+    # host request it was pumping.  Retain a policy-owner rejection across
+    # that JSON-RPC error reply so a cooperative (or racing) prompt response
+    # can never turn the invocation into a success.
+    server_request_rejection: AcpClientRejected | None = None
+
+    def raise_server_request_rejection() -> None:
+        if server_request_rejection is not None:
+            raise server_request_rejection
+
     def observe_notification(value: dict[str, object]) -> None:
         wire.append(value)
 
     def deny_request(value: dict[str, object]) -> object:
+        nonlocal server_request_rejection
         wire.append(value)
         method = value.get("method")
         params = value.get("params")
         if (not isinstance(params, dict) or session_id is None
                 or params.get("sessionId") != session_id):
-            raise AcpClientRejected("malformed or foreign server request")
+            server_request_rejection = AcpClientRejected("malformed or foreign server request")
+            raise server_request_rejection
         if method == "session/request_permission":
             # ACP v1 has no ``denied`` permission outcome.  Cancellation is
             # the pinned, fail-closed response shape.
             return {"outcome": {"outcome": "cancelled"}}
         if method == "elicitation/create":
             return {"action": "cancel", "content": None}
-        raise AcpClientRejected("unsupported server request")
+        server_request_rejection = AcpClientRejected("unsupported server request")
+        raise server_request_rejection
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     config_home = Path(tempfile.mkdtemp(prefix="nc-acp-codex-", dir=log_path.parent))
@@ -238,6 +251,7 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
         init_id = stream.send_request("initialize", init_params)
         wire.append({"jsonrpc": "2.0", "id": init_id, "method": "initialize", "params": init_params})
         init_response = stream.wait_for(init_id)
+        raise_server_request_rejection()
         wire.append(init_response)
         if not _air_advertised(init_response.get("result")):
             raise AcpClientRejected("server does not advertise pinned ACP/AIR profile")
@@ -246,6 +260,7 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
         new_id = stream.send_request("session/new", new_params)
         wire.append({"jsonrpc": "2.0", "id": new_id, "method": "session/new", "params": new_params})
         new_response = stream.wait_for(new_id)
+        raise_server_request_rejection()
         wire.append(new_response)
         new_result = new_response.get("result")
         if not isinstance(new_result, dict) or not isinstance(new_result.get("sessionId"), str):
@@ -263,6 +278,7 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
             wire.append({"jsonrpc": "2.0", "id": config_id_request,
                          "method": "session/set_config_option", "params": params})
             response = stream.wait_for(config_id_request)
+            raise_server_request_rejection()
             wire.append(response)
             if not _selected(response.get("result"), config_id, value):
                 raise AcpClientRejected("server rejected explicit ACP configuration")
@@ -282,6 +298,7 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
                      "params": prompt_params})
         try:
             prompt_response = stream.wait_for(prompt_id, deadline=time.monotonic() + timeout_s)
+            raise_server_request_rejection()
         except (AcpDeadlineExpired, AcpProcessTimeout) as exc:
             timed_out = True
             cancel_deadline = time.monotonic() + 10

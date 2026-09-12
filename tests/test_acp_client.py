@@ -80,8 +80,14 @@ if scenario == "permission":
 if scenario == "elicitation":
     send({"jsonrpc":"2.0","id":"elicit","method":"elicitation/create","params":{"sessionId":"fresh"}})
     assert read()["result"] == {"action":"cancel", "content":None}
-if scenario == "malformed_request":
-    send({"jsonrpc":"2.0","id":"bad","method":"session/request_permission","params":{}})
+if scenario in {"malformed_request", "foreign_request", "unsupported_request"}:
+    if scenario == "malformed_request":
+        method, params = "session/request_permission", {}
+    elif scenario == "foreign_request":
+        method, params = "session/request_permission", {"sessionId":"other"}
+    else:
+        method, params = "client/unsupported", {"sessionId":"fresh"}
+    send({"jsonrpc":"2.0","id":"bad","method":method,"params":params})
     assert read()["error"]["code"] == -32603
 if scenario == "agent_tool":
     # This is an agent-owned update; it requires no client terminal or
@@ -155,9 +161,16 @@ def test_fake_post_response_nonzero_exit_cannot_be_success(tmp_path: Path) -> No
     assert "before deliberate shutdown" in raised.value.shutdown
 
 
-@pytest.mark.parametrize("scenario", ["elicitation", "malformed_request"])
-def test_fake_client_requests_are_cancelled_or_fail_closed(tmp_path: Path, scenario: str) -> None:
-    assert run(tmp_path, scenario).prompt.kind == "success"
+def test_fake_elicitation_is_cancelled_noninteractively(tmp_path: Path) -> None:
+    assert run(tmp_path, "elicitation").prompt.kind == "success"
+
+
+@pytest.mark.parametrize("scenario", ["malformed_request", "foreign_request", "unsupported_request"])
+def test_fake_invalid_client_requests_are_answered_then_fail_closed(tmp_path: Path, scenario: str) -> None:
+    with pytest.raises(AcpClientRejected, match="server request") as raised:
+        run(tmp_path, scenario)
+    assert raised.value.process["pid"] > 0
+    assert isinstance(raised.value.shutdown, str)
 
 
 @pytest.mark.parametrize("scenario,error", [("unsupported_profile", AcpClientRejected),

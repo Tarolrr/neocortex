@@ -93,6 +93,15 @@ def test_bootstrap_rerun_preserves_config_and_does_not_reinstall(tmp_path):
 
     assert first.returncode == second.returncode == 0
     assert config.read_text() == '{"adapter": "preserve-me"}'
+    # The isolated install copies the tracked template verbatim.  Keep the
+    # queue-wide oneshot timeout disabled without weakening timer cadence or
+    # the application-level execution deadline.
+    service = (Path(env["SYSTEMD_DIR"]) / "neocortex.service").read_text()
+    timer = (Path(env["SYSTEMD_DIR"]) / "neocortex.timer").read_text()
+    assert "TimeoutStartSec=infinity" in service
+    assert "RuntimeMaxSec=" not in service
+    assert "OnUnitInactiveSec=5min" in timer
+    assert "turn_timeout_s: int = 900" in (ROOT / "nc/config.py").read_text()
     assert first_calls == "systemctl daemon-reload\n"
     assert log.read_text() == first_calls  # rerun made no package/vendor/unit calls
 

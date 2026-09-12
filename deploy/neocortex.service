@@ -8,6 +8,9 @@ WorkingDirectory=/opt/neocortex-runner
 Environment=NC_HOME=/root/.neocortex
 Environment=PATH=/opt/neocortex-runner/.venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/opt/neocortex-runner/.venv/bin/nc run
-TimeoutStartSec=3600
-# One run drains the queue and exits; the timer decides when to start the next
-# one. A crashed turn therefore costs one cycle, not the system.
+# A oneshot's start phase is the entire queue drain.  Do not kill a healthy
+# drain after an arbitrary service-wide hour; individual turns remain bounded
+# by their adapter/preflight deadlines and the timer schedules the next drain.
+TimeoutStartSec=infinity
+# One run drains the queue and exits.  Provider deferral exits for a later
+# timer firing; host/turn failures are distinct from successful completion.

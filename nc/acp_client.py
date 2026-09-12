@@ -299,7 +299,7 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
                 except (AcpProcessError, AcpStreamError, AcpDeadlineExpired):
                     timeout_phases.append("close_response_expired")
             error = AcpProcessTimeout("ACP prompt deadline expired after bounded cancellation")
-            setattr(error, "timeout_phases", tuple(timeout_phases))
+            error.timeout_phases = tuple(timeout_phases)
             timeout_error = error
             raise error from exc
         wire.append(prompt_response)

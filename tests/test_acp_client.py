@@ -105,6 +105,11 @@ if scenario == "malformed":
 if scenario == "post_response_exit":
     response(prompt, {"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":3}})
     sys.exit(7)
+if scenario == "delayed_post_response_exit":
+    response(prompt, {"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":3}})
+    # Outlive the 50ms post-response observation, but die before the
+    # five-second stdin-EOF grace period is allowed to expire.
+    time.sleep(.15); sys.exit(9)
 failure = {"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"warning","title":"retry","actions":["retry"]}
 if scenario == "warning": send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
 if scenario == "terminal":
@@ -181,6 +186,13 @@ def test_fake_post_response_nonzero_exit_cannot_be_success(tmp_path: Path) -> No
         run(tmp_path, "post_response_exit")
     assert raised.value.process["exit_code"] == 7
     assert "before deliberate shutdown" in raised.value.shutdown
+
+
+def test_fake_delayed_shutdown_nonzero_exit_cannot_be_success(tmp_path: Path) -> None:
+    with pytest.raises(AcpUnexpectedExit, match="exited unexpectedly with status 9") as raised:
+        run(tmp_path, "delayed_post_response_exit")
+    assert raised.value.process["exit_code"] == 9
+    assert "failure during deliberate shutdown" in raised.value.shutdown
 
 
 def test_fake_elicitation_is_cancelled_noninteractively(tmp_path: Path) -> None:

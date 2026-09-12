@@ -180,6 +180,11 @@ class AcpSubprocess:
         self._stderr_done = threading.Event()
         self._closed = False
         self._intentional_shutdown = False
+        # A nonzero exit observed before this client sends a containment
+        # signal is process failure evidence, even when it happens while
+        # orderly stdin-EOF cleanup is in progress.
+        self.shutdown_failure: AcpUnexpectedExit | None = None
+        self._shutdown_failure_during_cleanup = False
         # This is deliberately separate from a process exit code: closing a
         # server is cleanup, not a successful ACP result.
         self.shutdown_outcome: str | None = None
@@ -391,7 +396,12 @@ class AcpSubprocess:
                 self.proc.stdin.close()
             except OSError:
                 pass
-        if not self._wait_for_exit(self._grace):
+        exited_after_eof = self._wait_for_exit(self._grace)
+        if (exited_after_eof and self._intentional_shutdown
+                and isinstance(self.proc.returncode, int) and self.proc.returncode != 0):
+            self.shutdown_failure = AcpUnexpectedExit(self._exit_message(self.proc.returncode))
+            self._shutdown_failure_during_cleanup = True
+        if not exited_after_eof:
             self.timeout_phases.append("term_grace")
         self._terminate()
         if not self._wait_for_exit(self._grace):
@@ -427,6 +437,8 @@ class AcpSubprocess:
         self._closed = True
         preexisting_exit = self.proc.poll()
         self._intentional_shutdown = preexisting_exit is None
+        if isinstance(preexisting_exit, int) and preexisting_exit != 0:
+            self.shutdown_failure = AcpUnexpectedExit(self._exit_message(preexisting_exit))
         self.shutdown_outcome = (
             "ACP intentional shutdown in progress" if preexisting_exit is None
             else f"ACP process exited before deliberate shutdown with status {preexisting_exit}"
@@ -451,8 +463,14 @@ class AcpSubprocess:
         else:
             evidence = f"child exited with status {code}"
         uncertainty = "; containment uncertain" if self.cleanup_uncertain else ""
-        prefix = "ACP intentional shutdown" if preexisting_exit is None else (
+        prefix = "ACP process failure during deliberate shutdown" if (
+            self.shutdown_failure and self._shutdown_failure_during_cleanup
+        ) else (
+            "ACP process exit observed before deliberate shutdown" if self.shutdown_failure else (
+            "ACP intentional shutdown" if preexisting_exit is None else (
             "ACP process exit observed before deliberate shutdown"
+            )
+            )
         )
         self.shutdown_outcome = f"{prefix}: {evidence}{uncertainty}"
 

@@ -403,10 +403,18 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
     finally:
         child.close()
         timeout_phases.extend(child.timeout_phases)
+        # A server may reply successfully, outlive the short post-response
+        # observation, then crash while orderly stdin-EOF cleanup waits for
+        # it.  That is not an intentional shutdown and cannot be hidden by
+        # successful prompt evidence.
+        if failure is None and child.shutdown_failure is not None:
+            failure = child.shutdown_failure
         if failure is not None:
             process = _process_fact(child, bool(timeout_phases), timeout_phases)
             failure.process = process
             failure.shutdown = child.shutdown_outcome
+            if child.shutdown_failure is not None:
+                raise failure
             if isinstance(failure, AcpProcessTimeout):
                 failure.timeout_phases = tuple(timeout_phases)
     assert result is not None

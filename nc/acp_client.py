@@ -206,19 +206,33 @@ def _process_fact(child: AcpSubprocess, timed_out: bool,
     }
 
 
-def _air_observations(wire: Sequence[object], session_id: str) -> list[object]:
-    """Retain raw AIR observations while exposing only strict pinned records."""
+def _air_observations(wire: Sequence[object], session_id: str,
+                      prompt_id: int) -> list[object]:
+    """Retain AIR observations correlated to this session's active prompt.
+
+    Setup replies are deliberately excluded even if they carry AIR-shaped
+    metadata: they have no prompt ownership.  The prompt response itself and
+    matching ``session/update`` notifications observed after its request and
+    before its response are the only evidence for this turn.
+    """
     observed: list[object] = []
+    prompt_active = False
     for item in wire:
         if not isinstance(item, dict):
             continue
         value: object | None = None
-        if item.get("method") == "session/update":
+        if (item.get("method") == "session/prompt" and item.get("id") == prompt_id
+                and isinstance(item.get("params"), dict)
+                and item["params"].get("sessionId") == session_id):
+            prompt_active = True
+            continue
+        if prompt_active and item.get("method") == "session/update":
             params = item.get("params")
             if isinstance(params, dict) and params.get("sessionId") == session_id:
                 value = params.get("update")
-        elif "result" in item:
+        elif prompt_active and item.get("id") == prompt_id and "result" in item:
             value = item["result"]
+            prompt_active = False
         if not isinstance(value, dict):
             continue
         try:
@@ -383,7 +397,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         decoder_wire = [dict(item, id=str(prompt_id)) if isinstance(item, dict)
                         and item.get("id") == prompt_id else item for item in wire]
         decoded = decode_acp_prompt_result(decoder_wire, request_id=str(prompt_id), session_id=session_id)
-        observations = _air_observations(wire, session_id)
+        observations = _air_observations(wire, session_id, prompt_id)
         prompt_fact: AcpPromptFact = {
             "request_id": str(prompt_id), "session_id": session_id, "prompt_id": str(prompt_id),
             "prompt_response_valid": decoded.kind != "protocol_invalid",

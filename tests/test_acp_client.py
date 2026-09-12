@@ -63,7 +63,15 @@ for expected in ("model", "mode"):
         if option["id"] == expected: option["currentValue"] = request["params"]["value"]
     if scenario == "reset_model" and expected == "mode":
         options = [option for option in options if option["id"] != "model"]
-    response(request, {"configOptions":options})
+    config_result = {"configOptions":options}
+    if scenario == "setup_air" and expected == "model":
+        # AIR metadata on a setup reply belongs to neither the active prompt
+        # nor its session/update window and must not taint prompt evidence.
+        config_result["_meta"] = {"jetbrains":{"air":{"version":1,"sessionFailure":{
+            "id":"setup:x", "revision":1, "category":"service", "severity":"error",
+            "title":"unrelated setup failure", "actions":[]
+        }}}}
+    response(request, config_result)
 if scenario == "reset_model":
     # The client must reject the final snapshot before it can send a prompt.
     assert sys.stdin.readline() == ""
@@ -164,6 +172,13 @@ def test_fake_terminal_and_recoverable_evidence(tmp_path: Path, scenario: str, k
 
 def test_fake_permission_is_denied_noninteractively(tmp_path: Path) -> None:
     assert run(tmp_path, "permission").prompt.kind == "success"
+
+
+def test_fake_setup_air_metadata_cannot_taint_prompt_evidence(tmp_path: Path) -> None:
+    turn = run(tmp_path, "setup_air")
+    assert turn.prompt.kind == "success"
+    assert turn.prompt_fact["air_observations"] == []
+    assert turn.prompt_fact["session_failures"] == []
 
 
 def test_source_pinned_agent_owned_tool_update_needs_no_client_tools(tmp_path: Path) -> None:

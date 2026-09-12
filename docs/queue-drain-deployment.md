@@ -59,29 +59,36 @@ not a test to run against production work.
 ## Feedback 204 incident note
 
 **Attribution:** owner feedback 204, concerning the September 11 queue-drain
-window. **Collection:** 2026-09-12T21:59:45+02:00 (Europe/Belgrade), by an
-isolated repository worker at commit
-`c4fb55f2455c9cecb2fa0aaf51d84f1f6c68456e` (the inspected HEAD before this
-change).  The requested local interval is **2026-09-11 22:45--23:55
+window. **Collection:** 2026-09-12T22:11:51+02:00 (Europe/Belgrade), by this
+worker using read-only journal, systemd, Git, and SQLite access; tracked
+template inspected at `4c95348` (before this evidence-note edit). The requested
+local interval is **2026-09-11 22:45--23:55
 Europe/Belgrade**, which converts to **2026-09-11 20:45--21:55 UTC** (CEST,
 UTC+02:00).
 
-No host journal, installed `/etc/systemd/system` source, effective systemd
-properties/drop-ins, runner checkout, or runtime database is mounted in this
-worktree, and task boundaries prohibit reading or mutating that runtime state.
-Consequently this note does **not** claim to have observed journal lines in the
-window, an installed unit value, a runner version, or a database correlation.
-The required owner-side read-only collection is: `journalctl --since '2026-09-11
-22:45:00 CEST' --until '2026-09-11 23:55:00 CEST' -u neocortex.service`,
-`systemctl cat`, `systemctl show` properties above, `git -C
-/opt/neocortex-runner rev-parse HEAD`, and a SQLite `mode=ro`, `query_only=ON`,
-single read transaction over the affected `run`, `task`, `agent`, `message`,
-and `incident` history.  Record unavailable fields as unavailable, not as a
-negative result.
+The read-only journal records `neocortex.service` starting at **22:46:48
+CEST**, then at **23:46:49 CEST** reporting “start operation timed out”,
+terminating its main process with `TERM`, and failing with result `timeout`.
+It starts again at **23:52:18 CEST** and deactivates successfully at **23:54:41
+CEST**.  This is direct evidence of the service-wide start timeout in the
+requested window, not evidence of provider overload or successful completion.
 
-The tracked template at the inspected commit had `TimeoutStartSec=3600`; the
-installed source and effective unit/drop-ins are unavailable here, so equality
-cannot be inferred.  A consistent database snapshot is likewise unavailable,
-so no affected run/task history is asserted.  In particular, current T017
-blocking must not be attributed solely to the old service timeout: correlation
-requires the owner-collected timestamps, journal, and read-only snapshot.
+At collection, the tracked `deploy/neocortex.service` specifies
+`TimeoutStartSec=infinity`; the installed `/etc/systemd/system/neocortex.service`
+is readable and still specifies `TimeoutStartSec=3600`. `systemctl show`
+reports `TimeoutStartUSec=1h`, `TimeoutStopUSec=1min 30s`, and
+`FragmentPath=/etc/systemd/system/neocortex.service`; `DropInPaths=` was empty,
+and `systemctl cat` showed no drop-ins. Thus the effective one-hour setting
+matches the installed source, not the updated tracked template. The installed
+runner resolves to `929bbd1b643e8aafde9a69c70670c3c50a1abed2` (its working tree
+also has a modified `neocortex.egg-info/SOURCES.txt`), so it is not assumed to
+contain this change.
+
+A read-only SQLite snapshot of `/root/.neocortex/state.db` used
+`PRAGMA query_only=ON` and one `BEGIN`/`COMMIT` transaction. It records T016
+as done at 23:13:16 CEST; T017 run 238 began at **23:46:41 CEST**, eight seconds
+before the journal timeout, and is recorded `INTERRUPTED` with no timeout,
+terminal-category, or host-assessment value. T017 is currently `blocked` and
+was later requeued by the owner. This is a temporal correlation, not proof that
+the start timeout alone caused current T017 blocking: the snapshot's later
+interruption/recovery fields and the task history require separate diagnosis.

@@ -172,6 +172,7 @@ def test_source_pinned_agent_owned_tool_update_needs_no_client_tools(tmp_path: P
     assert source["commit"] == "51d6247ac7448485bfcf534b813196fafc26df59"
     assert source["selected_mode"]["id"] == "agent"
     assert source["selected_mode"]["sandboxPolicy"]["type"] == "workspaceWrite"
+    assert source["selected_mode"]["sandboxPolicy"]["networkAccess"] is False
     assert source["agent_owned_update"]["sessionUpdate"] == "tool_call_update"
     turn = run(tmp_path, "agent_tool")
     assert turn.prompt.kind == "success"
@@ -224,13 +225,26 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
         assert raised.value.process["timed_out"] is False
 
 
-def test_restricted_policy_and_environment_are_explicit(tmp_path: Path) -> None:
+def test_restricted_policy_is_rejected_before_dispatch_when_agent_mode_cannot_preserve_network(
+    tmp_path: Path,
+) -> None:
     policy = CodexAcpPolicy.restricted(tmp_path)
     assert policy.cwd == tmp_path.resolve()
     assert policy.public_web_search and policy.network_access
-    command = fake_server("restricted")
-    assert run_codex_acp_turn(command, launch=verified_launch(command), policy=policy, model="model", prompt="hello",
-                              log_path=tmp_path / "restricted.log", timeout_s=1).prompt.kind == "success"
+    # The pinned source says selecting ``mode=agent`` makes effective
+    # workspace-write networkAccess false.  The requested true setting in a
+    # private config file would therefore be overridden.  The client must not
+    # start an ACP process and present that request as restricted support.
+    source = json.loads((Path(__file__).parent / "fixtures" /
+                         "codex-acp-agent-tool-path.source.json").read_text())
+    assert source["selected_mode"]["sandboxPolicy"]["networkAccess"] is False
+    marker = tmp_path / "restricted-server-started"
+    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
+    with pytest.raises(AcpClientRejected, match="pinned agent mode disables network access"):
+        run_codex_acp_turn(command, launch=verified_launch(command), policy=policy,
+                            model="model", prompt="hello", log_path=tmp_path / "restricted.log",
+                            timeout_s=1)
+    assert not marker.exists()
 
 
 def test_global_config_and_invalid_policy_cannot_override_pinned_launch(tmp_path: Path) -> None:

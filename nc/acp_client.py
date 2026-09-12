@@ -28,6 +28,11 @@ _PINNED_ACP_INTEGRITY = (
 )
 _PINNED_CODEX_VERSION = "0.153.4"
 _PINNED_SDK_VERSION = "1.4.0"
+# Source-pinned AgentMode.ts at the commit recorded in
+# tests/fixtures/codex-acp-agent-tool-path.source.json.  Selecting the only
+# supported ACP mode replaces its workspace-write sandbox with this value, so
+# a config.toml request for network access is not an effective guarantee.
+_PINNED_AGENT_MODE_NETWORK_ACCESS = False
 _PROTECTED_ENV = frozenset({
     "CODEX_CONFIG", "CODEX_PATH", "INITIAL_AGENT_MODE", "CODEX_HOME", "HOME",
     "XDG_CONFIG_HOME", "XDG_DATA_HOME",
@@ -83,9 +88,10 @@ class CodexAcpPolicy:
 
     @classmethod
     def restricted(cls, run_directory: Path) -> CodexAcpPolicy:
-        # This records the advisory contract.  ACP itself advertises no web or
-        # terminal client capability; actual sandbox enforcement remains a
-        # required live activation check, not a claim made by this client.
+        # Preserve the requested advisory contract as an explicit input.  The
+        # pinned ACP ``agent`` mode currently cannot honour it, so validation
+        # rejects it before a child is started rather than dispatching with a
+        # weaker effective sandbox.
         path = run_directory.resolve()
         return cls("restricted", path, path, public_web_search=True, network_access=True)
 
@@ -100,6 +106,10 @@ class CodexAcpPolicy:
             raise AcpClientRejected("restricted ACP must preserve its run-directory cwd")
         if self.kind == "restricted" and not (self.public_web_search and self.network_access):
             raise AcpClientRejected("restricted ACP requires pinned web and network settings")
+        if self.kind == "restricted" and not _PINNED_AGENT_MODE_NETWORK_ACCESS:
+            raise AcpClientRejected(
+                "restricted ACP is unavailable: pinned agent mode disables network access",
+            )
         if self.kind == "ordinary" and (self.public_web_search or self.network_access):
             raise AcpClientRejected("ordinary ACP cannot request web or network access")
 

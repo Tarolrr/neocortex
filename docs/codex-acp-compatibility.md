@@ -129,9 +129,10 @@ progress or a successful turn clears an active retry warning internally
 (`completeRetryIncidentOnTurnProgress`/`completeSuccessfulTurn`/`clearSessionFailure`)
 without emitting a synthetic “Recovered” revision. Thus recovery evidence is a
 warning followed by progress or success with that warning cleared, never an
-invented AIR clear/update. `timed_out` is true iff `timeout_phases` is nonempty;
-the ordered values record each expired `cancel_response`, `session_close`,
-`term_grace`, or `kill_grace` bound.
+invented AIR clear/update. `timed_out` is true when the primary prompt budget
+or any cleanup bound expires. The ordered `timeout_phases` values record only
+expired cleanup bounds: `cancel_response`, `session_close`, `term_grace`, or
+`kill_grace`.
 
 Conservative lossy mapping: the Codex `quota_exhausted` kind is emitted as
 `limit` with no actions, and is only an unknown quota/account condition;

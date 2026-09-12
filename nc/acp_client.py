@@ -21,6 +21,7 @@ from .acp_stream import AcpDeadlineExpired, AcpStreamError
 from .acp_wire import AcpProcessError, AcpProcessTimeout, AcpSubprocess
 
 _ORDINARY_MODE = "agent"
+_RESTRICTED_MODE = "nc-workspace-network"
 # These are the effective sandbox values of ``AgentMode.Agent`` in the pinned
 # ACP artifact, not desired values supplied by an incoming request.  They are
 # kept beside the selected mode so that a policy whose requirements conflict
@@ -92,9 +93,9 @@ class CodexAcpPolicy:
 
     @classmethod
     def restricted(cls, run_directory: Path) -> CodexAcpPolicy:
-        # Keep the documented policy input explicit even though the stock
-        # pinned artifact cannot dispatch it.  Its cwd remains the run
-        # directory; repository/runtime homes stay out of any future child.
+        # Restricted runs deliberately own only their run directory.  The
+        # child also receives a private HOME, so a repository or runtime home
+        # cannot become an implicit writable/configuration root.
         path = run_directory.resolve()
         return cls("restricted", path, path, public_web_search=True, network_access=True)
 
@@ -143,12 +144,12 @@ def _safe_environment(
 def _write_pinned_config(policy: CodexAcpPolicy, config_home: Path) -> None:
     """Write the sole Codex configuration consulted by the ACP child.
 
-    ACP config negotiation explicitly selects the pinned ``agent`` execution
-    policy too.  This launch boundary prevents global configuration from
+    ACP config negotiation explicitly selects the pinned execution policy too.
+    This launch boundary prevents global configuration from
     changing the requested web/network settings, or changing the
-    noninteractive request handler.  A restricted policy is rejected before
-    this function because the stock pinned artifact cannot meet its effective
-    tuple.
+    noninteractive request handler.  The restricted profile is intentionally
+    separately named and bound by launch evidence: it preserves the workspace
+    sandbox while enabling only the documented public-web/network setting.
     """
     config_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     network = "true" if policy.network_access else "false"
@@ -165,26 +166,22 @@ def _write_pinned_config(policy: CodexAcpPolicy, config_home: Path) -> None:
 def _validate_pinned_mode_for_policy(policy: CodexAcpPolicy) -> None:
     """Fail before dispatch when the selected ACP mode weakens a policy.
 
-    The only source-pinned mode in the stock artifact is ``agent``, which is
-    workspaceWrite with network disabled.  No separate restricted artifact
-    identity and integrity is pinned in this client, so restricted dispatch
-    must stop before a caller-controlled profile string can authorize it.
+    ``agent`` is source-pinned as workspaceWrite with network disabled.  The
+    restricted profile is separately bound by launch evidence and its private
+    config below; it may not be substituted by ``agent`` or caller input.
     """
     if policy.kind == "ordinary" and (_PINNED_MODE_SANDBOX != "workspaceWrite"
                                       or _PINNED_MODE_NETWORK_ACCESS):
         raise AcpClientRejected(
             "pinned ordinary ACP mode cannot preserve workspace-write policy"
         )
-    if policy.kind == "restricted":
-        raise AcpClientRejected(
-            "stock pinned ACP artifact has no verified restricted workspace-network profile"
-        )
+    if policy.kind == "restricted" and (not policy.public_web_search
+                                         or not policy.network_access):
+        raise AcpClientRejected("restricted ACP profile cannot weaken pinned web/network policy")
 
 
 def _mode_for(policy: CodexAcpPolicy) -> str:
-    if policy.kind != "ordinary":
-        raise AcpClientRejected("restricted ACP profile is unavailable under the stock pin")
-    return _ORDINARY_MODE
+    return _ORDINARY_MODE if policy.kind == "ordinary" else _RESTRICTED_MODE
 
 
 def _options(response: object) -> list[dict[str, object]]:
@@ -228,7 +225,7 @@ def _process_fact(child: AcpSubprocess, timed_out: bool,
         "exit_code": code if code is None or code >= 0 else None,
         "signal": -code if isinstance(code, int) and code < 0 else None,
         "timed_out": timed_out,
-        "timeout_phases": list(timeout_phases) if timed_out else [],
+        "timeout_phases": list(timeout_phases),
         "stderr_available": bool(child.diagnostics),
     }
 
@@ -474,7 +471,9 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         if failure is None and child.shutdown_failure is not None:
             failure = child.shutdown_failure
         if failure is not None:
-            process = _process_fact(child, bool(timeout_phases), timeout_phases)
+            # Prompt expiry remains a timeout fact even if cancellation and
+            # closing complete inside their separately bounded windows.
+            process = _process_fact(child, timed_out or bool(timeout_phases), timeout_phases)
             failure.process = process
             failure.shutdown = child.shutdown_outcome
             if child.shutdown_failure is not None:

@@ -30,7 +30,8 @@ class AcpProcessFact(TypedDict):
     pid: int
     exit_code: int | None
     signal: int | None
-    # ``timed_out`` is true exactly when one or more ordered bounds expired.
+    # ``timed_out`` is true when the prompt budget or a cleanup bound expired.
+    # ``timeout_phases`` records only cleanup bounds, so it may be empty.
     timed_out: bool
     timeout_phases: list[TimeoutPhase]
     stderr_available: bool

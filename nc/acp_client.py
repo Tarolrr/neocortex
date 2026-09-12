@@ -7,6 +7,7 @@ It starts one process, makes one fresh session and sends exactly one prompt.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -15,10 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from .acp_contract import AcpProcessFact, AcpPromptFact, is_air_session_failure
+from .acp_contract import AcpProcessFact, AcpPromptFact
 from .acp_decoder import AcpPromptResult, decode_acp_prompt_result
 from .acp_stream import AcpDeadlineExpired, AcpStreamError
 from .acp_wire import AcpProcessError, AcpProcessTimeout, AcpSubprocess
+
+_MAX_EVIDENCE_RECORDS = 128
+_MAX_EVIDENCE_BYTES = 64 * 1024
 
 _ORDINARY_MODE = "agent"
 # These are the effective sandbox values of ``AgentMode.Agent`` in the pinned
@@ -42,6 +46,16 @@ _PROTECTED_ENV = frozenset({
 
 class AcpClientRejected(RuntimeError):
     """A profile, policy, or server capability was rejected before prompting."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        # Pre-launch rejection has no child facts, but consumers still get a
+        # stable envelope instead of scraping an exception string.
+        self.evidence = AcpTurnEvidence(None, None, None, False, "", "setup_rejected")
+
+
+class AcpEvidenceOverflow(RuntimeError):
+    """Authoritative correlated evidence exceeded the published local bound."""
 
 
 @dataclass(frozen=True)
@@ -122,6 +136,89 @@ class CodexAcpTurn:
     process: AcpProcessFact
     shutdown: str | None
     live_sandbox_enforcement_verified: Literal[False] = False
+
+
+@dataclass(frozen=True)
+class AcpTurnEvidence:
+    """Stable local envelope attached to every post-launch failure.
+
+    The collector retains at most 128 correlated AIR/usage/response records
+    and 64 KiB of their JSON representation.  It never retains transcript or
+    tool updates.  Overflow is a failure, rather than a dropped observation.
+    """
+
+    prompt: AcpPromptFact | None
+    process: AcpProcessFact | None
+    shutdown: str | None
+    cleanup_uncertain: bool
+    log_path: str
+    status: str
+
+
+class _TurnEvidenceCollector:
+    """Bounded, correlated input for the pure decoder (not a wire transcript)."""
+
+    def __init__(self) -> None:
+        self.records: list[object] = []
+        self.prompt_id: int | None = None
+        self.session_id: str | None = None
+        self.bytes = 0
+        self.overflow = False
+
+    def _add(self, value: object) -> None:
+        try:
+            size = len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
+        except (TypeError, ValueError):
+            self.overflow = True
+            raise AcpEvidenceOverflow("ACP evidence-overflow: unserializable authoritative evidence")
+        if len(self.records) >= _MAX_EVIDENCE_RECORDS or self.bytes + size > _MAX_EVIDENCE_BYTES:
+            self.overflow = True
+            raise AcpEvidenceOverflow("ACP evidence-overflow: correlated evidence limit exceeded")
+        self.records.append(value)
+        self.bytes += size
+
+    def prompt_request(self, value: dict[str, object], prompt_id: int, session_id: str) -> None:
+        self.prompt_id, self.session_id = prompt_id, session_id
+        self._add(value)
+
+    def notification(self, value: dict[str, object]) -> None:
+        """Keep only update fields which the decoder is allowed to inspect."""
+        if value.get("method") != "session/update" or self.session_id is None:
+            return
+        params = value.get("params")
+        if not isinstance(params, dict) or params.get("sessionId") != self.session_id:
+            return
+        update = params.get("update")
+        if not isinstance(update, dict):
+            return
+        # Tool/transcript payloads are intentionally not copied.
+        if not (_has_air(update) or (update.get("sessionUpdate") == "usage_update" and "usage" in update)):
+            return
+        self._add({"jsonrpc": value.get("jsonrpc"), "method": "session/update",
+                   "params": {"sessionId": self.session_id, "update": update}})
+
+    def prompt_response(self, value: object) -> None:
+        if not isinstance(value, dict):
+            self._add(value)
+            return
+        # Prompt result extensions may carry arbitrary content too.  The
+        # decoder has authority only over these terminal fields.
+        retained: dict[str, object] = {key: value[key] for key in ("jsonrpc", "id") if key in value}
+        if "result" in value:
+            result = value["result"]
+            if isinstance(result, dict):
+                retained["result"] = {key: result[key] for key in ("stopReason", "usage", "_meta") if key in result}
+            else:
+                retained["result"] = result
+        if "error" in value:
+            retained["error"] = value["error"]
+        self._add(retained)
+
+
+def _has_air(value: object) -> bool:
+    return (isinstance(value, dict) and isinstance(value.get("_meta"), dict)
+            and isinstance(value["_meta"].get("jetbrains"), dict)
+            and "air" in value["_meta"]["jetbrains"])
 
 
 def _safe_environment(
@@ -211,13 +308,15 @@ def _selected(response: object, config_id: str, value: str) -> bool:
 
 
 def _air_advertised(response: object) -> bool:
-    if not isinstance(response, dict) or response.get("protocolVersion") != 1:
+    if (not isinstance(response, dict) or response.get("protocolVersion") != 1
+            or isinstance(response.get("protocolVersion"), bool)):
         return False
     try:
         air = response["_meta"]["jetbrains"]["air"]  # type: ignore[index]
     except (KeyError, TypeError):
         return False
     return (isinstance(air, dict) and air.get("version") == 1
+            and not isinstance(air.get("version"), bool)
             and isinstance(air.get("capabilities"), list)
             and "sessionFailure" in air["capabilities"])
 
@@ -298,12 +397,13 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
     policy.validate()
     _validate_pinned_mode_for_policy(policy)
     if not command or not model or not prompt or timeout_s <= 0:
-        raise ValueError("command, model, prompt, and positive timeout are required")
+        raise AcpClientRejected("command, model, prompt, and positive timeout are required")
     launch.validate_for(command, _mode_for(policy))
     # The prompt budget is separate from the prescribed bounded cancellation
     # and cleanup phases.  The supervisor still owns one outer deadline.
     deadline = time.monotonic() + timeout_s + 15
-    wire: list[object] = []
+    evidence = _TurnEvidenceCollector()
+    prompt_fact: AcpPromptFact | None = None
     session_id: str | None = None
     # AcpJsonRpcStream must reply to a peer request before it can resume the
     # host request it was pumping.  Retain a policy-owner rejection across
@@ -316,11 +416,10 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
             raise server_request_rejection
 
     def observe_notification(value: dict[str, object]) -> None:
-        wire.append(value)
+        evidence.notification(value)
 
     def deny_request(value: dict[str, object]) -> object:
         nonlocal server_request_rejection
-        wire.append(value)
         method = value.get("method")
         params = value.get("params")
         if (not isinstance(params, dict) or session_id is None
@@ -339,8 +438,12 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
     log_path.parent.mkdir(parents=True, exist_ok=True)
     config_home = Path(tempfile.mkdtemp(prefix="nc-acp-codex-", dir=log_path.parent))
     _write_pinned_config(policy, config_home)
-    child = AcpSubprocess(command, cwd=policy.cwd, deadline=deadline, log_path=log_path,
-                          env=_safe_environment(environment, config_home=config_home))
+    try:
+        child = AcpSubprocess(command, cwd=policy.cwd, deadline=deadline, log_path=log_path,
+                              env=_safe_environment(environment, config_home=config_home))
+    except BaseException as exc:
+        exc.evidence = AcpTurnEvidence(None, None, None, False, str(log_path), "launcher_failure")
+        raise
     result: CodexAcpTurn | None = None
     timed_out = False
     # These are only *expired* bounded cleanup phases; successful protocol
@@ -354,19 +457,15 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
             "_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["sessionFailure"]}}},
         }}
         init_id = stream.send_request("initialize", init_params)
-        wire.append({"jsonrpc": "2.0", "id": init_id, "method": "initialize", "params": init_params})
         init_response = stream.wait_for(init_id)
         raise_server_request_rejection()
-        wire.append(init_response)
         if not _air_advertised(init_response.get("result")):
             raise AcpClientRejected("server does not advertise pinned ACP/AIR profile")
 
         new_params: dict[str, object] = {"cwd": str(policy.cwd), "mcpServers": []}
         new_id = stream.send_request("session/new", new_params)
-        wire.append({"jsonrpc": "2.0", "id": new_id, "method": "session/new", "params": new_params})
         new_response = stream.wait_for(new_id)
         raise_server_request_rejection()
-        wire.append(new_response)
         new_result = new_response.get("result")
         if not isinstance(new_result, dict) or not isinstance(new_result.get("sessionId"), str):
             raise AcpClientRejected("server did not allocate a valid fresh session")
@@ -381,11 +480,8 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         for config_id, value in (("model", model), ("mode", mode)):
             params: dict[str, object] = {"sessionId": session_id, "configId": config_id, "value": value}
             config_id_request = stream.send_request("session/set_config_option", params)
-            wire.append({"jsonrpc": "2.0", "id": config_id_request,
-                         "method": "session/set_config_option", "params": params})
             response = stream.wait_for(config_id_request)
             raise_server_request_rejection()
-            wire.append(response)
             if not _selected(response.get("result"), config_id, value):
                 raise AcpClientRejected("server rejected explicit ACP configuration")
 
@@ -400,8 +496,8 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         prompt_params: dict[str, object] = {"sessionId": session_id,
                                             "prompt": [{"type": "text", "text": prompt}]}
         prompt_id = stream.send_request("session/prompt", prompt_params)
-        wire.append({"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
-                     "params": prompt_params})
+        evidence.prompt_request({"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
+                                 "params": prompt_params}, prompt_id, session_id)
         try:
             prompt_response = stream.wait_for(prompt_id, deadline=time.monotonic() + timeout_s)
             raise_server_request_rejection()
@@ -419,37 +515,49 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
                     "session/cancel", {"sessionId": session_id}, deadline=cancel_deadline,
                 )
                 prompt_response = stream.wait_for(prompt_id, deadline=cancel_deadline)
-            except (AcpProcessError, AcpStreamError, AcpDeadlineExpired):
+            except AcpDeadlineExpired:
                 timeout_phases.append("cancel_response")
+            except (AcpProcessError, AcpStreamError) as cleanup_error:
+                # EOF/write/protocol failure is evidence in its own right;
+                # do not relabel it as an expired cancellation deadline.
+                raise cleanup_error from exc
             if close_advertised:
                 close_deadline = time.monotonic() + 5
                 try:
                     stream.request(
                         "session/close", {"sessionId": session_id}, deadline=close_deadline,
                     )
-                except (AcpProcessError, AcpStreamError, AcpDeadlineExpired):
+                except AcpDeadlineExpired:
                     timeout_phases.append("session_close")
+                except (AcpProcessError, AcpStreamError) as cleanup_error:
+                    raise cleanup_error from exc
             error = AcpProcessTimeout("ACP prompt deadline expired after bounded cancellation")
             error.timeout_phases = tuple(timeout_phases)
             raise error from exc
-        wire.append(prompt_response)
+        evidence.prompt_response(prompt_response)
         # The transport intentionally uses compact numeric JSON-RPC ids, while
         # AIR incident ownership is text-prefixed.  Give the pure decoder its
         # pinned textual correlation view without changing the captured facts.
         decoder_wire = [dict(item, id=str(prompt_id)) if isinstance(item, dict)
-                        and item.get("id") == prompt_id else item for item in wire]
+                        and item.get("id") == prompt_id else item for item in evidence.records]
         decoded = decode_acp_prompt_result(decoder_wire, request_id=str(prompt_id), session_id=session_id)
-        observations = _air_observations(wire, session_id, prompt_id)
-        prompt_fact: AcpPromptFact = {
+        observations = _air_observations(evidence.records, session_id, prompt_id)
+        prompt_fact = {
             "request_id": str(prompt_id), "session_id": session_id, "prompt_id": str(prompt_id),
             "prompt_response_valid": decoded.kind != "protocol_invalid",
             "stop_reason": decoded.stop_reason, "air_observations": observations,
-            "session_failures": [item for item in observations if is_air_session_failure(item)],
+            "session_failures": [
+                {"id": item.incident_id, "revision": item.revision, "category": item.category,
+                 "severity": item.severity, "title": item.diagnostic, "actions": list(item.actions)}
+                for item in decoded.failures
+            ],
         }
-        if "result" in prompt_response and isinstance(prompt_response["result"], dict):
-            prompt_fact["jsonrpc_result"] = prompt_response["result"]
-        if "error" in prompt_response and isinstance(prompt_response["error"], dict):
-            prompt_fact["jsonrpc_error"] = prompt_response["error"]
+        retained_response = evidence.records[-1]
+        if isinstance(retained_response, dict):
+            if isinstance(retained_response.get("result"), dict):
+                prompt_fact["jsonrpc_result"] = retained_response["result"]
+            if isinstance(retained_response.get("error"), dict):
+                prompt_fact["jsonrpc_error"] = retained_response["error"]
         # A completed response is not permission to hide a process which has
         # already failed.  Yield briefly so an immediate post-response exit
         # is observed before this client starts deliberate cleanup.
@@ -481,6 +589,10 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
             process = _process_fact(child, timed_out or bool(timeout_phases), timeout_phases)
             failure.process = process
             failure.shutdown = child.shutdown_outcome
+            failure.evidence = AcpTurnEvidence(
+                prompt_fact, process, child.shutdown_outcome, child.cleanup_uncertain,
+                str(log_path), "evidence_overflow" if evidence.overflow else "local_failure",
+            )
             if child.shutdown_failure is not None:
                 raise failure
             if isinstance(failure, AcpProcessTimeout):

@@ -34,6 +34,18 @@ credentials and does not authenticate; live activation must establish a
 separately verified credential boundary. It sets model and mode explicitly,
 validates each response, and returns decoded prompt evidence plus independent
 process facts and distinct intentional-shutdown evidence.  Before it creates a process,
+
+## Bounded turn evidence
+
+The isolated client keeps a correlated evidence envelope rather than an ACP
+transcript: at most 128 retained AIR/usage/prompt-response records and 64 KiB
+of JSON. Tool and message notifications are not retained. The final direct
+usage snapshot is retained independently. If an authoritative retained record
+would exceed either bound, the turn fails with `ACP evidence-overflow`; it is
+not silently discarded. The envelope is attached to local failures with the
+observed prompt facts, nullable exit/signal facts, intentional-shutdown and
+cleanup-uncertainty disposition, and log reference. This documents the client
+interface only; it does not claim that a live deployment enforces a sandbox.
 `CodexAcpLaunchEvidence` must match the pinned package name/version/tarball
 integrity, resolved Codex 0.153.4, resolved ACP SDK 1.4.0, the exact command,
 and the selected profile;

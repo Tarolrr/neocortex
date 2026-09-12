@@ -89,15 +89,19 @@ def is_air_session_failure(value: object) -> bool:
 
 
 def is_completion_candidate(prompt: AcpPromptFact) -> bool:
-    """Return transport-only eligibility; role parsing makes the final decision."""
+    """Return transport-only eligibility; role parsing makes the final decision.
+
+    ``air_observations`` is a lossless raw audit trail.  It is deliberately
+    not a second completion validator: duplicate and stale revisions have
+    already been reconciled into ``session_failures`` by the decoder.
+    """
     observations = prompt.get("air_observations")
     failures = prompt.get("session_failures")
     if not isinstance(observations, list) or not isinstance(failures, list):
         return False
     if not all(is_air_session_failure(observation) for observation in observations):
         return False
-    # The adapter must not omit an observed error from its validated view.
-    if failures != observations or not all(is_air_session_failure(failure) for failure in failures):
+    if not all(is_air_session_failure(failure) for failure in failures):
         return False
     return (
         prompt.get("prompt_response_valid") is True

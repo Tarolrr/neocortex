@@ -246,7 +246,7 @@ def decode_acp_prompt_result(
         return AcpPromptResult("protocol_invalid", None, "prompt stopReason is invalid", (), usage)
     # A caller's negotiated profile is still an input fact, but do not discard
     # independently received terminal data when it is unsupported.
-    if air_version != 1:
+    if not isinstance(air_version, int) or isinstance(air_version, bool) or air_version != 1:
         return AcpPromptResult("protocol_invalid", stop_reason, "unsupported AIR extension version", (), usage)
     raw_failures: list[object] = []
     for item in wire[request_index + 1:response_index]:

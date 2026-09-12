@@ -254,7 +254,7 @@ def _error_text(event: dict[str, object]) -> str:
     return " ".join(bits)
 
 
-def _category_from_terminal(text: str) -> str:
+def _category_from_terminal(adapter: str, text: str) -> str:
     """Map a *structured terminal* provider diagnostic to the runner taxonomy."""
     value = text.lower()
     # Ordered from specific product/account states to broad HTTP-style errors.
@@ -270,7 +270,8 @@ def _category_from_terminal(text: str) -> str:
         and re.search(r"https://chatgpt\.com/codex/settings/usage\b", value)
     )
     captured_retry = re.search(r"\btry\s+again\s+at\s+\S+", value)
-    if captured_codex_usage_limit and captured_consumer_product and captured_retry:
+    if (adapter == "codex" and captured_codex_usage_limit
+            and captured_consumer_product and captured_retry):
         return "subscription_limit"
     # A bare "usage limit" or "plan limit" also occurs for API organization
     # spend limits.  It cannot establish a resettable end-user subscription
@@ -362,7 +363,7 @@ def _structured_terminal(adapter: str, text: str) -> tuple[str, str] | None:
     if not failed:
         return None
     diagnostic = _error_text(event)
-    return _category_from_terminal(diagnostic), sanitize_diagnostic(diagnostic)
+    return _category_from_terminal(adapter, diagnostic), sanitize_diagnostic(diagnostic)
 
 
 def assess_session(result: SessionResult, _adapter: str) -> HostAssessment:

@@ -26,7 +26,7 @@ from nc.adapters import (
 ])
 def test_generic_usage_or_plan_limit_is_not_a_subscription_limit(diagnostic, expected):
     """Synthetic terminal diagnostics without subscription evidence stay unknown."""
-    assert _category_from_terminal(diagnostic) == expected
+    assert _category_from_terminal("codex", diagnostic) == expected
 
 
 @pytest.mark.parametrize("diagnostic", [
@@ -38,7 +38,7 @@ def test_generic_usage_or_plan_limit_is_not_a_subscription_limit(diagnostic, exp
 ])
 def test_ambiguous_billing_or_quota_diagnostic_is_not_billing_credits(diagnostic):
     """Synthetic terminal diagnostics need explicit API-credit exhaustion."""
-    assert _category_from_terminal(diagnostic) == "unknown"
+    assert _category_from_terminal("codex", diagnostic) == "unknown"
 
 
 @pytest.mark.parametrize("diagnostic", [
@@ -48,7 +48,7 @@ def test_ambiguous_billing_or_quota_diagnostic_is_not_billing_credits(diagnostic
 ])
 def test_explicit_api_credit_exhaustion_is_billing_credits(diagnostic):
     """Synthetic terminal diagnostics explicitly establish exhausted credits."""
-    assert _category_from_terminal(diagnostic) == "billing_credits"
+    assert _category_from_terminal("codex", diagnostic) == "billing_credits"
 
 
 @pytest.mark.parametrize("diagnostic", [
@@ -58,7 +58,7 @@ def test_explicit_api_credit_exhaustion_is_billing_credits(diagnostic):
 ])
 def test_explicit_resettable_subscription_allowance_is_classified(diagnostic):
     """Synthetic diagnostics must identify both the product and reset/cadence."""
-    assert _category_from_terminal(diagnostic) == "subscription_limit"
+    assert _category_from_terminal("codex", diagnostic) == "subscription_limit"
 
 
 def test_captured_codex_usage_limit_terminal_envelopes(tmp_path):
@@ -87,7 +87,20 @@ def test_captured_codex_usage_limit_terminal_envelopes(tmp_path):
     ("You've hit your usage limit. visit https://chatgpt.com/codex/settings/usage try again at later", "unknown"),
 ])
 def test_captured_codex_grammar_is_narrow_synthetic_variants(diagnostic, expected):
-    assert _category_from_terminal(diagnostic) == expected
+    assert _category_from_terminal("codex", diagnostic) == expected
+
+
+def test_captured_codex_usage_words_are_not_claude_subscription_evidence(tmp_path):
+    """The captured grammar is a Codex compatibility rule, not a Claude rule."""
+    event = (Path(__file__).parent / "fixtures" /
+             "codex-usage-limit.owner-feedback-245.run-174.captured.jsonl").read_text().splitlines()[-1]
+    path = tmp_path / "session.log"
+    # A Claude-shaped terminal envelope makes this provider-owned Claude evidence.
+    # The diagnostic itself remains exclusively a Codex grammar match.
+    path.write_text('{"type":"result","is_error":true,"result":' +
+                    event.split('"error":{"message":', 1)[1][:-1] + '\n')
+    assessment = assess_session(SessionResult(1, path, None, False), "claude")
+    assert (assessment.status, assessment.category) == ("FAILED", "unknown")
 
 
 def test_real_codex_usage(tmp_path, monkeypatch):

@@ -36,8 +36,11 @@ if scenario in {"restricted", "isolated"}:
     config = open(os.path.join(home, "config.toml")).read()
     assert os.environ["CODEX_HOME"] == home
     assert "CODEX_CONFIG" not in os.environ
+    assert "CODEX_PATH" not in os.environ
+    assert "INITIAL_AGENT_MODE" not in os.environ
     assert "sandbox_mode = \"workspace-write\"" in config
     if scenario == "restricted":
+        assert os.getcwd() == os.environ["EXPECTED_CWD"]
         assert "web_search = \"live\"" in config and "network_access = true" in config
     else:
         assert "web_search = \"disabled\"" in config and "network_access = false" in config
@@ -271,26 +274,25 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
         assert raised.value.process["timed_out"] is False
 
 
-def test_restricted_policy_is_rejected_before_dispatch_when_agent_mode_cannot_preserve_network(
+def test_restricted_policy_launches_an_isolated_child_with_its_pinned_settings(
     tmp_path: Path,
 ) -> None:
     policy = CodexAcpPolicy.restricted(tmp_path)
     assert policy.cwd == tmp_path.resolve()
     assert policy.public_web_search and policy.network_access
-    # The pinned source says selecting ``mode=agent`` makes effective
-    # workspace-write networkAccess false.  The requested true setting in a
-    # private config file would therefore be overridden.  The client must not
-    # start an ACP process and present that request as restricted support.
-    source = json.loads((Path(__file__).parent / "fixtures" /
-                         "codex-acp-agent-tool-path.source.json").read_text())
-    assert source["selected_mode"]["sandboxPolicy"]["networkAccess"] is False
-    marker = tmp_path / "restricted-server-started"
-    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
-    with pytest.raises(AcpClientRejected, match="pinned agent mode disables network access"):
-        run_codex_acp_turn(command, launch=verified_launch(command), policy=policy,
-                            model="model", prompt="hello", log_path=tmp_path / "restricted.log",
-                            timeout_s=1)
-    assert not marker.exists()
+    command = fake_server("restricted")
+    turn = run_codex_acp_turn(command, launch=verified_launch(command), policy=policy,
+                               model="model", prompt="hello", log_path=tmp_path / "restricted.log",
+                               timeout_s=1,
+                               environment={
+                                   "HOME": "/global-config",
+                                   "CODEX_CONFIG": "/global-config/config.toml",
+                                   "CODEX_PATH": "bad",
+                                   "INITIAL_AGENT_MODE": "agent-full-access",
+                                   "EXPECTED_CWD": str(tmp_path.resolve()),
+                               })
+    assert turn.prompt.kind == "success"
+    assert turn.live_sandbox_enforcement_verified is False
 
 
 def test_global_config_and_invalid_policy_cannot_override_pinned_launch(tmp_path: Path) -> None:

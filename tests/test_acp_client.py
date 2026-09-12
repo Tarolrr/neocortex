@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -21,6 +22,8 @@ def read(): return json.loads(sys.stdin.readline())
 def send(value): print(json.dumps(value), flush=True)
 def response(request, result): send({"jsonrpc":"2.0", "id":request["id"], "result":result})
 init = read()
+if scenario == "agent_tool":
+    assert set(init["params"]["clientCapabilities"]) == {"_meta"}
 if scenario in {"restricted", "isolated"}:
     home = os.environ["HOME"]
     config = open(os.path.join(home, "config.toml")).read()
@@ -47,7 +50,13 @@ for expected in ("model", "mode"):
     assert request["method"] == "session/set_config_option" and request["params"]["configId"] == expected
     for option in options:
         if option["id"] == expected: option["currentValue"] = request["params"]["value"]
+    if scenario == "reset_model" and expected == "mode":
+        options = [option for option in options if option["id"] != "model"]
     response(request, {"configOptions":options})
+if scenario == "reset_model":
+    # The client must reject the final snapshot before it can send a prompt.
+    assert sys.stdin.readline() == ""
+    sys.exit(0)
 prompt = read()
 assert prompt["method"] == "session/prompt" and prompt["params"]["sessionId"] == "fresh"
 if scenario == "timeout":
@@ -68,6 +77,10 @@ if scenario == "elicitation":
 if scenario == "malformed_request":
     send({"jsonrpc":"2.0","id":"bad","method":"session/request_permission","params":{}})
     assert read()["error"]["code"] == -32603
+if scenario == "agent_tool":
+    # This is an agent-owned update; it requires no client terminal or
+    # filesystem capability and is not a client-directed tool request.
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"sessionUpdate":"tool_call_update","toolCallId":"agent-owned-command","status":"completed"}}})
 if scenario == "error":
     send({"jsonrpc":"2.0","id":prompt["id"],"error":{"code":-1,"message":"bad"}}); time.sleep(.2); sys.exit(0)
 if scenario == "malformed":
@@ -114,9 +127,26 @@ def test_fake_permission_is_denied_noninteractively(tmp_path: Path) -> None:
     assert run(tmp_path, "permission").prompt.kind == "success"
 
 
+def test_source_pinned_agent_owned_tool_update_needs_no_client_tools(tmp_path: Path) -> None:
+    source = json.loads((Path(__file__).parent / "fixtures" /
+                         "codex-acp-agent-tool-path.source.json").read_text())
+    assert source["commit"] == "51d6247ac7448485bfcf534b813196fafc26df59"
+    assert source["selected_mode"]["id"] == "agent"
+    assert source["selected_mode"]["sandboxPolicy"]["type"] == "workspaceWrite"
+    assert source["agent_owned_update"]["sessionUpdate"] == "tool_call_update"
+    turn = run(tmp_path, "agent_tool")
+    assert turn.prompt.kind == "success"
+    # The fake server only proceeds if it received the client's exact
+    # initialize shape; this update is the source-backed server-to-client
+    # agent tool path, not a capability advertised by NC.
+    assert turn.live_sandbox_enforcement_verified is False
+
+
 def test_fake_post_response_nonzero_exit_cannot_be_success(tmp_path: Path) -> None:
-    with pytest.raises(AcpUnexpectedExit, match="exited unexpectedly with status 7"):
+    with pytest.raises(AcpUnexpectedExit, match="exited unexpectedly with status 7") as raised:
         run(tmp_path, "post_response_exit")
+    assert raised.value.process["exit_code"] == 7
+    assert "before deliberate shutdown" in raised.value.shutdown
 
 
 @pytest.mark.parametrize("scenario", ["elicitation", "malformed_request"])
@@ -124,8 +154,8 @@ def test_fake_client_requests_are_cancelled_or_fail_closed(tmp_path: Path, scena
     assert run(tmp_path, scenario).prompt.kind == "success"
 
 
-@pytest.mark.parametrize("scenario,error", [("unsupported", AcpClientRejected), ("eof", AcpTransportEof),
-                                               ("timeout", AcpProcessTimeout)])
+@pytest.mark.parametrize("scenario,error", [("unsupported", AcpClientRejected), ("reset_model", AcpClientRejected),
+                                               ("eof", AcpTransportEof), ("timeout", AcpProcessTimeout)])
 def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: str, error: type[Exception]) -> None:
     with pytest.raises(error) as raised:
         run(tmp_path, scenario, timeout_s=.1 if scenario == "timeout" else 1)
@@ -134,6 +164,10 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
         assert raised.value.process["timed_out"] is False
         assert raised.value.process["timeout_phases"] == []
         assert "intentional shutdown" in raised.value.shutdown
+    else:
+        assert raised.value.process["pid"] > 0
+        assert isinstance(raised.value.shutdown, str)
+        assert raised.value.process["timed_out"] is False
 
 
 def test_restricted_policy_and_environment_are_explicit(tmp_path: Path) -> None:

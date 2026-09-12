@@ -1,0 +1,18 @@
+{
+  "attribution": "source-derived pinned Codex ACP 1.11.0 behavior; not a captured incident",
+  "commit": "51d6247ac7448485bfcf534b813196fafc26df59",
+  "agent_mode_source": "https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AgentMode.ts",
+  "event_mapper_source": "https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexEventHandler.ts",
+  "selected_mode": {
+    "id": "agent",
+    "approvalPolicy": "on-request",
+    "approvalsReviewer": "auto_review",
+    "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": false}
+  },
+  "agent_owned_update": {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "agent-owned-command",
+    "status": "completed"
+  },
+  "live_sandbox_enforcement_verified": false
+}

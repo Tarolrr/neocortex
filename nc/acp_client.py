@@ -199,6 +199,7 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
     # and cleanup phases.  The supervisor still owns one outer deadline.
     deadline = time.monotonic() + timeout_s + 15
     wire: list[object] = []
+    session_id: str | None = None
     def observe_notification(value: dict[str, object]) -> None:
         wire.append(value)
 
@@ -206,7 +207,8 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
         wire.append(value)
         method = value.get("method")
         params = value.get("params")
-        if not isinstance(params, dict) or params.get("sessionId") != session_id:
+        if (not isinstance(params, dict) or session_id is None
+                or params.get("sessionId") != session_id):
             raise AcpClientRejected("malformed or foreign server request")
         if method == "session/request_permission":
             # ACP v1 has no ``denied`` permission outcome.  Cancellation is
@@ -226,7 +228,7 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
     # These are only *expired* bounded cleanup phases; successful protocol
     # operations and the original prompt deadline are not process facts.
     timeout_phases: list[str] = []
-    timeout_error: AcpProcessTimeout | None = None
+    failure: BaseException | None = None
     try:
         stream = child.stream(notification_handler=observe_notification, request_handler=deny_request)
 
@@ -265,6 +267,14 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
             if not _selected(response.get("result"), config_id, value):
                 raise AcpClientRejected("server rejected explicit ACP configuration")
 
+        # A set-config response is a complete option snapshot, not an
+        # acknowledgement for only the option named by its request.  In
+        # particular, a mode update must not be allowed to silently reset or
+        # omit the selected model before dispatching the prompt.
+        if not (_selected(response.get("result"), "model", model)
+                and _selected(response.get("result"), "mode", _MODE)):
+            raise AcpClientRejected("server did not retain the pinned model and execution policy")
+
         prompt_params: dict[str, object] = {"sessionId": session_id,
                                             "prompt": [{"type": "text", "text": prompt}]}
         prompt_id = stream.send_request("session/prompt", prompt_params)
@@ -298,7 +308,6 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
                     timeout_phases.append("session_close")
             error = AcpProcessTimeout("ACP prompt deadline expired after bounded cancellation")
             error.timeout_phases = tuple(timeout_phases)
-            timeout_error = error
             raise error from exc
         wire.append(prompt_response)
         # The transport intentionally uses compact numeric JSON-RPC ids, while
@@ -325,19 +334,24 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
         result = CodexAcpTurn(decoded, prompt_fact, _process_fact(child, False), None)
     except AcpProcessTimeout as exc:
         timed_out = True
-        timeout_error = timeout_error or exc
+        failure = exc
         raise
-    except AcpProcessError:
-        raise
-    except AcpStreamError:
+    except BaseException as exc:
+        # Every post-launch failure carries facts independent of the ACP
+        # response.  This includes EOF, a nonzero exit, malformed requests,
+        # and profile/configuration rejection; callers never have to infer
+        # local process state from an exception message.
+        failure = exc
         raise
     finally:
         child.close()
         timeout_phases.extend(child.timeout_phases)
-        if timeout_error is not None:
-            timeout_error.timeout_phases = tuple(timeout_phases)
-            timeout_error.process = _process_fact(child, bool(timeout_phases), timeout_phases)
-            timeout_error.shutdown = child.shutdown_outcome
+        if failure is not None:
+            process = _process_fact(child, bool(timeout_phases), timeout_phases)
+            setattr(failure, "process", process)
+            setattr(failure, "shutdown", child.shutdown_outcome)
+            if isinstance(failure, AcpProcessTimeout):
+                failure.timeout_phases = tuple(timeout_phases)
     assert result is not None
     timed_out = timed_out or bool(timeout_phases)
     return CodexAcpTurn(result.prompt, result.prompt_fact, _process_fact(child, timed_out, timeout_phases),

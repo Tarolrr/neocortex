@@ -151,3 +151,10 @@ source tuple and fail-closed permission disposition testable. Fixtures cover suc
 warning then success, quota-as-limit, retryable limit and service, access,
 request, cancellation, malformed AIR metadata, a same-incident revision, and
 retry recovery through turn progress (with no invented recovery revision).
+
+`tests/fixtures/codex-acp-agent-tool-path.source.json` records the pinned
+`AgentMode.ts` and `CodexEventHandler.ts` source locations used by the client's
+fake-server regression. It demonstrates that an `agent`-owned
+`tool_call_update` reaches the client without NC advertising terminal or
+filesystem capabilities. This is protocol-path evidence only: live sandbox
+enforcement remains explicitly unverified.

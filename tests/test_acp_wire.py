@@ -183,6 +183,7 @@ def test_close_escalates_hung_graceful_shutdown_and_reaps(tmp_path: Path) -> Non
     # SIGKILL is required because EOF and SIGTERM were both deliberately
     # ignored.  returncode is populated by close's wait, rather than poll().
     assert child.proc.returncode == -9
+    assert child.timeout_phases == ["term_grace", "kill_grace"]
     with pytest.raises(ChildProcessError):
         os.waitpid(child.proc.pid, os.WNOHANG)
     with pytest.raises(AcpIntentionalShutdown, match="intentional shutdown.*signal 9"):

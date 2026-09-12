@@ -60,8 +60,9 @@ and `elicitation/create` (form or URL), with `elicitation/complete` as its
 follow-up notification; these are the client-directed request paths in the
 tagged implementation ([handler source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/CodexElicitationHandler.ts)).
 This profile advertises neither elicitation nor MCP servers, so an unexpected
-permission request receives **deny** and an unexpected elicitation receives
-**cancel**: never open a URL, solicit input, or persist a choice. The selected
+permission request receives the ACP v1 fail-closed **cancelled** outcome and
+an unexpected elicitation receives **cancel**: never open a URL, solicit
+input, or persist a choice. The selected
 tagged mode is exactly `agent`: its [mode definition](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AgentMode.ts)
 sets Codex `approvalPolicy: "on-request"`, `approvalsReviewer: "auto_review"`,
 and `sandboxPolicy: "workspaceWrite"`. It is **not** Codex `never`, and its
@@ -70,8 +71,8 @@ workspace-write sandbox; `agent-full-access` is the only tagged `never` mode
 and it selects `dangerFullAccess`, so it is rejected for NC's no-widened-
 sandbox profile. Validate the selected `agent` config response and this
 source-pinned policy tuple before a prompt; the tuple is not an ACP wire echo.
-For `agent`, every `session/request_permission` is fail-closed with **deny**
-even if Codex asks after auto-review/on-request, and every elicitation is
+For `agent`, every `session/request_permission` is fail-closed with the ACP
+v1 **cancelled** outcome even if Codex asks after auto-review/on-request, and every elicitation is
 **cancel**. An unavailable policy-owner response, unknown/malformed request,
 or attempt to broaden cwd/sandbox is likewise fail-closed and non-completing.
 

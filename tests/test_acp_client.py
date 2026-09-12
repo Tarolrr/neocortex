@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from nc.acp_client import AcpClientRejected, CodexAcpPolicy, run_codex_acp_turn
-from nc.acp_wire import AcpProcessTimeout, AcpTransportEof
+from nc.acp_wire import AcpProcessTimeout, AcpTransportEof, AcpUnexpectedExit
 
 
 def fake_server(scenario: str) -> list[str]:
@@ -61,7 +61,7 @@ if scenario == "timeout":
     time.sleep(.1); sys.exit(0)
 if scenario == "permission":
     send({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{"sessionId":"fresh"}})
-    assert read()["result"]["outcome"]["outcome"] == "denied"
+    assert read()["result"] == {"outcome":{"outcome":"cancelled"}}
 if scenario == "elicitation":
     send({"jsonrpc":"2.0","id":"elicit","method":"elicitation/create","params":{"sessionId":"fresh"}})
     assert read()["result"] == {"action":"cancel", "content":None}
@@ -72,6 +72,9 @@ if scenario == "error":
     send({"jsonrpc":"2.0","id":prompt["id"],"error":{"code":-1,"message":"bad"}}); time.sleep(.2); sys.exit(0)
 if scenario == "malformed":
     response(prompt, {"stopReason":"end_turn","_meta":{"jetbrains":{"air":{"version":2}}}}); time.sleep(.2); sys.exit(0)
+if scenario == "post_response_exit":
+    response(prompt, {"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":3}})
+    sys.exit(7)
 failure = {"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"warning","title":"retry","actions":["retry"]}
 if scenario == "warning": send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
 if scenario == "terminal":
@@ -111,6 +114,11 @@ def test_fake_permission_is_denied_noninteractively(tmp_path: Path) -> None:
     assert run(tmp_path, "permission").prompt.kind == "success"
 
 
+def test_fake_post_response_nonzero_exit_cannot_be_success(tmp_path: Path) -> None:
+    with pytest.raises(AcpUnexpectedExit, match="exited unexpectedly with status 7"):
+        run(tmp_path, "post_response_exit")
+
+
 @pytest.mark.parametrize("scenario", ["elicitation", "malformed_request"])
 def test_fake_client_requests_are_cancelled_or_fail_closed(tmp_path: Path, scenario: str) -> None:
     assert run(tmp_path, scenario).prompt.kind == "success"
@@ -122,10 +130,9 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
     with pytest.raises(error) as raised:
         run(tmp_path, scenario, timeout_s=.1 if scenario == "timeout" else 1)
     if scenario == "timeout":
-        assert raised.value.timeout_phases == (
-            "prompt_deadline", "cancel_sent", "cancel_response", "close_response",
-        )
-        assert raised.value.process["timed_out"] is True
+        assert raised.value.timeout_phases == ()
+        assert raised.value.process["timed_out"] is False
+        assert raised.value.process["timeout_phases"] == []
         assert "intentional shutdown" in raised.value.shutdown
 
 

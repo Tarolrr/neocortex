@@ -209,7 +209,9 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
         if not isinstance(params, dict) or params.get("sessionId") != session_id:
             raise AcpClientRejected("malformed or foreign server request")
         if method == "session/request_permission":
-            return {"outcome": {"outcome": "denied"}}
+            # ACP v1 has no ``denied`` permission outcome.  Cancellation is
+            # the pinned, fail-closed response shape.
+            return {"outcome": {"outcome": "cancelled"}}
         if method == "elicitation/create":
             return {"action": "cancel", "content": None}
         raise AcpClientRejected("unsupported server request")
@@ -221,6 +223,8 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
                           env=_safe_environment(environment, config_home=config_home))
     result: CodexAcpTurn | None = None
     timed_out = False
+    # These are only *expired* bounded cleanup phases; successful protocol
+    # operations and the original prompt deadline are not process facts.
     timeout_phases: list[str] = []
     timeout_error: AcpProcessTimeout | None = None
     try:
@@ -270,9 +274,6 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
             prompt_response = stream.wait_for(prompt_id, deadline=time.monotonic() + timeout_s)
         except (AcpDeadlineExpired, AcpProcessTimeout) as exc:
             timed_out = True
-            timeout_phases.append(
-                "total_deadline" if isinstance(exc, AcpProcessTimeout) else "prompt_deadline"
-            )
             cancel_deadline = time.monotonic() + 10
             # A total-bound expiry during a live prompt still owes the pinned
             # cancellation sequence.  Temporarily extend only the supervisor
@@ -284,20 +285,17 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
                 stream.notify(
                     "session/cancel", {"sessionId": session_id}, deadline=cancel_deadline,
                 )
-                timeout_phases.append("cancel_sent")
                 prompt_response = stream.wait_for(prompt_id, deadline=cancel_deadline)
-                timeout_phases.append("cancel_response")
             except (AcpProcessError, AcpStreamError, AcpDeadlineExpired):
-                timeout_phases.append("cancel_response_expired")
+                timeout_phases.append("cancel_response")
             if close_advertised:
                 close_deadline = time.monotonic() + 5
                 try:
                     stream.request(
                         "session/close", {"sessionId": session_id}, deadline=close_deadline,
                     )
-                    timeout_phases.append("close_response")
                 except (AcpProcessError, AcpStreamError, AcpDeadlineExpired):
-                    timeout_phases.append("close_response_expired")
+                    timeout_phases.append("session_close")
             error = AcpProcessTimeout("ACP prompt deadline expired after bounded cancellation")
             error.timeout_phases = tuple(timeout_phases)
             timeout_error = error
@@ -321,8 +319,9 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
         if "error" in prompt_response and isinstance(prompt_response["error"], dict):
             prompt_fact["jsonrpc_error"] = prompt_response["error"]
         # A completed response is not permission to hide a process which has
-        # already failed.  A live server is closed deliberately below.
-        child.check()
+        # already failed.  Yield briefly so an immediate post-response exit
+        # is observed before this client starts deliberate cleanup.
+        child.check_post_response_failure()
         result = CodexAcpTurn(decoded, prompt_fact, _process_fact(child, False), None)
     except AcpProcessTimeout as exc:
         timed_out = True
@@ -334,9 +333,12 @@ def run_codex_acp_turn(command: Sequence[str], *, policy: CodexAcpPolicy, model:
         raise
     finally:
         child.close()
+        timeout_phases.extend(child.timeout_phases)
         if timeout_error is not None:
-            timeout_error.process = _process_fact(child, True, timeout_phases)
+            timeout_error.timeout_phases = tuple(timeout_phases)
+            timeout_error.process = _process_fact(child, bool(timeout_phases), timeout_phases)
             timeout_error.shutdown = child.shutdown_outcome
     assert result is not None
+    timed_out = timed_out or bool(timeout_phases)
     return CodexAcpTurn(result.prompt, result.prompt_fact, _process_fact(child, timed_out, timeout_phases),
                          child.shutdown_outcome)

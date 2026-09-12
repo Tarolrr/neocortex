@@ -20,13 +20,22 @@ from .acp_decoder import AcpPromptResult, decode_acp_prompt_result
 from .acp_stream import AcpDeadlineExpired, AcpStreamError
 from .acp_wire import AcpProcessError, AcpProcessTimeout, AcpSubprocess
 
-_MODE = "agent"
+_ORDINARY_MODE = "agent"
+# ``codex-acp`` selects a mode after ``session/new``.  Restricted use cannot
+# reuse ``agent``: the upstream 1.11.0 source proves that mode turns network
+# access off.  A deployment which supplies the separately pinned restricted
+# launch profile must expose this mode, with the tuple below, or the client
+# stops before prompt dispatch.  This is deliberately not a fallback to
+# ``agent-full-access``.
+_RESTRICTED_MODE = "nc-workspace-network"
 # These are the effective sandbox values of ``AgentMode.Agent`` in the pinned
 # ACP artifact, not desired values supplied by an incoming request.  They are
 # kept beside the selected mode so that a policy whose requirements conflict
 # with that mode is rejected before a child or private config is created.
 _PINNED_MODE_SANDBOX = "workspaceWrite"
 _PINNED_MODE_NETWORK_ACCESS = False
+_PINNED_RESTRICTED_MODE_SANDBOX = "workspaceWrite"
+_PINNED_RESTRICTED_MODE_NETWORK_ACCESS = True
 _PINNED_ACP_PACKAGE = "@agentclientprotocol/codex-acp"
 _PINNED_ACP_VERSION = "1.11.0"
 _PINNED_ACP_INTEGRITY = (
@@ -61,8 +70,9 @@ class CodexAcpLaunchEvidence:
     artifact_integrity: str
     codex_version: str
     sdk_version: str
+    profile: str
 
-    def validate_for(self, command: Sequence[str]) -> None:
+    def validate_for(self, command: Sequence[str], profile: str) -> None:
         if tuple(command) != self.command:
             raise AcpClientRejected("launch command does not match verified ACP evidence")
         if (self.package != _PINNED_ACP_PACKAGE
@@ -71,6 +81,8 @@ class CodexAcpLaunchEvidence:
                 or self.codex_version != _PINNED_CODEX_VERSION
                 or self.sdk_version != _PINNED_SDK_VERSION):
             raise AcpClientRejected("launch evidence does not match pinned ACP contract")
+        if self.profile != profile:
+            raise AcpClientRejected("launch evidence does not bind the selected ACP profile")
 
 
 @dataclass(frozen=True)
@@ -89,10 +101,9 @@ class CodexAcpPolicy:
 
     @classmethod
     def restricted(cls, run_directory: Path) -> CodexAcpPolicy:
-        # This is the explicit restricted-policy input.  With the presently
-        # pinned ACP mode it is intentionally rejected at dispatch: that mode
-        # fixes workspace-write networking off, so silently launching it would
-        # weaken this policy's required public-network contract.
+        # This selects the separately pinned workspace-network profile.  Its
+        # cwd remains the run directory; repository/runtime homes stay out of
+        # the child environment.
         path = run_directory.resolve()
         return cls("restricted", path, path, public_web_search=True, network_access=True)
 
@@ -162,17 +173,23 @@ def _write_pinned_config(policy: CodexAcpPolicy, config_home: Path) -> None:
 def _validate_pinned_mode_for_policy(policy: CodexAcpPolicy) -> None:
     """Fail before dispatch when the selected ACP mode weakens a policy.
 
-    The pinned source defines ``agent`` as workspaceWrite with
-    ``networkAccess: false``.  ACP mode selection is authoritative over the
-    private config request, therefore a restricted request requiring network
-    access cannot safely be launched with this artifact.
+    The ordinary source-pinned ``agent`` mode is workspaceWrite with network
+    disabled.  Restricted dispatch instead requires its distinct pinned
+    workspace-network profile; neither profile can degrade into the other.
     """
-    if (policy.kind == "restricted"
-            and (_PINNED_MODE_SANDBOX != "workspaceWrite"
-                 or not _PINNED_MODE_NETWORK_ACCESS)):
+    if policy.kind == "ordinary" and (_PINNED_MODE_SANDBOX != "workspaceWrite"
+                                      or _PINNED_MODE_NETWORK_ACCESS):
         raise AcpClientRejected(
-            "pinned ACP mode cannot preserve restricted workspace-write network policy"
+            "pinned ordinary ACP mode cannot preserve workspace-write policy"
         )
+    if (policy.kind == "restricted"
+            and (_PINNED_RESTRICTED_MODE_SANDBOX != "workspaceWrite"
+                 or not _PINNED_RESTRICTED_MODE_NETWORK_ACCESS)):
+        raise AcpClientRejected("pinned restricted ACP mode cannot preserve workspace-write network policy")
+
+
+def _mode_for(policy: CodexAcpPolicy) -> str:
+    return _RESTRICTED_MODE if policy.kind == "restricted" else _ORDINARY_MODE
 
 
 def _options(response: object) -> list[dict[str, object]]:
@@ -279,7 +296,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
     _validate_pinned_mode_for_policy(policy)
     if not command or not model or not prompt or timeout_s <= 0:
         raise ValueError("command, model, prompt, and positive timeout are required")
-    launch.validate_for(command)
+    launch.validate_for(command, _mode_for(policy))
     # The prompt budget is separate from the prescribed bounded cancellation
     # and cleanup phases.  The supervisor still owns one outer deadline.
     deadline = time.monotonic() + timeout_s + 15
@@ -354,10 +371,11 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         capabilities = new_result.get("sessionCapabilities")
         close_advertised = isinstance(capabilities, dict) and capabilities.get("close") is True
         options = _options(new_result)
-        if not _offered(options, "model", model) or not _offered(options, "mode", _MODE):
+        mode = _mode_for(policy)
+        if not _offered(options, "model", model) or not _offered(options, "mode", mode):
             raise AcpClientRejected("requested model or pinned execution policy is unsupported")
 
-        for config_id, value in (("model", model), ("mode", _MODE)):
+        for config_id, value in (("model", model), ("mode", mode)):
             params: dict[str, object] = {"sessionId": session_id, "configId": config_id, "value": value}
             config_id_request = stream.send_request("session/set_config_option", params)
             wire.append({"jsonrpc": "2.0", "id": config_id_request,
@@ -373,7 +391,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         # particular, a mode update must not be allowed to silently reset or
         # omit the selected model before dispatching the prompt.
         if not (_selected(response.get("result"), "model", model)
-                and _selected(response.get("result"), "mode", _MODE)):
+                and _selected(response.get("result"), "mode", mode)):
             raise AcpClientRejected("server did not retain the pinned model and execution policy")
 
         prompt_params: dict[str, object] = {"sessionId": session_id,

@@ -56,7 +56,8 @@ if scenario == "unsupported_profile":
     sys.exit(0)
 response(init, {"protocolVersion":1, "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}})
 new = read()
-options = [{"id":"model","options":[{"value":"model"}],"currentValue":"x"}, {"id":"mode","options":[{"value":"agent"}],"currentValue":"x"}]
+mode = "nc-workspace-network" if scenario == "restricted" else "agent"
+options = [{"id":"model","options":[{"value":"model"}],"currentValue":"x"}, {"id":"mode","options":[{"value":mode}],"currentValue":"x"}]
 if scenario == "unsupported": options[0]["options"] = []
 response(new, {"sessionId":"fresh", "configOptions":options,
                "sessionCapabilities":{"close": scenario == "timeout"}})
@@ -149,6 +150,7 @@ def verified_launch(command: list[str], **overrides: str) -> CodexAcpLaunchEvide
         ),
         "codex_version": "0.153.4",
         "sdk_version": "1.4.0",
+        "profile": "agent",
     }
     values.update(overrides)
     return CodexAcpLaunchEvidence(**values)  # type: ignore[arg-type]
@@ -274,33 +276,43 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
         assert raised.value.process["timed_out"] is False
 
 
-def test_restricted_policy_fails_closed_when_pinned_mode_loses_network(
+def test_restricted_policy_uses_pinned_workspace_network_profile_end_to_end(
     tmp_path: Path,
 ) -> None:
     policy = CodexAcpPolicy.restricted(tmp_path)
     assert policy.cwd == tmp_path.resolve()
     assert policy.public_web_search and policy.network_access
-    # This is the effective source-pinned tuple, rather than a config-file
-    # request.  It proves the selected profile cannot satisfy restricted
-    # workspace-write networking, which must reject before server dispatch.
+    # The ordinary profile is source-pinned network-disabled.  Restricted
+    # never aliases it: its fake ACP server only accepts the distinct pinned
+    # workspace-network mode and also proves the launch configuration/cwd.
     source = json.loads((Path(__file__).parent / "fixtures" /
                          "codex-acp-agent-tool-path.source.json").read_text())
-    assert source["selected_mode"]["sandboxPolicy"]["type"] == "workspaceWrite"
     assert source["selected_mode"]["sandboxPolicy"]["networkAccess"] is False
-    marker = tmp_path / "restricted-server-started"
-    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
-    with pytest.raises(AcpClientRejected, match="cannot preserve restricted"):
+    command = fake_server("restricted")
+    turn = run_codex_acp_turn(
+        command, launch=verified_launch(command, profile="nc-workspace-network"), policy=policy,
+        model="model", prompt="hello", log_path=tmp_path / "restricted.log",
+        environment={
+            "HOME": "/global-config",
+            "CODEX_CONFIG": "/global-config/config.toml",
+            "CODEX_PATH": "bad",
+            "INITIAL_AGENT_MODE": "agent-full-access",
+            "EXPECTED_CWD": str(tmp_path.resolve()),
+        },
+    )
+    assert turn.prompt.kind == "success"
+    assert turn.live_sandbox_enforcement_verified is False
+
+
+def test_restricted_profile_rejects_when_server_cannot_enforce_its_mode(tmp_path: Path) -> None:
+    # An ordinary server offers only agent.  The restricted client must not
+    # silently dispatch it with that network-disabled profile.
+    command = fake_server("success")
+    with pytest.raises(AcpClientRejected, match="execution policy is unsupported"):
         run_codex_acp_turn(
-            command, launch=verified_launch(command), policy=policy,
-            model="model", prompt="hello", log_path=tmp_path / "restricted.log",
-            environment={
-                "HOME": "/global-config",
-                "CODEX_CONFIG": "/global-config/config.toml",
-                "CODEX_PATH": "bad",
-                "INITIAL_AGENT_MODE": "agent-full-access",
-            },
+            command, launch=verified_launch(command, profile="nc-workspace-network"), policy=CodexAcpPolicy.restricted(tmp_path),
+            model="model", prompt="hello", log_path=tmp_path / "rejected.log",
         )
-    assert not marker.exists()
 
 
 def test_global_config_and_invalid_policy_cannot_override_pinned_launch(tmp_path: Path) -> None:

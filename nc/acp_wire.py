@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Self
 
@@ -167,7 +167,8 @@ class AcpSubprocess:
 
     def __init__(self, command: Sequence[str], *, cwd: Path, deadline: float,
                  log_path: Path, clock: Callable[[], float] = time.monotonic,
-                 stderr_bytes: int = 32_768, grace_s: float = 2.0) -> None:
+                 stderr_bytes: int = 32_768, grace_s: float = 5.0,
+                 env: Mapping[str, str] | None = None) -> None:
         if not command or stderr_bytes < 0 or grace_s < 0:
             raise ValueError("invalid ACP subprocess bounds")
         self.deadline = deadline
@@ -179,17 +180,29 @@ class AcpSubprocess:
         self._stderr_done = threading.Event()
         self._closed = False
         self._intentional_shutdown = False
+        # A nonzero exit observed before this client sends a containment
+        # signal is process failure evidence, even when it happens while
+        # orderly stdin-EOF cleanup is in progress.
+        self.shutdown_failure: AcpUnexpectedExit | None = None
+        self._shutdown_failure_during_cleanup = False
         # This is deliberately separate from a process exit code: closing a
         # server is cleanup, not a successful ACP result.
         self.shutdown_outcome: str | None = None
+        # Ordered bounds that actually expired during local cleanup.  The
+        # client combines these with expired cancellation/close wire bounds.
+        self.timeout_phases: list[str] = []
         self.cleanup_uncertain = False
         self._cgroup = _adapter_cgroup()
-        env = dict(os.environ, PATH=f"{Path.home()}/.local/bin:{os.environ.get('PATH', '')}")
+        # ``env`` is an isolation boundary.  In particular, do not prepend a
+        # runtime-home bin directory: a relative verified command must resolve
+        # only through the explicitly supplied PATH, not a parent-controlled
+        # same-named executable.
+        launch_env = dict(os.environ if env is None else env)
         launched = False
         try:
             self.proc = subprocess.Popen(
                 list(command), cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, env=env, start_new_session=True,
+                stderr=subprocess.PIPE, env=launch_env, start_new_session=True,
                 preexec_fn=(lambda: _join_cgroup(self._cgroup)) if self._cgroup else None,  # noqa: PLW1509 - containment before ACP exec
             )
             launched = True
@@ -256,6 +269,23 @@ class AcpSubprocess:
             raise AcpProcessTimeout("ACP total deadline expired")
         code = self.proc.poll()
         if code is not None:
+            raise AcpUnexpectedExit(self._exit_message(code))
+
+    def check_post_response_failure(self, observation_s: float = 0.05) -> None:
+        """Reject a nonzero exit that races directly behind a prompt reply.
+
+        A live server remains ours to close.  But a server which has already
+        failed after replying must not acquire an "intentional shutdown"
+        label merely because cleanup starts a few scheduler ticks later.
+        """
+        if observation_s < 0:
+            raise ValueError("post-response observation must be nonnegative")
+        try:
+            self.proc.wait(timeout=observation_s)
+        except subprocess.TimeoutExpired:
+            return
+        code = self.proc.returncode
+        if isinstance(code, int) and code != 0:
             raise AcpUnexpectedExit(self._exit_message(code))
 
     def _raise_if_intentional_shutdown(self) -> None:
@@ -369,9 +399,16 @@ class AcpSubprocess:
                 self.proc.stdin.close()
             except OSError:
                 pass
-        self._wait_for_exit(self._grace)
+        exited_after_eof = self._wait_for_exit(self._grace)
+        if (exited_after_eof and self._intentional_shutdown
+                and isinstance(self.proc.returncode, int) and self.proc.returncode != 0):
+            self.shutdown_failure = AcpUnexpectedExit(self._exit_message(self.proc.returncode))
+            self._shutdown_failure_during_cleanup = True
+        if not exited_after_eof:
+            self.timeout_phases.append("term_grace")
         self._terminate()
-        self._wait_for_exit(self._grace)
+        if not self._wait_for_exit(self._grace):
+            self.timeout_phases.append("kill_grace")
         self._terminate(force=True)
         self._terminate_cgroup()
         reaped = self._wait_for_exit(self._grace)
@@ -401,8 +438,14 @@ class AcpSubprocess:
         if self._closed:
             return
         self._closed = True
-        self._intentional_shutdown = True
-        self.shutdown_outcome = "ACP intentional shutdown in progress"
+        preexisting_exit = self.proc.poll()
+        self._intentional_shutdown = preexisting_exit is None
+        if isinstance(preexisting_exit, int) and preexisting_exit != 0:
+            self.shutdown_failure = AcpUnexpectedExit(self._exit_message(preexisting_exit))
+        self.shutdown_outcome = (
+            "ACP intentional shutdown in progress" if preexisting_exit is None
+            else f"ACP process exited before deliberate shutdown with status {preexisting_exit}"
+        )
         # EOF is the ACP stdio closure/cancellation signal.  Give a compliant
         # server a small, independent grace period before containment signals.
         self._cleanup_process(close_pipes=False)
@@ -423,7 +466,16 @@ class AcpSubprocess:
         else:
             evidence = f"child exited with status {code}"
         uncertainty = "; containment uncertain" if self.cleanup_uncertain else ""
-        self.shutdown_outcome = f"ACP intentional shutdown: {evidence}{uncertainty}"
+        prefix = "ACP process failure during deliberate shutdown" if (
+            self.shutdown_failure and self._shutdown_failure_during_cleanup
+        ) else (
+            "ACP process exit observed before deliberate shutdown" if self.shutdown_failure else (
+            "ACP intentional shutdown" if preexisting_exit is None else (
+            "ACP process exit observed before deliberate shutdown"
+            )
+            )
+        )
+        self.shutdown_outcome = f"{prefix}: {evidence}{uncertainty}"
 
     def __enter__(self) -> Self:
         return self
@@ -437,6 +489,8 @@ AcpProcessSupervisor = AcpSubprocess
 
 
 def launch_acp(command: Sequence[str], *, cwd: Path, deadline: float, log_path: Path,
-               clock: Callable[[], float] = time.monotonic) -> AcpSubprocess:
+               clock: Callable[[], float] = time.monotonic,
+               env: Mapping[str, str] | None = None) -> AcpSubprocess:
     """Launch an owned ACP subprocess; callers must close it in ``finally``."""
-    return AcpSubprocess(command, cwd=cwd, deadline=deadline, log_path=log_path, clock=clock)
+    return AcpSubprocess(command, cwd=cwd, deadline=deadline, log_path=log_path, clock=clock,
+                         env=env)

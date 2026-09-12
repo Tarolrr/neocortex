@@ -274,31 +274,33 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
         assert raised.value.process["timed_out"] is False
 
 
-def test_restricted_policy_launches_an_isolated_child_with_its_pinned_settings(
+def test_restricted_policy_fails_closed_when_pinned_mode_loses_network(
     tmp_path: Path,
 ) -> None:
     policy = CodexAcpPolicy.restricted(tmp_path)
     assert policy.cwd == tmp_path.resolve()
     assert policy.public_web_search and policy.network_access
-    # The private launch request is intentionally distinct from a verified
-    # live sandbox: the source-pinned ``agent`` mode owns a false effective
-    # networkAccess value when ACP applies that mode.
+    # This is the effective source-pinned tuple, rather than a config-file
+    # request.  It proves the selected profile cannot satisfy restricted
+    # workspace-write networking, which must reject before server dispatch.
     source = json.loads((Path(__file__).parent / "fixtures" /
                          "codex-acp-agent-tool-path.source.json").read_text())
+    assert source["selected_mode"]["sandboxPolicy"]["type"] == "workspaceWrite"
     assert source["selected_mode"]["sandboxPolicy"]["networkAccess"] is False
-    command = fake_server("restricted")
-    turn = run_codex_acp_turn(command, launch=verified_launch(command), policy=policy,
-                               model="model", prompt="hello", log_path=tmp_path / "restricted.log",
-                               timeout_s=1,
-                               environment={
-                                   "HOME": "/global-config",
-                                   "CODEX_CONFIG": "/global-config/config.toml",
-                                   "CODEX_PATH": "bad",
-                                   "INITIAL_AGENT_MODE": "agent-full-access",
-                                   "EXPECTED_CWD": str(tmp_path.resolve()),
-                               })
-    assert turn.prompt.kind == "success"
-    assert turn.live_sandbox_enforcement_verified is False
+    marker = tmp_path / "restricted-server-started"
+    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
+    with pytest.raises(AcpClientRejected, match="cannot preserve restricted"):
+        run_codex_acp_turn(
+            command, launch=verified_launch(command), policy=policy,
+            model="model", prompt="hello", log_path=tmp_path / "restricted.log",
+            environment={
+                "HOME": "/global-config",
+                "CODEX_CONFIG": "/global-config/config.toml",
+                "CODEX_PATH": "bad",
+                "INITIAL_AGENT_MODE": "agent-full-access",
+            },
+        )
+    assert not marker.exists()
 
 
 def test_global_config_and_invalid_policy_cannot_override_pinned_launch(tmp_path: Path) -> None:

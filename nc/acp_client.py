@@ -21,6 +21,12 @@ from .acp_stream import AcpDeadlineExpired, AcpStreamError
 from .acp_wire import AcpProcessError, AcpProcessTimeout, AcpSubprocess
 
 _MODE = "agent"
+# These are the effective sandbox values of ``AgentMode.Agent`` in the pinned
+# ACP artifact, not desired values supplied by an incoming request.  They are
+# kept beside the selected mode so that a policy whose requirements conflict
+# with that mode is rejected before a child or private config is created.
+_PINNED_MODE_SANDBOX = "workspaceWrite"
+_PINNED_MODE_NETWORK_ACCESS = False
 _PINNED_ACP_PACKAGE = "@agentclientprotocol/codex-acp"
 _PINNED_ACP_VERSION = "1.11.0"
 _PINNED_ACP_INTEGRITY = (
@@ -83,9 +89,10 @@ class CodexAcpPolicy:
 
     @classmethod
     def restricted(cls, run_directory: Path) -> CodexAcpPolicy:
-        # This is an executable, isolated launch profile.  Its settings are
-        # written into the only configuration home visible to the child; they
-        # are not advisory values inherited from the host.
+        # This is the explicit restricted-policy input.  With the presently
+        # pinned ACP mode it is intentionally rejected at dispatch: that mode
+        # fixes workspace-write networking off, so silently launching it would
+        # weaken this policy's required public-network contract.
         path = run_directory.resolve()
         return cls("restricted", path, path, public_web_search=True, network_access=True)
 
@@ -137,9 +144,8 @@ def _write_pinned_config(policy: CodexAcpPolicy, config_home: Path) -> None:
     ACP config negotiation explicitly selects the pinned ``agent`` execution
     policy too.  This launch boundary prevents global configuration from
     changing the requested web/network settings, or changing the
-    noninteractive request handler.  The source-pinned ACP mode subsequently
-    owns its live sandbox tuple; this client records no claim that its private
-    config request has been enforced by a real Codex process.
+    noninteractive request handler.  A restricted policy is rejected before
+    this function because the pinned mode cannot meet its effective tuple.
     """
     config_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     network = "true" if policy.network_access else "false"
@@ -151,6 +157,22 @@ def _write_pinned_config(policy: CodexAcpPolicy, config_home: Path) -> None:
         "[sandbox_workspace_write]\n"
         f"network_access = {network}\n"
     )
+
+
+def _validate_pinned_mode_for_policy(policy: CodexAcpPolicy) -> None:
+    """Fail before dispatch when the selected ACP mode weakens a policy.
+
+    The pinned source defines ``agent`` as workspaceWrite with
+    ``networkAccess: false``.  ACP mode selection is authoritative over the
+    private config request, therefore a restricted request requiring network
+    access cannot safely be launched with this artifact.
+    """
+    if (policy.kind == "restricted"
+            and (_PINNED_MODE_SANDBOX != "workspaceWrite"
+                 or not _PINNED_MODE_NETWORK_ACCESS)):
+        raise AcpClientRejected(
+            "pinned ACP mode cannot preserve restricted workspace-write network policy"
+        )
 
 
 def _options(response: object) -> list[dict[str, object]]:
@@ -254,6 +276,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
     here.  Exceptions are deliberate fail-closed evidence.
     """
     policy.validate()
+    _validate_pinned_mode_for_policy(policy)
     if not command or not model or not prompt or timeout_s <= 0:
         raise ValueError("command, model, prompt, and positive timeout are required")
     launch.validate_for(command)

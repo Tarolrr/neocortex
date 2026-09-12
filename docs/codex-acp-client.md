@@ -8,31 +8,28 @@ Inputs are an external `codex-acp` command plus a
 `CodexAcpLaunchEvidence` bound to that exact command, a model, prompt, log
 path, and either `CodexAcpPolicy.ordinary(worktree)` or
 `CodexAcpPolicy.restricted(run_directory)`.  The latter retains the run
-directory as cwd and records workspace-write, noninteractive approvals, public
-web-search/network intent, and protected repository/runtime-home contract.
-It launches with a fresh private configuration home that explicitly requests
-live web search and workspace network access; inherited Codex configuration,
-paths, initial mode, and homes cannot alter that request.  The selected ACP
-`agent` mode is source-backed with `workspaceWrite.networkAccess=false`, so a
-real Codex process may replace the requested network setting while applying
-its mode.  The fake-server end-to-end test verifies the child's cwd and private
-configuration input, not live Codex sandbox enforcement or its effective
-network setting.
+directory as cwd and requires workspace-write, noninteractive approvals,
+public web search/network, and protected repository/runtime homes.  It is not
+currently dispatchable: the pinned ACP `agent` profile is source-backed as
+`workspaceWrite.networkAccess=false`.  Since that effective tuple cannot
+preserve restricted networking, the client rejects restricted invocation
+before it creates a process or writes a configuration file.  It must remain
+rejected until a pinned ACP profile that demonstrates the required
+workspace-write + network-enabled tuple is supplied; a private config request
+is not treated as enforcement.  The source-backed test verifies that effective
+tuple and the no-child fail-closed boundary.  Live sandbox enforcement remains
+unverified.
 ACP advertises no client terminal/filesystem/MCP/web tool.
 The `agent` mode is source-backed as `workspaceWrite`, `on-request`, and
 `auto_review`; every ACP permission request is denied and every elicitation is
 cancelled.  Live sandbox enforcement is explicitly unverified until owner
 activation.
 
-The client strips `CODEX_CONFIG`, `CODEX_PATH`, `INITIAL_AGENT_MODE`, inherited
-`HOME`/`CODEX_HOME`, and XDG configuration homes. It gives the child a fresh,
-private configuration home containing only the pinned `agent` settings:
-workspace-write sandbox, on-request mode, and the ordinary policy's explicit
-disabled web-search/network values (or restricted policy's explicit live
-web-search/network request). The subsequently selected `agent` mode owns the
-effective source-pinned sandbox tuple, whose `networkAccess=false` is covered
-by a source-backed test; neither that tuple nor live sandbox enforcement has
-been verified against a running Codex process. This neither copies nor changes
+For an ordinary invocation, the client strips `CODEX_CONFIG`, `CODEX_PATH`,
+`INITIAL_AGENT_MODE`, inherited `HOME`/`CODEX_HOME`, and XDG configuration
+homes. It gives the child a fresh, private configuration home containing only
+the pinned `agent` settings: workspace-write sandbox, on-request mode, and
+explicitly disabled web-search/network values. This neither copies nor changes
 credentials and does not authenticate; live activation must establish a
 separately verified credential boundary. It sets model and mode explicitly,
 validates each response, and returns decoded prompt evidence plus independent

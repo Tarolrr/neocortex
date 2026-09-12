@@ -21,21 +21,12 @@ from .acp_stream import AcpDeadlineExpired, AcpStreamError
 from .acp_wire import AcpProcessError, AcpProcessTimeout, AcpSubprocess
 
 _ORDINARY_MODE = "agent"
-# ``codex-acp`` selects a mode after ``session/new``.  Restricted use cannot
-# reuse ``agent``: the upstream 1.11.0 source proves that mode turns network
-# access off.  A deployment which supplies the separately pinned restricted
-# launch profile must expose this mode, with the tuple below, or the client
-# stops before prompt dispatch.  This is deliberately not a fallback to
-# ``agent-full-access``.
-_RESTRICTED_MODE = "nc-workspace-network"
 # These are the effective sandbox values of ``AgentMode.Agent`` in the pinned
 # ACP artifact, not desired values supplied by an incoming request.  They are
 # kept beside the selected mode so that a policy whose requirements conflict
 # with that mode is rejected before a child or private config is created.
 _PINNED_MODE_SANDBOX = "workspaceWrite"
 _PINNED_MODE_NETWORK_ACCESS = False
-_PINNED_RESTRICTED_MODE_SANDBOX = "workspaceWrite"
-_PINNED_RESTRICTED_MODE_NETWORK_ACCESS = True
 _PINNED_ACP_PACKAGE = "@agentclientprotocol/codex-acp"
 _PINNED_ACP_VERSION = "1.11.0"
 _PINNED_ACP_INTEGRITY = (
@@ -101,9 +92,9 @@ class CodexAcpPolicy:
 
     @classmethod
     def restricted(cls, run_directory: Path) -> CodexAcpPolicy:
-        # This selects the separately pinned workspace-network profile.  Its
-        # cwd remains the run directory; repository/runtime homes stay out of
-        # the child environment.
+        # Keep the documented policy input explicit even though the stock
+        # pinned artifact cannot dispatch it.  Its cwd remains the run
+        # directory; repository/runtime homes stay out of any future child.
         path = run_directory.resolve()
         return cls("restricted", path, path, public_web_search=True, network_access=True)
 
@@ -156,7 +147,8 @@ def _write_pinned_config(policy: CodexAcpPolicy, config_home: Path) -> None:
     policy too.  This launch boundary prevents global configuration from
     changing the requested web/network settings, or changing the
     noninteractive request handler.  A restricted policy is rejected before
-    this function because the pinned mode cannot meet its effective tuple.
+    this function because the stock pinned artifact cannot meet its effective
+    tuple.
     """
     config_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     network = "true" if policy.network_access else "false"
@@ -173,23 +165,26 @@ def _write_pinned_config(policy: CodexAcpPolicy, config_home: Path) -> None:
 def _validate_pinned_mode_for_policy(policy: CodexAcpPolicy) -> None:
     """Fail before dispatch when the selected ACP mode weakens a policy.
 
-    The ordinary source-pinned ``agent`` mode is workspaceWrite with network
-    disabled.  Restricted dispatch instead requires its distinct pinned
-    workspace-network profile; neither profile can degrade into the other.
+    The only source-pinned mode in the stock artifact is ``agent``, which is
+    workspaceWrite with network disabled.  No separate restricted artifact
+    identity and integrity is pinned in this client, so restricted dispatch
+    must stop before a caller-controlled profile string can authorize it.
     """
     if policy.kind == "ordinary" and (_PINNED_MODE_SANDBOX != "workspaceWrite"
                                       or _PINNED_MODE_NETWORK_ACCESS):
         raise AcpClientRejected(
             "pinned ordinary ACP mode cannot preserve workspace-write policy"
         )
-    if (policy.kind == "restricted"
-            and (_PINNED_RESTRICTED_MODE_SANDBOX != "workspaceWrite"
-                 or not _PINNED_RESTRICTED_MODE_NETWORK_ACCESS)):
-        raise AcpClientRejected("pinned restricted ACP mode cannot preserve workspace-write network policy")
+    if policy.kind == "restricted":
+        raise AcpClientRejected(
+            "stock pinned ACP artifact has no verified restricted workspace-network profile"
+        )
 
 
 def _mode_for(policy: CodexAcpPolicy) -> str:
-    return _RESTRICTED_MODE if policy.kind == "restricted" else _ORDINARY_MODE
+    if policy.kind != "ordinary":
+        raise AcpClientRejected("restricted ACP profile is unavailable under the stock pin")
+    return _ORDINARY_MODE
 
 
 def _options(response: object) -> list[dict[str, object]]:
@@ -274,8 +269,14 @@ def _air_observations(wire: Sequence[object], session_id: str,
         # A session can deliver a late failure from an earlier prompt during
         # this request's window.  Match the decoder's incident ownership rule
         # so prompt facts cannot attribute it to this invocation.
-        if (isinstance(failure, dict) and isinstance(failure.get("id"), str)
-                and failure["id"].startswith(f"{prompt_id}:")):
+        if isinstance(failure, dict) and isinstance(failure.get("id"), str):
+            if failure["id"].startswith(f"{prompt_id}:"):
+                observed.append(failure)
+        else:
+            # There is no usable incident id with which to identify another
+            # prompt.  It was emitted during this prompt's session window, so
+            # retain the exact malformed raw value for forensic evidence; the
+            # separate typed view below intentionally excludes it.
             observed.append(failure)
     return observed
 

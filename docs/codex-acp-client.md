@@ -9,28 +9,27 @@ Inputs are an external `codex-acp` command plus a
 path, and either `CodexAcpPolicy.ordinary(worktree)` or
 `CodexAcpPolicy.restricted(run_directory)`.  The latter retains the run
 directory as cwd and requires workspace-write, noninteractive approvals,
-public web search/network, and protected repository/runtime homes. Restricted
-dispatch selects the distinct pinned `nc-workspace-network` launch profile,
-not upstream `agent`: it requires the effective workspace-write plus
-network-enabled tuple. The client writes matching isolated settings and checks
-that the server offers and retains that exact profile before it prompts. If a
-launch only offers upstream `agent`, it fails closed before dispatch;
-`agent` is source-backed as `workspaceWrite.networkAccess=false` and is never
-a restricted fallback. The fake-server end-to-end test covers restricted cwd,
-isolated homes, web/network configuration, and the selected profile. Live
-sandbox enforcement remains explicitly unverified; a future deployment
-verifier must bind this profile to a reviewed launch artifact before activation.
+public web search/network, and protected repository/runtime homes. The stock
+pinned `@agentclientprotocol/codex-acp` 1.11.0 artifact only source-backs
+`agent`, whose effective tuple is `workspaceWrite.networkAccess=false`.
+Therefore restricted invocation currently fails closed before process launch:
+a caller cannot authorize an invented profile through launch evidence or a
+server config option. A future deployment must define a separate pinned launch
+artifact (identity, integrity, source evidence, and effective-policy
+verification) before restricted dispatch can be enabled. `agent` is never a
+restricted fallback. Live sandbox enforcement remains explicitly unverified.
 ACP advertises no client terminal/filesystem/MCP/web tool.
 The `agent` mode is source-backed as `workspaceWrite`, `on-request`, and
 `auto_review`; every ACP permission request is denied and every elicitation is
 cancelled.  Live sandbox enforcement is explicitly unverified until owner
 activation.
 
-For either invocation, the client strips `CODEX_CONFIG`, `CODEX_PATH`,
+For an ordinary dispatch, the client strips `CODEX_CONFIG`, `CODEX_PATH`,
 `INITIAL_AGENT_MODE`, inherited `HOME`/`CODEX_HOME`, and XDG configuration
 homes. It gives the child a fresh, private configuration home containing only
-the selected pinned profile's workspace-write sandbox, on-request mode, and
-explicit web-search/network values. This neither copies nor changes
+the pinned `agent` workspace-write sandbox, on-request mode, and disabled
+web-search/network values. A restricted request is rejected before this setup.
+This neither copies nor changes
 credentials and does not authenticate; live activation must establish a
 separately verified credential boundary. It sets model and mode explicitly,
 validates each response, and returns decoded prompt evidence plus independent

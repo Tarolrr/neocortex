@@ -116,6 +116,11 @@ if scenario == "error":
     send({"jsonrpc":"2.0","id":prompt["id"],"error":{"code":-1,"message":"bad"}}); time.sleep(.2); sys.exit(0)
 if scenario == "malformed":
     response(prompt, {"stopReason":"end_turn","_meta":{"jetbrains":{"air":{"version":2}}}}); time.sleep(.2); sys.exit(0)
+if scenario == "malformed_failure":
+    bad_failure = {"id": 7}
+    response(prompt, {"stopReason":"end_turn", "_meta":{"jetbrains":{"air":{
+        "version": 1, "sessionFailure": bad_failure}}}})
+    time.sleep(.2); sys.exit(0)
 if scenario == "post_response_exit":
     response(prompt, {"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":3}})
     sys.exit(7)
@@ -190,6 +195,13 @@ def test_fake_setup_air_metadata_cannot_taint_prompt_evidence(tmp_path: Path) ->
     turn = run(tmp_path, "setup_air")
     assert turn.prompt.kind == "success"
     assert turn.prompt_fact["air_observations"] == []
+    assert turn.prompt_fact["session_failures"] == []
+
+
+def test_fake_malformed_air_failure_is_lossless_prompt_evidence(tmp_path: Path) -> None:
+    turn = run(tmp_path, "malformed_failure")
+    assert turn.prompt.kind == "protocol_invalid"
+    assert turn.prompt_fact["air_observations"] == [{"id": 7}]
     assert turn.prompt_fact["session_failures"] == []
 
 
@@ -276,39 +288,31 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
         assert raised.value.process["timed_out"] is False
 
 
-def test_restricted_policy_uses_pinned_workspace_network_profile_end_to_end(
+def test_restricted_policy_fails_closed_without_a_separately_pinned_artifact(
     tmp_path: Path,
 ) -> None:
     policy = CodexAcpPolicy.restricted(tmp_path)
     assert policy.cwd == tmp_path.resolve()
     assert policy.public_web_search and policy.network_access
-    # The ordinary profile is source-pinned network-disabled.  Restricted
-    # never aliases it: its fake ACP server only accepts the distinct pinned
-    # workspace-network mode and also proves the launch configuration/cwd.
+    # The stock artifact source-backs only network-disabled agent.  A caller
+    # cannot create a restricted profile merely by claiming it in launch
+    # evidence or by having a server self-report a config option.
     source = json.loads((Path(__file__).parent / "fixtures" /
                          "codex-acp-agent-tool-path.source.json").read_text())
     assert source["selected_mode"]["sandboxPolicy"]["networkAccess"] is False
     command = fake_server("restricted")
-    turn = run_codex_acp_turn(
-        command, launch=verified_launch(command, profile="nc-workspace-network"), policy=policy,
-        model="model", prompt="hello", log_path=tmp_path / "restricted.log",
-        environment={
-            "HOME": "/global-config",
-            "CODEX_CONFIG": "/global-config/config.toml",
-            "CODEX_PATH": "bad",
-            "INITIAL_AGENT_MODE": "agent-full-access",
-            "EXPECTED_CWD": str(tmp_path.resolve()),
-        },
-    )
-    assert turn.prompt.kind == "success"
-    assert turn.live_sandbox_enforcement_verified is False
+    with pytest.raises(AcpClientRejected, match="no verified restricted"):
+        run_codex_acp_turn(
+            command, launch=verified_launch(command, profile="nc-workspace-network"), policy=policy,
+            model="model", prompt="hello", log_path=tmp_path / "restricted.log",
+        )
 
 
 def test_restricted_profile_rejects_when_server_cannot_enforce_its_mode(tmp_path: Path) -> None:
-    # An ordinary server offers only agent.  The restricted client must not
-    # silently dispatch it with that network-disabled profile.
+    # No server offer can compensate for the absence of a separately pinned
+    # restricted launch artifact.
     command = fake_server("success")
-    with pytest.raises(AcpClientRejected, match="execution policy is unsupported"):
+    with pytest.raises(AcpClientRejected, match="no verified restricted"):
         run_codex_acp_turn(
             command, launch=verified_launch(command, profile="nc-workspace-network"), policy=CodexAcpPolicy.restricted(tmp_path),
             model="model", prompt="hello", log_path=tmp_path / "rejected.log",

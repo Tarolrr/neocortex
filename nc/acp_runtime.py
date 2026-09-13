@@ -217,10 +217,11 @@ def _verify_sri_derived_contents(root: Path, lock: dict[str, object]) -> None:
         # package, including the ACP root, must exactly be its reviewed tarball.
         if (root / relative).is_dir():
             _verify_package_contents(root, relative, artifact)
-    _verify_complete_node_modules_tree(root, artifacts)
+    _verify_complete_node_modules_tree(root, artifacts, lock)
 
 
-def _verify_complete_node_modules_tree(root: Path, artifacts: Mapping[str, Path]) -> None:
+def _verify_complete_node_modules_tree(
+        root: Path, artifacts: Mapping[str, Path], lock: dict[str, object] | None = None) -> None:
     """Reject paths which are not derivable from reviewed package artifacts.
 
     ``installed.sha256`` is only a corruption receipt: it cannot authorize a
@@ -232,6 +233,12 @@ def _verify_complete_node_modules_tree(root: Path, artifacts: Mapping[str, Path]
     allowed_files: set[Path] = set()
     allowed_dirs: set[Path] = {modules, modules / ".bin"}
     allowed_links: dict[Path, Path] = {}
+    if lock is not None:
+        _verify_npm_hidden_lock(root, lock)
+        # npm ci writes this installation-state lock.  It is not a package
+        # tarball member, but _verify_npm_hidden_lock binds every one of its
+        # resolved package entries to the reviewed lock before allowing it.
+        allowed_files.add(modules / ".package-lock.json")
     for relative, artifact in artifacts.items():
         directory = root / relative
         if not directory.is_dir():
@@ -274,6 +281,32 @@ def _verify_complete_node_modules_tree(root: Path, artifacts: Mapping[str, Path]
             raise AcpRuntimeNotReady("installed dependency tree has unexpected directories")
     if set(allowed_links) != {path for path in modules.rglob("*") if path.is_symlink()}:
         raise AcpRuntimeNotReady("installed dependency tree is missing required npm links")
+
+
+def _verify_npm_hidden_lock(root: Path, lock: dict[str, object]) -> None:
+    """Authenticate npm ci's generated ``node_modules/.package-lock.json``.
+
+    The hidden lock is normal npm output and is included in the local hash
+    receipt.  It cannot be treated as an arbitrary installer-created file:
+    its package map must be precisely the present, non-dev subset of the
+    immutable reviewed resolution.  The ACP root is unpacked after npm ci and
+    deliberately has no entry in this npm-generated file.
+    """
+    hidden = _json(root / "node_modules" / ".package-lock.json")
+    reviewed_packages = lock.get("packages")
+    hidden_packages = hidden.get("packages")
+    if (not isinstance(reviewed_packages, dict) or not isinstance(hidden_packages, dict)
+            or hidden.get("lockfileVersion") != lock.get("lockfileVersion")):
+        raise AcpRuntimeNotReady("npm hidden lock is missing or differs from reviewed resolution")
+    expected: dict[str, object] = {}
+    for relative, entry in reviewed_packages.items():
+        if (not isinstance(relative, str) or not relative.startswith("node_modules/")
+                or not isinstance(entry, dict) or entry.get("dev")
+                or not (root / relative).is_dir()):
+            continue
+        expected[relative] = entry
+    if hidden_packages != expected:
+        raise AcpRuntimeNotReady("npm hidden lock is missing or differs from reviewed resolution")
 
 
 def _npm_bin_dir(package_directory: Path) -> Path:

@@ -64,7 +64,11 @@ inspection immediately before any future launch: it hashes the installed
 `package-lock.json` against the committed reviewed-lock digest and requires
 matching reviewed-lock SRI/version entries for ACP, Codex, SDK, and the
 selected platform package. Runtime-local receipts are tree-mutation
-tripwires, not the trust anchor. It returns an evidence object
+tripwires, not the trust anchor. npm's normal generated
+`node_modules/.package-lock.json` is retained in the isolated runtime and is
+accepted only when its installed production package map exactly matches the
+present subset of that reviewed resolution; it is not an unreviewed exception
+to the SRI-derived tree check. It returns an evidence object
 bound to that install-recorded absolute Node plus the authenticated
 `dist/index.js` entry point. It does not execute the `.bin` shim, because its
 `/usr/bin/env node` shebang would select Node from service PATH. Thus a service

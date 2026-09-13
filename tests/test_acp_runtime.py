@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import json
 import os
 import subprocess
 import tarfile
@@ -315,8 +316,14 @@ def _fixture_package_tarball(path: Path, files: dict[str, str]) -> None:
         archive.add(source, arcname="package")
 
 
-def test_sri_tree_check_accepts_scoped_root_npm_bin_link_end_to_end(tmp_path: Path) -> None:
-    """Exercise real tar/SRI derivation for npm's scoped root .bin layout."""
+def test_sri_tree_check_accepts_npm_hidden_lock_and_scoped_root_bin_link(tmp_path: Path) -> None:
+    """Exercise real tar/SRI/tree verification with npm ci's hidden lock.
+
+    npm creates ``node_modules/.package-lock.json`` after resolving its exact
+    graph.  This fixture deliberately retains that standard generated file,
+    rather than bypassing complete-tree verification as older installer tests
+    did.
+    """
     root = tmp_path / "runtime"
     acp_dir = root / "node_modules" / "@agentclientprotocol" / "codex-acp"
     dependency = root / "node_modules" / "dependency"
@@ -340,8 +347,34 @@ def test_sri_tree_check_accepts_scoped_root_npm_bin_link_end_to_end(tmp_path: Pa
     cache = root / "npm-cache" / "_cacache" / "content-v2" / "sha512" / encoded[:2] / encoded[2:4] / encoded[4:]
     cache.parent.mkdir(parents=True)
     cache.write_bytes(dependency_artifact.read_bytes())
-    lock = {"packages": {"node_modules/dependency": {"integrity": sri}}}
+    dependency_entry = {"integrity": sri}
+    lock = {"lockfileVersion": 3, "packages": {"node_modules/dependency": dependency_entry}}
+    (root / "node_modules" / ".package-lock.json").write_text(json.dumps({
+        "lockfileVersion": 3,
+        "packages": {"node_modules/dependency": dependency_entry},
+    }))
     acp_runtime._verify_sri_derived_contents(root, lock)
+
+
+def test_sri_tree_check_rejects_hidden_lock_not_matching_reviewed_resolution(tmp_path: Path) -> None:
+    """The npm-generated file is allowed only after exact resolution binding."""
+    root = tmp_path / "runtime"
+    package = root / "node_modules" / "dependency"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text('{"version": "1.0.0"}')
+    (root / "node_modules" / ".package-lock.json").write_text(
+        '{"lockfileVersion": 3, "packages": {}}')
+    artifact = tmp_path / "dependency.tgz"
+    _fixture_package_tarball(artifact, {"package.json": '{"version": "1.0.0"}'})
+    digest = hashlib.sha512(artifact.read_bytes()).digest()
+    sri = "sha512-" + base64.b64encode(digest).decode()
+    encoded = digest.hex()
+    cache = root / "npm-cache" / "_cacache" / "content-v2" / "sha512" / encoded[:2] / encoded[2:4] / encoded[4:]
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(artifact.read_bytes())
+    lock = {"lockfileVersion": 3, "packages": {"node_modules/dependency": {"integrity": sri}}}
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="hidden lock"):
+        acp_runtime._verify_sri_derived_contents(root, lock)
 
 
 def test_private_parent_rejects_linked_worktree_common_gitdir(tmp_path: Path) -> None:

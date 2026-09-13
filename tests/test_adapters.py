@@ -406,7 +406,6 @@ def test_acp_local_failure_overrides_typed_retry_hint(tmp_path):
 
 
 @pytest.mark.parametrize(("result_kind", "completion", "stop_reason"), [
-    ("failed", False, "end_turn"),
     ("success", True, "cancelled"),
     ("success", True, "max_tokens"),
     ("success", True, "unknown"),

@@ -464,21 +464,28 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
     # A retry action cannot turn a cancelled, truncated, or otherwise
     # noncanonical prompt into a timer-retryable provider condition.  Require
     # the independent terminal result before consulting active AIR evidence.
-    # ``is_completion_candidate`` is intentionally checked below: active AIR
-    # errors make a successful *outcome* ineligible, while this narrower
-    # envelope check establishes that the failed prompt itself ended cleanly.
-    if (result.acp_result_kind != "success" or result.completion is not True
-            or not _is_canonical_acp_terminal(prompt)):
+    # The decoder deliberately calls active AIR errors ``failed`` (and the
+    # adapter therefore marks completion false).  That decoder-failed state is
+    # still a clean canonical terminal envelope, but only when it carries the
+    # validated active AIR evidence below.  Do not generalize this exception
+    # to JSON-RPC, local, cancellation, or arbitrary failed prompt outcomes.
+    failures = prompt.get("session_failures")
+    active_air_errors = (
+        isinstance(failures, list) and bool(failures)
+        and all(is_air_session_failure(item) for item in failures)
+        and any(isinstance(item, dict) and item.get("severity") == "error"
+                for item in failures)
+    )
+    normal_completion = result.acp_result_kind == "success" and result.completion is True
+    decoded_air_failure = result.acp_result_kind == "failed" and result.completion is False
+    if (not _is_canonical_acp_terminal(prompt)
+            or not (normal_completion or (decoded_air_failure and active_air_errors))):
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
     # AIR is structured provider evidence, but only a single canonical active
     # error record can select the deliberately small timer policy below.  In
     # particular, do not use titles, details, stderr, or an apparent live ACP
     # parent to guess whether a connection failure was remote.
-    failures = prompt.get("session_failures")
-    if (isinstance(failures, list) and failures
-            and all(is_air_session_failure(item) for item in failures)
-            and any(isinstance(item, dict) and item.get("severity") == "error"
-                    for item in failures)):
+    if active_air_errors:
         return _assess_air_failures(prompt, failures)
     if not is_completion_candidate(prompt):
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")

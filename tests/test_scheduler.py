@@ -12,7 +12,8 @@ from pathlib import Path
 import pytest
 
 from nc import cli, operations, protocol, turn
-from nc.adapters import SessionResult
+from nc.adapters import AcpAdapter, SessionResult
+from nc.acp_decoder import decode_acp_prompt_result
 from nc.config import Config
 from nc.lifecycle import LifecycleBusy, lifecycle_lock
 from nc.scheduler import Scheduler
@@ -1808,6 +1809,63 @@ def test_acp_nondeferrable_failures_keep_worker_failure_policy(
     assert host["category"] == expected
     assert state.one("SELECT attempts FROM task WHERE id=?", (task,))[0] == 1
     assert agent["turns"] == 1
+
+
+@pytest.mark.parametrize(("category", "expected"), [
+    ("limit", "throttled"),
+    ("service", "transient"),
+])
+def test_decoded_air_failure_through_acp_adapter_defers_timer(
+        setup, monkeypatch, category, expected):
+    """A decoder-failed canonical AIR terminal reaches T009 through the adapter.
+
+    The fake is the isolated ACP transport seam.  It returns the same decoded
+    ``failed`` result and correlated facts that the real client gives
+    ``CodexAcpAdapter`` for an active AIR error; it does not use restricted
+    ACP or a fabricated successful completion.
+    """
+    cfg, state, _repo = setup
+    task = state.add_task("neocortex", "adapter AIR outage", "objective", [])
+    failure = {
+        "id": "p:failure", "revision": 1, "category": category,
+        "severity": "error", "title": "typed provider condition", "actions": ["retry"],
+    }
+    wire = [
+        {"id": "p", "method": "session/prompt", "params": {"sessionId": "s"}},
+        {"method": "session/update", "params": {"sessionId": "s", "update": {
+            "_meta": {"jetbrains": {"air": {"version": 1, "sessionFailure": failure}}},
+        }}},
+        {"id": "p", "result": {"stopReason": "end_turn"}},
+    ]
+    decoded = decode_acp_prompt_result(wire, request_id="p", session_id="s")
+    assert decoded.kind == "failed"
+    prompt_fact = {
+        "request_id": "p", "prompt_id": "p", "session_id": "s",
+        "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+        "stop_reason": "end_turn", "air_observations": [failure],
+        "session_failures": [{
+            "id": item.incident_id, "revision": item.revision, "category": item.category,
+            "severity": item.severity, "title": item.title, "actions": list(item.actions),
+        } for item in decoded.failures],
+    }
+
+    def fake_turn(*_args, **_kwargs):
+        return type("FakeAcpTurn", (), {
+            "prompt": decoded,
+            "prompt_fact": prompt_fact,
+            "process": {"pid": 43, "exit_code": 0, "signal": None, "timed_out": False,
+                        "timeout_phases": [], "stderr_available": True,
+                        "supervisor_terminated": False},
+            "shutdown": None,
+        })()
+
+    monkeypatch.setattr("nc.acp_client.run_codex_acp_turn", fake_turn)
+    adapter = AcpAdapter(["isolated-fake-acp"], object(), policy_factory=lambda _cwd: object())
+    timer_invocation(cfg, state, adapter)
+    run = state.one("SELECT terminal_category FROM run ORDER BY id DESC LIMIT 1")
+    assert run["terminal_category"] == expected
+    assert state.one("SELECT attempts FROM task WHERE id=?", (task,))[0] == 0
+    assert state.one("SELECT turns FROM agent WHERE role='worker' ORDER BY id LIMIT 1")[0] == 0
 
 
 def test_timer_outages_exceed_task_and_turn_budgets_without_breaker(setup):

@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 
 from nc import cli, operations, protocol, turn
-from nc.adapters import AcpAdapter, SessionResult
 from nc.acp_decoder import decode_acp_prompt_result
+from nc.adapters import AcpAdapter, SessionResult
 from nc.config import Config
 from nc.lifecycle import LifecycleBusy, lifecycle_lock
 from nc.scheduler import Scheduler

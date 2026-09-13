@@ -69,6 +69,27 @@ def _platform_package_version(path: Path, arch: str) -> None:
     _package_version(path, f"{CODEX_VERSION}-linux-{arch}", f"Codex linux-{arch} binary")
 
 
+def _platform_binary(path: Path, arch: str) -> Path:
+    """Return the executable path in the published 0.153.4 Linux artifact.
+
+    These optional packages are not ordinary ``bin`` npm packages.  The npm
+    tarballs place the native executable below a target-triple vendor tree:
+    ``x86_64-unknown-linux-musl`` for x64 and
+    ``aarch64-unknown-linux-musl`` for arm64.  Keep this mapping explicit so
+    a package that merely has the right version cannot substitute a different
+    platform binary layout.
+    """
+    triples = {
+        "x64": "x86_64-unknown-linux-musl",
+        "arm64": "aarch64-unknown-linux-musl",
+    }
+    try:
+        triple = triples[arch]
+    except KeyError as exc:  # Defensive: callers derive arch from _host_platform.
+        raise AcpRuntimeNotReady("unsupported Codex Linux binary architecture") from exc
+    return path / "vendor" / triple / "bin" / "codex"
+
+
 def _host_platform() -> tuple[str, str]:
     if platform.system() != "Linux":
         raise AcpRuntimeNotReady("unsupported ACP runtime platform: Linux amd64 or arm64 required")
@@ -226,7 +247,7 @@ def inspect_runtime(root: Path, *, profile: str = "agent") -> CodexAcpRuntime:
     if root not in resolved.parents:
         raise AcpRuntimeNotReady("codex-acp launcher resolves outside isolated runtime")
     _verify_launcher(root, command)
-    binary = binary_package / "bin" / "codex"
+    binary = _platform_binary(binary_package, node_arch)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise AcpRuntimeNotReady("selected Codex platform binary is missing or not executable")
     evidence = CodexAcpLaunchEvidence(

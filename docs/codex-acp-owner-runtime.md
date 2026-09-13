@@ -38,7 +38,14 @@ nc acp-doctor --runtime /srv/neocortex/acp-1.11.0
 The command rejects an existing directory, a bad tarball, anything other than
 Linux amd64/arm64, missing matching `@openai/codex-linux-{x64,arm64}`, missing
 resolved ACP/Codex/SDK versions, or a launcher outside the runtime.  It does
-not reuse or update the global bootstrap Codex 0.86.0.  `verify` redoes the
+not reuse or update the global bootstrap Codex 0.86.0.  Before `npm ci`, it
+also reads the executing `node` version and rejects anything below the
+published Codex requirement of Node `>=16` (npm engine warnings are not
+accepted as a successful install).  The published Linux packages contain the
+native executables at `vendor/x86_64-unknown-linux-musl/bin/codex` (amd64) and
+`vendor/aarch64-unknown-linux-musl/bin/codex` (arm64), rather than a generic
+`bin/codex`; installation and verification require that exact host path.
+`verify` redoes the
 inspection immediately before any future launch: it hashes the installed
 `package-lock.json` against the committed reviewed-lock digest and requires
 matching reviewed-lock SRI/version entries for ACP, Codex, SDK, and the

@@ -37,12 +37,14 @@ for spec in '@agentclientprotocol/sdk:1.4.0' '@openai/codex:0.153.4' "@openai/co
   name="${spec%%:*}"; version="${spec#*:}"; dir="$prefix/node_modules/$name"
   mkdir -p "$dir"; printf '{"version":"%s"}\\n' "$version" > "$dir/package.json"
 done
-mkdir -p "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/bin"
-printf '#!/bin/sh\\n' > "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/bin/codex"
-chmod +x "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/bin/codex"
+    case "$ACP_TEST_ARCH" in x64) triple=x86_64-unknown-linux-musl;; arm64) triple=aarch64-unknown-linux-musl;; esac
+    mkdir -p "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/vendor/$triple/bin"
+    printf '#!/bin/sh\\n' > "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/vendor/$triple/bin/codex"
+    chmod +x "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/vendor/$triple/bin/codex"
 """)
     _stub_executable(tools / "node", """
 case "$*" in
+  *process.versions.node*) printf '%s' "${ACP_TEST_NODE_VERSION:-20.19.0}";;
   *codex-acp*) printf 1.11.0;; *'@openai/codex/package.json'*) printf 0.153.4;;
   *sdk/package.json*) printf 1.4.0;; *codex-linux-*) printf '0.153.4-linux-%s' "$ACP_TEST_ARCH";; *) exit 0;;
 esac
@@ -76,7 +78,8 @@ def runtime_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, arch: str =
     command.parent.mkdir(parents=True)
     command.write_text("#!/bin/sh\n")
     command.chmod(0o700)
-    binary = root / "node_modules" / "@openai" / f"codex-linux-{arch}" / "bin" / "codex"
+    binary = acp_runtime._platform_binary(
+        root / "node_modules" / "@openai" / f"codex-linux-{arch}", arch)
     binary.parent.mkdir(parents=True)
     binary.write_text("#!/bin/sh\n")
     binary.chmod(0o700)
@@ -107,6 +110,50 @@ def test_inspection_accepts_actual_arm64_platform_artifact(tmp_path, monkeypatch
     monkeypatch.setattr(acp_runtime, "_host_platform", lambda: ("linux-arm64", "arm64"))
     (root / "receipt.json").write_text('{"package":"@agentclientprotocol/codex-acp","version":"1.11.0","integrity":"' + acp_runtime.INTEGRITY + '","platform":"linux-arm64"}')
     assert acp_runtime.inspect_runtime(root).platform == "linux-arm64"
+
+
+def test_inspection_rejects_legacy_nonpublished_platform_binary_layout(tmp_path, monkeypatch):
+    root = runtime_tree(tmp_path, monkeypatch)
+    binary = acp_runtime._platform_binary(
+        root / "node_modules" / "@openai" / "codex-linux-x64", "x64")
+    binary.unlink()
+    legacy = root / "node_modules" / "@openai" / "codex-linux-x64" / "bin" / "codex"
+    legacy.parent.mkdir()
+    legacy.write_text("#!/bin/sh\n")
+    legacy.chmod(0o700)
+    # Regenerate the tree receipt so this specifically proves layout checking.
+    lines = []
+    for path in sorted((root / "node_modules").rglob("*")):
+        if path.is_file() and ".bin" not in path.relative_to(root / "node_modules").parts:
+            lines.append(acp_runtime.hashlib.sha256(path.read_bytes()).hexdigest()
+                         + "  " + str(path.relative_to(root)))
+    (root / "installed.sha256").write_text("\n".join(lines) + "\n")
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="platform binary"):
+        acp_runtime.inspect_runtime(root)
+
+
+def test_owner_installer_rejects_node_older_than_pinned_requirement(tmp_path, monkeypatch):
+    source = tmp_path / "source" / "package"
+    (source / "dist").mkdir(parents=True)
+    (source / "package.json").write_text('{"version":"1.11.0"}')
+    (source / "dist" / "index.js").write_text("#!/usr/bin/env node\n")
+    tarball = tmp_path / "codex-acp.tgz"
+    with tarfile.open(tarball, "w:gz") as archive:
+        archive.add(source, arcname="package")
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    _stub_executable(tools / "openssl", "printf x")
+    _stub_executable(tools / "base64", "cat >/dev/null\nprintf '%s' 'opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ=='")
+    _stub_executable(tools / "node", "printf '%s' 15.0.0")
+    _stub_executable(tools / "npm", "exit 99")
+    runtime = tmp_path / "runtime"
+    script = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.sh"
+    environment = os.environ | {"PATH": str(tools) + os.pathsep + os.environ["PATH"]}
+    result = subprocess.run([str(script), "install", str(runtime), str(tarball)],
+                            env=environment, text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert "requires Node >=16" in result.stderr
+    assert not runtime.exists()
 
 
 def test_inspection_rejects_unpinned_profile(tmp_path, monkeypatch):

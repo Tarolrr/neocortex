@@ -223,7 +223,11 @@ def _record_host(state: State, run_id: int, result, assessment: HostAssessment) 
         assessment=assessment.status,
         evidence_path=(str(result.evidence_path) if getattr(result, "evidence_path", None) else None),
     )
-    _set_defer_until(state, run_id, assessment.diagnostic)
+    # ACP AIR has no reset-time field.  Its title/details are untrusted prose,
+    # so a typed throttled/service deferral always uses the existing timer
+    # wake rather than extracting an epoch from diagnostics.
+    if result.transport != "acp":
+        _set_defer_until(state, run_id, assessment.diagnostic)
 
 
 def _record_exception_host(state: State, run_id: int,

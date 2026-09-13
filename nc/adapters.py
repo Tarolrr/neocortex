@@ -461,21 +461,117 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
                               f"ACP process terminated unexpectedly by signal {signal_number}")
     if process["exit_code"] != 0:
         return HostAssessment("FAILED", "local_error", "ACP process did not exit successfully")
-    # A decoder-normalized AIR condition is valid transport evidence but has
-    # no scheduler mapping yet.  It must remain a conservative host failure,
-    # rather than becoming either protocol corruption or a warning-success.
+    # A retry action cannot turn a cancelled, truncated, or otherwise
+    # noncanonical prompt into a timer-retryable provider condition.  Require
+    # the independent terminal result before consulting active AIR evidence.
+    # The decoder deliberately calls active AIR errors ``failed`` (and the
+    # adapter therefore marks completion false).  That decoder-failed state is
+    # still a clean canonical terminal envelope, but only when it carries the
+    # validated active AIR evidence below.  Do not generalize this exception
+    # to JSON-RPC, local, cancellation, or arbitrary failed prompt outcomes.
     failures = prompt.get("session_failures")
-    if isinstance(failures, list) and failures and all(is_air_session_failure(item)
-                                                       for item in failures):
-        without_failures = dict(prompt)
-        without_failures["session_failures"] = []
-        if is_completion_candidate(without_failures):
-            return HostAssessment("FAILED", "unknown", "ACP reported session failure")
-    if result.acp_result_kind != "success" or result.completion is not True:
+    active_air_errors = (
+        isinstance(failures, list) and bool(failures)
+        and all(is_air_session_failure(item) for item in failures)
+        and any(isinstance(item, dict) and item.get("severity") == "error"
+                for item in failures)
+    )
+    normal_completion = result.acp_result_kind == "success" and result.completion is True
+    decoded_air_failure = result.acp_result_kind == "failed" and result.completion is False
+    if (not _is_canonical_acp_terminal(prompt)
+            or not (normal_completion or (decoded_air_failure and active_air_errors))):
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
+    # AIR is structured provider evidence, but only one canonical active
+    # effective record, which must be an error, can select the deliberately
+    # small timer policy below.  In
+    # particular, do not use titles, details, stderr, or an apparent live ACP
+    # parent to guess whether a connection failure was remote.
+    if active_air_errors:
+        return _assess_air_failures(prompt, failures)
     if not is_completion_candidate(prompt):
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
     return HostAssessment("SUCCESS", "none", "")
+
+
+def _is_canonical_acp_terminal(prompt: dict[str, object]) -> bool:
+    """Validate the terminal prompt envelope before AIR policy selection.
+
+    Active AIR errors deliberately prevent ``is_completion_candidate``: they
+    are failures, not agent outcomes.  They still need a correlated successful
+    ``end_turn`` response so a retry hint cannot override cancellation,
+    max-token exhaustion, JSON-RPC failure, or an unknown stop reason.
+    """
+    request_id = prompt.get("request_id")
+    prompt_id = prompt.get("prompt_id")
+    session_id = prompt.get("session_id")
+    response = prompt.get("jsonrpc_result")
+    return (
+        prompt.get("prompt_response_valid") is True
+        and isinstance(request_id, str) and bool(request_id)
+        and isinstance(prompt_id, str) and bool(prompt_id)
+        and request_id == prompt_id
+        and isinstance(session_id, str) and bool(session_id)
+        and isinstance(response, dict)
+        and response.get("stopReason") == "end_turn"
+        and prompt.get("stop_reason") == "end_turn"
+        and "jsonrpc_error" not in prompt
+    )
+
+
+def _assess_air_failures(prompt: dict[str, object], failures: list[object]) -> HostAssessment:
+    """Map one canonical active AIR error conservatively.
+
+    This is intentionally a table over AIR fields, never prose.  AIR actions
+    remain display data: ``login`` and ``new_session`` neither authenticate
+    nor cause an internal retry/session replacement.  More than one active
+    effective failure (including warnings), unknown actions/categories,
+    malformed/corrupt prompt evidence, and every non-table category fail
+    closed as ``unknown``.
+    """
+    # A malformed record makes the decoder's prompt fact noncanonical.  Do
+    # not allow another, valid-looking record later in the observation list to
+    # obtain a deferral.
+    if prompt.get("prompt_response_valid") is not True:
+        return HostAssessment("FAILED", "protocol", "ACP prompt evidence is malformed")
+    # ``session_failures`` is already the decoder's complete effective set.
+    # A warning that has not been recovered is still active evidence, so it
+    # must participate in this cardinality check.  Filtering it out here
+    # would let an unrelated retryable error select a timer policy despite a
+    # concurrent (possibly extension-action) provider condition.
+    active = failures
+    if len(active) != 1:
+        return HostAssessment("FAILED", "unknown", "ACP has conflicting active session failures")
+    failure = active[0]
+    if not isinstance(failure, dict) or failure.get("severity") != "error":
+        return HostAssessment("FAILED", "unknown", "ACP active session failure is not an eligible error")
+    category = failure["category"]
+    actions = failure["actions"]
+    # is_air_session_failure above establishes these types.  Keep the check
+    # explicit at this policy boundary so future extensions cannot inherit a
+    # retry decision accidentally.
+    if not isinstance(category, str) or not isinstance(actions, list):
+        return HostAssessment("FAILED", "unknown", "ACP AIR category or actions are unknown")
+    diagnostic = sanitize_diagnostic(
+        f"ACP AIR {category} revision {failure['revision']} actions={actions}: {failure['title']}"
+    )
+    if any(action not in {"retry", "new_session", "login"} for action in actions):
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    has_retry = "retry" in actions
+    # Canonical active AIR policy table.  No row establishes subscription
+    # identity, a quota reset, authentication, or an upstream overload field.
+    if category == "limit" and has_retry:
+        return HostAssessment("FAILED", "throttled", diagnostic)
+    if category == "service" and has_retry:
+        return HostAssessment("FAILED", "transient", diagnostic)
+    if category == "limit":
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    if category == "access":
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    if category == "request":
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    # Connection includes a local App Server death and is therefore never a
+    # remote-transient inference.  Unknown is likewise deliberately inert.
+    return HostAssessment("FAILED", "unknown", diagnostic)
 
 
 def _valid_acp_process(process: dict[str, object]) -> bool:

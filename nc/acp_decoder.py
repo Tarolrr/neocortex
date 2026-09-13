@@ -301,11 +301,9 @@ def decode_acp_prompt_result(
         return AcpPromptResult("cancelled", stop_reason, None, evidence, usage)
     if stop_reason != "end_turn":
         return AcpPromptResult("failed", stop_reason, None, evidence, usage)
-    # A warning is a recoverable protocol observation, so it does not make
-    # the pure terminal decoder claim that an otherwise canonical end_turn
-    # failed.  The bridge/host applies the stricter scheduling policy to the
-    # retained evidence independently.
-    if all(item.severity == "warning" for item in evidence):
+    # Warnings are recoverable observations.  The bridge determines whether
+    # subsequent structured progress clears them from its active policy set.
+    if not evidence or all(item.severity == "warning" for item in evidence):
         return AcpPromptResult("success", stop_reason, None, evidence, usage)
     errors = [item for item in evidence if item.severity == "error"]
     diagnostic = errors[-1].diagnostic if errors else "ACP reported session failure"

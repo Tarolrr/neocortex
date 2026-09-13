@@ -314,13 +314,12 @@ def test_acp_unexpected_signal_is_local_error_without_diagnostic_authority(tmp_p
     assert "unexpectedly" in assessment.diagnostic
 
 
-@pytest.mark.parametrize(("severity", "category", "actions"), [
-    ("warning", "service", ["retry"]),
-    ("error", "limit", ["new_session"]),
+@pytest.mark.parametrize(("severity", "category", "actions", "expected"), [
+    ("warning", "service", ["retry"], "protocol"),
+    ("error", "limit", ["new_session"], "unknown"),
 ])
-def test_acp_valid_air_failure_is_conservative_unknown_not_protocol_or_success(
-        tmp_path, severity, category, actions):
-    """AIR policy belongs to the later mapping task, not completion parsing."""
+def test_acp_valid_air_failure_respects_recovery_and_typed_policy(
+        tmp_path, severity, category, actions, expected):
     prompt = {
         "request_id": "5", "prompt_id": "5", "session_id": "session-1",
         "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
@@ -331,13 +330,110 @@ def test_acp_valid_air_failure_is_conservative_unknown_not_protocol_or_success(
         }],
     }
     result = SessionResult(0, tmp_path / "diagnostic.log", None, False, transport="acp",
-                           completion=False, acp_result_kind="failed",
+                           completion=True, acp_result_kind="success",
                            acp_process={"pid": 4, "exit_code": 0, "signal": None,
                                         "timed_out": False, "timeout_phases": [],
                                         "stderr_available": True,
                                         "supervisor_terminated": False}, acp_prompt=prompt)
     assessment = assess_session(result, "codex-acp")
+    assert assessment.category == expected
+
+
+def test_acp_recovered_warning_with_progress_is_host_success(tmp_path):
+    """The bridge clears recovered AIR from the active set, retaining raw audit data."""
+    warning = {"id": "air-1", "revision": 1, "category": "service", "severity": "warning",
+               "title": "recovered", "actions": ["retry"]}
+    result = _acp_air_result(tmp_path, [])
+    result.completion = True
+    result.acp_result_kind = "success"
+    assert result.acp_prompt is not None
+    result.acp_prompt["air_observations"] = [warning]
+    assert assess_session(result, "codex-acp").status == "SUCCESS"
+
+
+def _acp_air_result(tmp_path, failures, *, process=None):
+    prompt = {
+        "request_id": "p", "prompt_id": "p", "session_id": "s",
+        "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+        "stop_reason": "end_turn", "air_observations": failures,
+        "session_failures": failures,
+    }
+    return SessionResult(
+        0, tmp_path / "acp-air.log", None, False, transport="acp", completion=True,
+        acp_result_kind="success",
+        acp_process=process or {"pid": 4, "exit_code": 0, "signal": None,
+                                "timed_out": False, "timeout_phases": [],
+                                "stderr_available": True, "supervisor_terminated": False},
+        acp_prompt=prompt,
+    )
+
+
+@pytest.mark.parametrize(("category", "actions", "expected"), [
+    ("limit", ["retry"], "throttled"),
+    ("service", ["retry"], "transient"),
+    ("limit", [], "unknown"),
+    ("access", ["login"], "unknown"),
+    ("request", ["new_session"], "unknown"),
+    ("connection", ["retry"], "unknown"),
+    ("service", ["retry", "future_action"], "unknown"),
+    ("unknown", ["retry"], "unknown"),
+])
+def test_acp_air_policy_is_typed_and_conservative(tmp_path, category, actions, expected):
+    failure = {"id": "air-1", "revision": 3, "category": category, "severity": "error",
+               "title": "provider retry_at=1999999999", "actions": actions}
+    assessment = assess_session(_acp_air_result(tmp_path, [failure]), "codex-acp")
+    assert (assessment.status, assessment.category) == ("FAILED", expected)
+    assert "provider retry_at" in assessment.diagnostic
+
+
+def test_acp_air_multiple_active_failures_cannot_use_last_retry_hint(tmp_path):
+    failures = [
+        {"id": "air-1", "revision": 1, "category": "access", "severity": "error",
+         "title": "access", "actions": []},
+        {"id": "air-2", "revision": 1, "category": "service", "severity": "error",
+         "title": "retry", "actions": ["retry"]},
+    ]
+    assert assess_session(_acp_air_result(tmp_path, failures), "codex-acp").category == "unknown"
+
+
+@pytest.mark.parametrize("warning_actions", [[], ["future_action"]])
+def test_acp_air_active_warning_conflicts_with_retryable_error(tmp_path, warning_actions):
+    """Every unrecovered effective failure blocks timer deferral, including warnings."""
+    failures = [
+        {"id": "air-warning", "revision": 1, "category": "access", "severity": "warning",
+         "title": "still active", "actions": warning_actions},
+        {"id": "air-error", "revision": 1, "category": "service", "severity": "error",
+         "title": "retry", "actions": ["retry"]},
+    ]
+    assessment = assess_session(_acp_air_result(tmp_path, failures), "codex-acp")
     assert (assessment.status, assessment.category) == ("FAILED", "unknown")
+
+
+def test_acp_local_failure_overrides_typed_retry_hint(tmp_path):
+    failure = {"id": "air-1", "revision": 1, "category": "service", "severity": "error",
+               "title": "retry", "actions": ["retry"]}
+    process = {"pid": 4, "exit_code": None, "signal": 15, "timed_out": False,
+               "timeout_phases": [], "stderr_available": True, "supervisor_terminated": False}
+    assessment = assess_session(_acp_air_result(tmp_path, [failure], process=process), "codex-acp")
+    assert assessment.category == "local_error"
+
+
+@pytest.mark.parametrize(("result_kind", "completion", "stop_reason"), [
+    ("success", True, "cancelled"),
+    ("success", True, "max_tokens"),
+    ("success", True, "unknown"),
+])
+def test_acp_retryable_air_never_overrides_noncanonical_prompt(
+        tmp_path, result_kind, completion, stop_reason):
+    failure = {"id": "air-1", "revision": 1, "category": "service", "severity": "error",
+               "title": "retry", "actions": ["retry"]}
+    result = _acp_air_result(tmp_path, [failure])
+    result.acp_result_kind = result_kind
+    result.completion = completion
+    assert result.acp_prompt is not None
+    result.acp_prompt["stop_reason"] = stop_reason
+    result.acp_prompt["jsonrpc_result"] = {"stopReason": stop_reason}
+    assert assess_session(result, "codex-acp").category == "protocol"
 
 
 @pytest.mark.parametrize("prompt", [

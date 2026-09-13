@@ -28,6 +28,8 @@ INTEGRITY = "sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKOD
 CODEX_VERSION = "0.153.4"
 SDK_VERSION = "1.4.0"
 PROFILE = "agent"
+_REVIEWED_LOCK_SHA256 = "ef7a28b18ecec377058926838c4637231ba6e3d7b1e8463d66a5acacd609d69d"
+_REVIEWED_LOCK = Path(__file__).resolve().parents[1] / "scripts" / "codex_acp_runtime.lock.json"
 _PROTECTED = frozenset(("CODEX_PATH", "CODEX_CONFIG", "CODEX_HOME", "HOME",
                         "XDG_CONFIG_HOME", "XDG_DATA_HOME", "INITIAL_AGENT_MODE"))
 _INHERITED_REDIRECTION = frozenset(("CODEX_PATH", "CODEX_CONFIG", "CODEX_HOME",
@@ -118,6 +120,65 @@ def _verify_installed_tree(root: Path) -> None:
         raise AcpRuntimeNotReady("installed dependency tree has unexpected files")
 
 
+def _verify_reviewed_resolution(root: Path, node_arch: str) -> None:
+    """Bind installed package metadata to the immutable reviewed lock.
+
+    Receipts under ``root`` are only diagnostic: an attacker able to rewrite
+    them can rewrite their hashes.  The committed lock hash and its SRI entries
+    are the use-time trust anchor for every installed package location.
+    """
+    try:
+        lock_bytes = _REVIEWED_LOCK.read_bytes()
+        lock = json.loads(lock_bytes)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AcpRuntimeNotReady("reviewed ACP dependency lock is unavailable") from exc
+    if hashlib.sha256(lock_bytes).hexdigest() != _REVIEWED_LOCK_SHA256:
+        raise AcpRuntimeNotReady("reviewed ACP dependency lock was modified")
+    try:
+        installed_lock = (root / "package-lock.json").read_bytes()
+    except OSError as exc:
+        raise AcpRuntimeNotReady("installed ACP dependency lock is missing") from exc
+    if hashlib.sha256(installed_lock).hexdigest() != _REVIEWED_LOCK_SHA256:
+        raise AcpRuntimeNotReady("installed dependency lock differs from reviewed exact lock")
+    packages = lock.get("packages") if isinstance(lock, dict) else None
+    if not isinstance(packages, dict):
+        raise AcpRuntimeNotReady("reviewed ACP dependency lock is malformed")
+    required = {
+        "node_modules/@agentclientprotocol/sdk": SDK_VERSION,
+        "node_modules/@openai/codex": CODEX_VERSION,
+        f"node_modules/@openai/codex-linux-{node_arch}": f"{CODEX_VERSION}-linux-{node_arch}",
+    }
+    # ACP itself is installed from the separately SRI-verified published
+    # tarball, so its lock-root package has no second registry integrity.
+    if not isinstance(packages.get(""), dict) or packages[""].get("version") != VERSION:
+        raise AcpRuntimeNotReady("reviewed lock lacks pinned ACP root package")
+    for relative, version in required.items():
+        entry = packages.get(relative)
+        if not isinstance(entry, dict) or entry.get("version") != version or not isinstance(entry.get("integrity"), str):
+            raise AcpRuntimeNotReady("reviewed lock lacks required pinned platform artifact")
+        installed = _json(root / relative / "package.json")
+        if installed.get("version") != version:
+            raise AcpRuntimeNotReady("installed dependency does not match reviewed lock")
+    # Cover every resolved transitive package, rather than treating the three
+    # top-level versions as a proxy for an arbitrary npm resolution.
+    for manifest in (root / "node_modules").rglob("package.json"):
+        relative = str(manifest.parent.relative_to(root))
+        if "/node_modules/.bin/" in f"/{relative}/":
+            continue
+        entry = packages.get(relative)
+        installed = _json(manifest)
+        if relative == "node_modules/@agentclientprotocol/codex-acp":
+            # The fixture/installed launcher package is the SRI-verified root
+            # artifact; npm's root lock entry intentionally has no integrity.
+            if installed.get("version") != VERSION:
+                raise AcpRuntimeNotReady("installed ACP differs from pinned root artifact")
+            continue
+        if not isinstance(entry, dict) or entry.get("version") != installed.get("version"):
+            raise AcpRuntimeNotReady("installed transitive dependency differs from reviewed lock")
+        if not isinstance(entry.get("integrity"), str):
+            raise AcpRuntimeNotReady("reviewed lock lacks transitive dependency integrity")
+
+
 def _verify_launcher(root: Path, command: Path) -> None:
     try:
         digest, relative = (root / "launcher.sha256").read_text().strip().split("  ", 1)
@@ -146,6 +207,7 @@ def inspect_runtime(root: Path, *, profile: str = "agent") -> CodexAcpRuntime:
         raise AcpRuntimeNotReady("runtime receipt integrity or platform mismatch")
     _verify_tarball(root)
     _verify_installed_tree(root)
+    _verify_reviewed_resolution(root, node_arch)
     modules = root / "node_modules"
     acp = modules / "@agentclientprotocol" / "codex-acp"
     _package_version(acp, VERSION, "codex-acp")
@@ -164,10 +226,14 @@ def inspect_runtime(root: Path, *, profile: str = "agent") -> CodexAcpRuntime:
     if root not in resolved.parents:
         raise AcpRuntimeNotReady("codex-acp launcher resolves outside isolated runtime")
     _verify_launcher(root, command)
+    binary = binary_package / "bin" / "codex"
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise AcpRuntimeNotReady("selected Codex platform binary is missing or not executable")
     evidence = CodexAcpLaunchEvidence(
         command=(str(command),), package=PACKAGE, package_version=VERSION,
         artifact_integrity=INTEGRITY, codex_version=CODEX_VERSION, sdk_version=SDK_VERSION,
-        profile=profile,
+        profile=profile, platform=host, binary_package=str(binary_package.resolve()),
+        binary_resolution=str(binary.resolve()),
     )
     return CodexAcpRuntime(root, command, host, evidence)
 
@@ -218,14 +284,12 @@ def prepare_private_home(credential_file: Path, *, parent: Path) -> Path:
         value = json.loads(credential_file.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise AcpRuntimeNotReady("credential readiness error: explicit auth.json is unreadable") from exc
-    if (not stat.S_ISREG(mode) or mode & 0o077 or not isinstance(value, dict) or not value):
+    if (not stat.S_ISREG(mode) or mode & 0o077 or not _supported_auth(value)):
         raise AcpRuntimeNotReady("credential readiness error: explicit auth.json is unsupported")
     parent.mkdir(parents=True, exist_ok=True)
     home = Path(tempfile.mkdtemp(prefix="nc-acp-home-", dir=parent))
     try:
-        codex = home / ".codex"
-        codex.mkdir(mode=0o700)
-        target = codex / "auth.json"
+        target = home / "auth.json"
         shutil.copyfile(credential_file, target)
         target.chmod(0o600)
         return home
@@ -241,9 +305,22 @@ def credential_readiness(credential_file: Path) -> str:
         value = json.loads(credential_file.resolve().read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise AcpRuntimeNotReady("credential readiness error: explicit auth.json is unreadable") from exc
-    if (not stat.S_ISREG(mode) or mode & 0o077 or not isinstance(value, dict) or not value):
+    if (not stat.S_ISREG(mode) or mode & 0o077 or not _supported_auth(value)):
         raise AcpRuntimeNotReady("credential readiness error: explicit auth.json is unsupported")
     return "explicit auth.json readable (values not inspected or logged)"
+
+
+def _supported_auth(value: object) -> bool:
+    """Pinned Codex file-auth records: API key or OAuth token record only."""
+    if not isinstance(value, dict):
+        return False
+    api_key = value.get("OPENAI_API_KEY")
+    if isinstance(api_key, str) and bool(api_key.strip()):
+        return True
+    tokens = value.get("tokens")
+    return (isinstance(tokens, dict)
+            and isinstance(tokens.get("access_token"), str) and bool(tokens["access_token"].strip())
+            and isinstance(tokens.get("refresh_token"), str) and bool(tokens["refresh_token"].strip()))
 
 
 def cleanup_private_home(home: Path, *, expected_parent: Path) -> None:

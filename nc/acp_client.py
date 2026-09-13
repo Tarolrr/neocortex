@@ -86,6 +86,9 @@ class CodexAcpLaunchEvidence:
     codex_version: str
     sdk_version: str
     profile: str
+    platform: str = ""
+    binary_package: str = ""
+    binary_resolution: str = ""
 
     def validate_for(self, command: Sequence[str], profile: str) -> None:
         if tuple(command) != self.command:
@@ -96,6 +99,8 @@ class CodexAcpLaunchEvidence:
                 or self.codex_version != _PINNED_CODEX_VERSION
                 or self.sdk_version != _PINNED_SDK_VERSION):
             raise AcpClientRejected("launch evidence does not match pinned ACP contract")
+        if self.platform and (not self.binary_package or not self.binary_resolution):
+            raise AcpClientRejected("launch evidence lacks verified platform binary resolution")
         if self.profile != profile:
             raise AcpClientRejected("launch evidence does not bind the selected ACP profile")
 
@@ -545,7 +550,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         # CODEX_HOME cannot point at a credential-free sibling directory.
         config_home = (private_home.resolve() if private_home is not None else
                        Path(tempfile.mkdtemp(prefix="nc-acp-codex-", dir=log_path.parent)))
-        if private_home is not None and not (config_home / ".codex" / "auth.json").is_file():
+        if private_home is not None and not (config_home / "auth.json").is_file():
             raise AcpClientRejected("private ACP home has no prepared auth.json", log_path=str(log_path))
         _write_pinned_config(policy, config_home)
     except BaseException as exc:

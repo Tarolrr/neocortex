@@ -35,7 +35,11 @@ The command rejects an existing directory, a bad tarball, anything other than
 Linux amd64/arm64, missing matching `@openai/codex-linux-{x64,arm64}`, missing
 resolved ACP/Codex/SDK versions, or a launcher outside the runtime.  It does
 not reuse or update the global bootstrap Codex 0.86.0.  `verify` redoes the
-inspection immediately before any future launch and returns an evidence object
+inspection immediately before any future launch: it hashes the installed
+`package-lock.json` against the committed reviewed-lock digest and requires
+matching reviewed-lock SRI/version entries for ACP, Codex, SDK, and the
+selected platform package. Runtime-local receipts are tree-mutation
+tripwires, not the trust anchor. It returns an evidence object
 bound to `/srv/.../node_modules/.bin/codex-acp`, not `codex` on PATH.  Thus a service PATH
 with no ACP executable is expected and safe.
 
@@ -47,7 +51,10 @@ reads `auth.json` from `CODEX_HOME`; that is the source-backed boundary used
 here. The explicit `nc acp-ordinary-smoke` opt-in uses only
 `prepare_private_home(EXPLICIT_AUTH_JSON, parent=...)`:
 it checks and copies the owner-selected existing Codex `auth.json` with mode
-0600 into that HOME.  It does not run login, mutate or enumerate the original
+0600 to `CODEX_HOME/auth.json`, the exact upstream lookup path. It accepts
+only a nonempty `OPENAI_API_KEY` record or OAuth `tokens.access_token` plus
+`tokens.refresh_token`, so unsupported auth storage fails offline. It does not
+run login, mutate or enumerate the original
 credential store, record credential values, or copy config.  This is a
 read-only reuse boundary; an unreadable, empty, malformed, or unsupported
 auth file is an actionable readiness error.  `nc acp-doctor --auth

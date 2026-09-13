@@ -224,6 +224,39 @@ def run(tmp_path: Path, scenario: str, **kwargs: object):
                                timeout_s=kwargs.pop("timeout_s", 1), **kwargs)
 
 
+def test_private_auth_is_at_codex_home_and_absolute_launcher_ignores_path(tmp_path: Path) -> None:
+    """A stub child proves the actual launch environment, without auth values."""
+    from nc import acp_runtime
+
+    auth = tmp_path / "source-auth.json"
+    auth.write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
+    auth.chmod(0o600)
+    home = acp_runtime.prepare_private_home(auth, parent=tmp_path / "homes")
+    observed = tmp_path / "observed.json"
+    code = (
+        "import json, os, pathlib; "
+        "pathlib.Path(os.environ['OBSERVED']).write_text(json.dumps({k: os.environ.get(k) for k in "
+        "('PATH','HOME','CODEX_HOME','CODEX_PATH','CODEX_CONFIG','XDG_CONFIG_HOME')}));"
+    )
+    command = [sys.executable, "-c", code]
+    try:
+        with pytest.raises(AcpUnexpectedExit):
+            run_codex_acp_turn(command, launch=verified_launch(command),
+                                policy=CodexAcpPolicy.ordinary(tmp_path), model="model", prompt="hello",
+                                log_path=tmp_path / "acp.log", timeout_s=1, private_home=home,
+                                environment={"PATH": "", "OBSERVED": str(observed), "CODEX_PATH": "/bad",
+                                             "CODEX_CONFIG": "/bad", "XDG_CONFIG_HOME": "/bad"})
+        child_env = json.loads(observed.read_text())
+        assert child_env["PATH"] == ""
+        assert child_env["HOME"] == str(home)
+        assert child_env["CODEX_HOME"] == str(home)
+        assert child_env["CODEX_PATH"] is None and child_env["CODEX_CONFIG"] is None
+        assert child_env["XDG_CONFIG_HOME"] == str(home)
+        assert (Path(child_env["CODEX_HOME"]) / "auth.json").is_file()
+    finally:
+        acp_runtime.cleanup_private_home(home, expected_parent=tmp_path / "homes")
+
+
 def test_fake_success_has_independent_shutdown_evidence(tmp_path: Path) -> None:
     turn = run(tmp_path, "success")
     assert turn.prompt.kind == "success"

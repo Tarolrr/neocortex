@@ -9,6 +9,8 @@ from nc import acp_runtime
 
 def runtime_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, arch: str = "x64") -> Path:
     root = tmp_path / "runtime"
+    root.mkdir()
+    (root / "package-lock.json").write_bytes(acp_runtime._REVIEWED_LOCK.read_bytes())
     for package, version in (("@agentclientprotocol/codex-acp", "1.11.0"),
                              ("@agentclientprotocol/sdk", "1.4.0"),
                              ("@openai/codex", "0.153.4"),
@@ -20,6 +22,10 @@ def runtime_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, arch: str =
     command.parent.mkdir(parents=True)
     command.write_text("#!/bin/sh\n")
     command.chmod(0o700)
+    binary = root / "node_modules" / "@openai" / f"codex-linux-{arch}" / "bin" / "codex"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o700)
     (root / "launcher.sha256").write_text(
         acp_runtime.hashlib.sha256(command.read_bytes()).hexdigest() + "  node_modules/.bin/codex-acp\n")
     (root / "receipt.json").write_text('{"package":"@agentclientprotocol/codex-acp","version":"1.11.0","integrity":"' + acp_runtime.INTEGRITY + '","platform":"linux-amd64"}')
@@ -54,13 +60,20 @@ def test_inspection_rejects_unpinned_profile(tmp_path, monkeypatch):
         acp_runtime.inspect_runtime(runtime_tree(tmp_path, monkeypatch), profile="arbitrary")
 
 
+def test_inspection_rejects_rewritten_installed_lock(tmp_path, monkeypatch):
+    root = runtime_tree(tmp_path, monkeypatch)
+    (root / "package-lock.json").write_text("{}")
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="reviewed exact lock"):
+        acp_runtime.inspect_runtime(root)
+
+
 def test_private_home_is_explicit_and_cleanup_is_scoped(tmp_path):
     source = tmp_path / "auth.json"
-    source.write_text('{"tokens": "fixture-only"}')
+    source.write_text('{"tokens": {"access_token": "fixture", "refresh_token": "fixture"}}')
     source.chmod(0o600)
     parent = tmp_path / "private"
     home = acp_runtime.prepare_private_home(source, parent=parent)
-    assert (home / ".codex" / "auth.json").read_text() == source.read_text()
+    assert (home / "auth.json").read_text() == source.read_text()
     acp_runtime.cleanup_private_home(home, expected_parent=parent)
     assert not home.exists()
     with pytest.raises(acp_runtime.AcpRuntimeNotReady):
@@ -70,3 +83,21 @@ def test_private_home_is_explicit_and_cleanup_is_scoped(tmp_path):
 def test_redirection_is_rejected():
     with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="CODEX_PATH"):
         acp_runtime.reject_inherited_redirection({"CODEX_PATH": "/elsewhere"})
+
+
+def test_explicit_smoke_rejects_inherited_redirection_before_runtime_or_auth(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEX_HOME", "/redirected")
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="CODEX_HOME"):
+        acp_runtime.run_verified_ordinary_turn(
+            runtime_root=tmp_path / "missing", credential_file=tmp_path / "auth.json",
+            private_parent=tmp_path / "homes", worktree=tmp_path, model="m", prompt="p",
+            log_path=tmp_path / "log")
+
+
+def test_credential_readiness_rejects_unrecognised_json(tmp_path: Path) -> None:
+    source = tmp_path / "auth.json"
+    source.write_text('{"garbage": true}')
+    source.chmod(0o600)
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="unsupported"):
+        acp_runtime.credential_readiness(source)

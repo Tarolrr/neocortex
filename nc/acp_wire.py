@@ -180,6 +180,7 @@ class AcpSubprocess:
         self._stderr_done = threading.Event()
         self._closed = False
         self._intentional_shutdown = False
+        self._supervisor_sent_termination = False
         # A nonzero exit observed before this client sends a containment
         # signal is process failure evidence, even when it happens while
         # orderly stdin-EOF cleanup is in progress.
@@ -228,6 +229,7 @@ class AcpSubprocess:
                         "timed_out": bool(self.timeout_phases),
                         "timeout_phases": list(self.timeout_phases),
                         "stderr_available": bool(self.diagnostics),
+                        "supervisor_terminated": self.supervisor_terminated,
                     }
                     exc.acp_launch_shutdown = self.shutdown_outcome
                     exc.acp_launch_cleanup_uncertain = self.cleanup_uncertain
@@ -353,8 +355,15 @@ class AcpSubprocess:
         # evidence that its ACP process tree has gone away.
         try:
             os.killpg(self.proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+            self._supervisor_sent_termination = True
         except (ProcessLookupError, PermissionError):
             pass
+
+    @property
+    def supervisor_terminated(self) -> bool:
+        """Whether our orderly cleanup, rather than a child failure, killed it."""
+        return (self._intentional_shutdown and self._supervisor_sent_termination
+                and self.shutdown_failure is None)
 
     def _wait_for_exit(self, timeout: float) -> bool:
         """Reap the direct child in a bounded cleanup phase.

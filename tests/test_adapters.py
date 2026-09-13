@@ -275,26 +275,42 @@ def test_acp_assessment_uses_correlated_facts_not_log_text(tmp_path):
                            acp_result_kind="success",
                            acp_process={"pid": 42, "exit_code": 0, "signal": None,
                                         "timed_out": False, "timeout_phases": [],
-                                        "stderr_available": True},
+                                        "stderr_available": True, "supervisor_terminated": False},
                            acp_prompt=prompt)
     assert not assess_session(result, "codex-acp").failed
     result.completion = False
     assert assess_session(result, "codex-acp").category == "protocol"
 
 
-def test_acp_signal_after_response_is_not_manufactured_success(tmp_path):
+def test_acp_supervisor_signal_after_response_is_not_manufactured_success(tmp_path):
+    path = tmp_path / "probe.log"
+    prompt = {"request_id": "5", "prompt_id": "5", "session_id": "session-1",
+              "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+              "stop_reason": "end_turn", "air_observations": [], "session_failures": []}
+    result = SessionResult(-15, path, None, False,
+                           transport="acp", completion=True,
+                           acp_result_kind="success",
+                           acp_process={"pid": 42, "exit_code": None, "signal": 15,
+                                        "timed_out": False, "timeout_phases": [],
+                                        "stderr_available": True, "supervisor_terminated": True},
+                           acp_prompt=prompt)
+    assert assess_session(result, "codex-acp").category == "local_error"
+
+
+def test_acp_unexpected_signal_is_local_error_without_diagnostic_authority(tmp_path):
     path = tmp_path / "probe.log"
     prompt = {"request_id": "5", "prompt_id": "5", "session_id": "session-1",
               "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
               "stop_reason": "end_turn", "air_observations": [], "session_failures": []}
     result = SessionResult(-15, path, None, False, terminal_diagnostic="ACP intentional shutdown",
-                           transport="acp", completion=True,
-                           acp_result_kind="success",
+                           transport="acp", completion=True, acp_result_kind="success",
                            acp_process={"pid": 42, "exit_code": None, "signal": 15,
                                         "timed_out": False, "timeout_phases": [],
-                                        "stderr_available": True},
+                                        "stderr_available": True, "supervisor_terminated": False},
                            acp_prompt=prompt)
-    assert assess_session(result, "codex-acp").category == "local_error"
+    assessment = assess_session(result, "codex-acp")
+    assert (assessment.status, assessment.category) == ("FAILED", "local_error")
+    assert "unexpectedly" in assessment.diagnostic
 
 
 @pytest.mark.parametrize(("severity", "category", "actions"), [
@@ -317,7 +333,8 @@ def test_acp_valid_air_failure_is_conservative_unknown_not_protocol_or_success(
                            completion=False, acp_result_kind="failed",
                            acp_process={"pid": 4, "exit_code": 0, "signal": None,
                                         "timed_out": False, "timeout_phases": [],
-                                        "stderr_available": True}, acp_prompt=prompt)
+                                        "stderr_available": True,
+                                        "supervisor_terminated": False}, acp_prompt=prompt)
     assessment = assess_session(result, "codex-acp")
     assert (assessment.status, assessment.category) == ("FAILED", "unknown")
 
@@ -334,7 +351,8 @@ def test_acp_requires_nonempty_correlated_prompt_identity(tmp_path, prompt):
                            completion=True, acp_result_kind="success",
                            acp_process={"pid": 4, "exit_code": 0, "signal": None,
                                         "timed_out": False, "timeout_phases": [],
-                                        "stderr_available": True}, acp_prompt=prompt)
+                                        "stderr_available": True,
+                                        "supervisor_terminated": False}, acp_prompt=prompt)
     assert assess_session(result, "codex-acp").category == "protocol"
 
 
@@ -346,7 +364,8 @@ def test_acp_rejects_cleanup_timeout_phase_without_timeout(tmp_path):
                            completion=True, acp_result_kind="success",
                            acp_process={"pid": 4, "exit_code": 0, "signal": None,
                                         "timed_out": False, "timeout_phases": ["term_grace"],
-                                        "stderr_available": True}, acp_prompt=prompt)
+                                        "stderr_available": True,
+                                        "supervisor_terminated": False}, acp_prompt=prompt)
     assert assess_session(result, "codex-acp").category == "protocol"
 
 

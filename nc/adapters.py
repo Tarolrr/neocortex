@@ -448,19 +448,17 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
     # hand-written partial fact paper over an unobserved signal or cleanup.
     if not _valid_acp_process(process):
         return HostAssessment("FAILED", "protocol", "ACP process evidence is incomplete")
-    if (result.acp_cleanup_uncertain
-            or "containment uncertain" in result.terminal_diagnostic.lower()):
+    if result.acp_cleanup_uncertain:
         return HostAssessment("FAILED", "local_error", "ACP cleanup containment is uncertain")
     if process.get("timed_out") is True:
         return HostAssessment("FAILED", "host_timeout", "ACP host deadline expired")
     signal_number = process["signal"]
     if signal_number is not None:
-        shutdown = result.terminal_diagnostic.lower()
-        category = "local_error" if "intentional shutdown" in shutdown else "host_timeout"
-        detail = ("ACP deliberately terminated by supervisor after response"
-                  if category == "local_error"
-                  else f"ACP process terminated by signal {signal_number}")
-        return HostAssessment("FAILED", category, detail)
+        if process["supervisor_terminated"]:
+            return HostAssessment("FAILED", "local_error",
+                                  "ACP deliberately terminated by supervisor after response")
+        return HostAssessment("FAILED", "local_error",
+                              f"ACP process terminated unexpectedly by signal {signal_number}")
     if process["exit_code"] != 0:
         return HostAssessment("FAILED", "local_error", "ACP process did not exit successfully")
     # A decoder-normalized AIR condition is valid transport evidence but has
@@ -482,7 +480,8 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
 
 def _valid_acp_process(process: dict[str, object]) -> bool:
     """Validate the complete, independently captured local process envelope."""
-    required = {"pid", "exit_code", "signal", "timed_out", "timeout_phases", "stderr_available"}
+    required = {"pid", "exit_code", "signal", "timed_out", "timeout_phases", "stderr_available",
+                "supervisor_terminated"}
     if not required <= process.keys():
         return False
     pid, code, signum = process["pid"], process["exit_code"], process["signal"]
@@ -494,7 +493,8 @@ def _valid_acp_process(process: dict[str, object]) -> bool:
             not isinstance(signum, int) or isinstance(signum, bool) or signum <= 0):
         return False
     if (not isinstance(process["timed_out"], bool)
-            or not isinstance(process["stderr_available"], bool)):
+            or not isinstance(process["stderr_available"], bool)
+            or not isinstance(process["supervisor_terminated"], bool)):
         return False
     phases = process["timeout_phases"]
     return isinstance(phases, list) and (process["timed_out"] or not phases) and all(

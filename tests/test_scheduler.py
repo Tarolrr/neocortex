@@ -1839,7 +1839,7 @@ def test_acp_preflight_success_persists_typed_evidence_without_a_log(setup, monk
                 acp_usage={"totalTokens": 7},
                 acp_process={"pid": 77, "exit_code": 0, "signal": None,
                              "timed_out": False, "timeout_phases": [],
-                             "stderr_available": False},
+                             "stderr_available": False, "supervisor_terminated": False},
                 acp_prompt={"request_id": "p", "prompt_id": "p", "session_id": "s",
                             "prompt_response_valid": True,
                             "jsonrpc_result": {"stopReason": "end_turn"},

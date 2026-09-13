@@ -39,6 +39,10 @@ class AcpProcessFact(TypedDict):
     timed_out: bool
     timeout_phases: list[TimeoutPhase]
     stderr_available: bool
+    # The local supervisor sent containment termination while it still owned
+    # a live child.  This is not inferred from a diagnostic string and is
+    # deliberately distinct from a child being killed unexpectedly.
+    supervisor_terminated: bool
 
 
 class AcpPromptFact(TypedDict):

@@ -514,6 +514,7 @@ def _process_fact(child: AcpSubprocess, timed_out: bool,
         "timed_out": timed_out,
         "timeout_phases": list(timeout_phases),
         "stderr_available": bool(child.diagnostics),
+        "supervisor_terminated": child.supervisor_terminated,
     }
 
 

@@ -120,6 +120,14 @@ passes only the verified absolute command/evidence to the client. That
 operation, model/network usability, and live sandbox enforcement are
 intentionally not performed by `nc doctor` or acceptance tests.
 
+The smoke rejects `/`, the owner HOME, arbitrary non-Git directories, and a
+Git subdirectory: `--worktree` must resolve exactly to a real Git worktree
+root. Before private-HOME creation it also rejects any root that overlaps the
+runtime, auth file or its parent, private-home parent, or resolved linked
+worktree `gitdir`/`commondir`. These checks make the supplied worktree the only
+ordinary `workspaceWrite` root; do not use a repository home or any directory
+that contains credentials or runtime files.
+
 For the pinned 1.11.0 `agent` profile, the exact tagged
 [AgentMode source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AgentMode.ts)
 sets `workspaceWrite`, `on-request`, and `auto_review`, with

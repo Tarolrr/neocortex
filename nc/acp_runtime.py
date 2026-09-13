@@ -456,6 +456,7 @@ def run_verified_ordinary_turn(*, runtime_root: Path, credential_file: Path,
 
     reject_inherited_redirection()
     runtime = inspect_runtime(runtime_root, profile=PROFILE)
+    _require_safe_ordinary_worktree(worktree, runtime.root, credential_file, private_parent)
     _require_private_parent_isolated(private_parent, worktree, runtime.root)
     home = prepare_private_home(credential_file, parent=private_parent,
                                 disallow_within=(worktree, runtime.root))
@@ -527,6 +528,67 @@ def _require_private_parent_isolated(parent: Path, worktree: Path, runtime: Path
     if any(_overlaps(parent, path) for path in forbidden):
         raise AcpRuntimeNotReady(
             "credential readiness error: private-home parent overlaps worktree, runtime, or repository")
+
+
+def _require_safe_ordinary_worktree(worktree: Path, runtime: Path,
+                                    credential_file: Path, private_parent: Path) -> None:
+    """Require the smoke write root to be a distinct, real Git worktree.
+
+    ``workspaceWrite`` makes this path the complete writable sandbox.  It must
+    therefore not be an owner home, the ACP runtime, credential material, or
+    Git's external linked-worktree metadata.  A plain existing directory is
+    deliberately insufficient: Git must identify it as its checkout root.
+    """
+    root = worktree.resolve()
+    if not root.is_absolute() or not root.is_dir():
+        raise AcpRuntimeNotReady("ordinary smoke readiness error: worktree must be an existing absolute directory")
+    # ``/`` and HOME are broad roots in themselves.  Their children are not
+    # inherently unsafe: owners commonly keep a distinct disposable worktree
+    # below HOME, so only the protected runtime/auth/private paths use a
+    # two-way containment check.
+    if root in (Path(root.anchor), Path.home().resolve()):
+        raise AcpRuntimeNotReady("ordinary smoke readiness error: worktree is a dangerous broad root")
+    dangerous = (runtime.resolve(), credential_file.resolve(),
+                 credential_file.resolve().parent, private_parent.resolve())
+    if any(_overlaps(root, protected) for protected in dangerous):
+        raise AcpRuntimeNotReady(
+            "ordinary smoke readiness error: worktree overlaps a broad, runtime, credential, or private-home path")
+
+    metadata = _worktree_git_metadata(root)
+    # A normal checkout owns .git below its root.  A linked checkout instead
+    # points outside it; never allow the writable root to include that shared
+    # gitdir or commondir (including when a caller supplied one directly).
+    own_dot_git = (root / ".git").resolve()
+    if any(_overlaps(root, path) and path != own_dot_git for path in metadata):
+        raise AcpRuntimeNotReady(
+            "ordinary smoke readiness error: worktree overlaps resolved Git metadata")
+    _require_git_worktree_root(root)
+
+
+def _require_git_worktree_root(worktree: Path) -> None:
+    """Use Git, with a sterile environment, to reject arbitrary directories."""
+    git = shutil.which("git", path=os.defpath)
+    if not git:
+        raise AcpRuntimeNotReady("ordinary smoke readiness error: Git is unavailable to verify worktree")
+    environment = {"PATH": os.defpath, "HOME": "/nonexistent", "LC_ALL": "C",
+                   "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                   "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        result = subprocess.run(
+            [git, "-C", str(worktree), "rev-parse", "--show-toplevel", "--is-inside-work-tree"],
+            env=environment, text=True, capture_output=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AcpRuntimeNotReady("ordinary smoke readiness error: Git could not verify worktree") from exc
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or len(lines) != 2 or lines[1] != "true":
+        raise AcpRuntimeNotReady("ordinary smoke readiness error: target is not a Git worktree")
+    try:
+        top_level = Path(lines[0]).resolve()
+    except OSError as exc:
+        raise AcpRuntimeNotReady("ordinary smoke readiness error: Git returned an invalid worktree root") from exc
+    if top_level != worktree:
+        raise AcpRuntimeNotReady("ordinary smoke readiness error: target must be the Git worktree root")
 
 
 def _worktree_git_metadata(worktree: Path) -> tuple[Path, ...]:

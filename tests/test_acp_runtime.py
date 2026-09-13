@@ -359,6 +359,65 @@ def test_private_parent_rejects_linked_worktree_common_gitdir(tmp_path: Path) ->
             common / "private-homes", worktree, tmp_path / "runtime")
 
 
+def _git_worktree(path: Path) -> Path:
+    subprocess.run(["git", "init", str(path)], check=True, capture_output=True, text=True)
+    return path
+
+
+def test_ordinary_smoke_requires_a_real_git_worktree(tmp_path: Path) -> None:
+    target = tmp_path / "arbitrary-directory"
+    target.mkdir()
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="not a Git worktree"):
+        acp_runtime._require_safe_ordinary_worktree(
+            target, tmp_path / "runtime",
+            tmp_path / "credentials" / "auth.json", tmp_path / "homes")
+
+
+@pytest.mark.parametrize("unsafe", ("runtime", "credential-parent", "private-parent"))
+def test_ordinary_smoke_rejects_runtime_and_credential_write_roots(
+        tmp_path: Path, unsafe: str) -> None:
+    runtime = tmp_path / "runtime"
+    credential = tmp_path / "credentials" / "auth.json"
+    private = tmp_path / "homes"
+    if unsafe == "runtime":
+        worktree = runtime
+    elif unsafe == "private-parent":
+        worktree = private
+    else:
+        worktree = credential.parent
+    worktree.mkdir(parents=True)
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="overlaps"):
+        acp_runtime._require_safe_ordinary_worktree(worktree, runtime, credential, private)
+
+
+@pytest.mark.parametrize("broad_root", (Path("/"), Path.home()))
+def test_ordinary_smoke_rejects_broad_roots_and_linked_git_metadata_overlap(
+        tmp_path: Path, broad_root: Path) -> None:
+    credential = tmp_path / "credentials" / "auth.json"
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="dangerous broad root"):
+        acp_runtime._require_safe_ordinary_worktree(
+            broad_root, tmp_path / "runtime", credential, tmp_path / "homes")
+
+    if broad_root != Path("/"):
+        return
+    # Simulate a malicious linked-worktree indirection whose gitdir is an
+    # ancestor of the requested writable root.  It must fail before Git would
+    # accept any caller-controlled directory as a smoke target.
+    worktree = tmp_path / "repository" / ".git" / "worktrees" / "linked"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: ..\n")
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="resolved Git metadata"):
+        acp_runtime._require_safe_ordinary_worktree(
+            worktree, tmp_path / "runtime", credential, tmp_path / "homes")
+
+
+def test_ordinary_smoke_accepts_distinct_git_worktree(tmp_path: Path) -> None:
+    worktree = _git_worktree(tmp_path / "worktree")
+    acp_runtime._require_safe_ordinary_worktree(
+        worktree, tmp_path / "runtime", tmp_path / "credentials" / "auth.json",
+        tmp_path / "homes")
+
+
 def test_private_home_is_explicit_and_cleanup_is_scoped(tmp_path):
     source = tmp_path / "auth.json"
     source.write_text(

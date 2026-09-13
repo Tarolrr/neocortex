@@ -109,7 +109,8 @@ def is_effective_completion(stop_reason: str | None, severities: Iterable[str]) 
     # AIR has no settled scheduler policy yet.  A decoded sessionFailure is
     # evidence of a provider condition, not evidence that the turn completed
     # successfully.  Keep this deliberately conservative until the mapping
-    # layer owns category/action policy.
+    # layer owns category/action policy.  The pure decoder separately retains
+    # canonical end_turn facts for recoverable warnings.
     return stop_reason == "end_turn" and not tuple(severities)
 
 

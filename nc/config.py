@@ -29,6 +29,10 @@ class Config:
         "critic": "gpt-6-astra",
     })
     adapters: dict[str, str] = field(default_factory=dict)
+    # Explicit owner opt-in for the pinned ACP transport.  These are paths,
+    # not credential values; bootstrap leaves both unset.
+    acp_runtime: str | None = None
+    acp_auth: str | None = None
     turn_timeout_s: int = 900
     preflight_timeout_s: int = 120
     max_consecutive_failures: int = 3

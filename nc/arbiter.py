@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,19 @@ class CheckResult:
     def render(self) -> str:
         status = "PASS" if self.ok else "FAIL"
         return f"[{status}] {self.command}\n{self.output.strip()[-1500:]}"
+
+
+@dataclass(frozen=True)
+class AdapterRequirement:
+    """One configured adapter's host capability.
+
+    ``executable`` is intentionally optional: a transport-backed adapter can
+    perform its own offline readiness inspection without making its configured
+    label a service-PATH command name.
+    """
+    label: str
+    executable: str | None = None
+    readiness: Callable[[], tuple[list[str], list[str]]] | None = None
 
 
 class MergeConflict(RuntimeError):
@@ -126,11 +140,22 @@ def _kill_group(proc: subprocess.Popen) -> None:
     proc.communicate()
 
 
-def host_requirements(adapter_clis: set[str]) -> tuple[list[str], list[str], str | None]:
-    """Resolve runner prerequisites using systemd's PATH, never login PATH."""
+def host_requirements(adapter_clis: Iterable[str | AdapterRequirement]) -> tuple[list[str], list[str], str | None]:
+    """Resolve runner prerequisites using systemd's PATH, never login PATH.
+
+    Strings retain the historical CLI-adapter behavior.  Capability objects
+    let a configured transport report readiness without being treated as an
+    executable just because it has an adapter label.
+    """
     reports, errors = [f"service PATH: {SERVICE_PATH}"], []
     resolved: dict[str, str] = {}
-    for name in ("python", "git", "sqlite3", "pytest", "ruff", *sorted(adapter_clis)):
+    requirements = [item if isinstance(item, AdapterRequirement)
+                    else AdapterRequirement(item, executable=item)
+                    for item in adapter_clis]
+    # One configured adapter may serve several roles. Run each label once.
+    requirements = list({item.label: item for item in requirements}.values())
+    executables = sorted({item.executable for item in requirements if item.executable})
+    for name in ("python", "git", "sqlite3", "pytest", "ruff", *executables):
         path = shutil.which(name, path=SERVICE_PATH)
         if path is None:
             errors.append(f"missing {name} on service PATH")
@@ -149,6 +174,15 @@ def host_requirements(adapter_clis: set[str]) -> tuple[list[str], list[str], str
                 errors.append(f"python must be Python 3.13 (found {text or 'unusable'})")
         except (OSError, subprocess.TimeoutExpired) as exc:
             errors.append(f"python cannot be executed: {exc}")
+    for requirement in sorted(requirements, key=lambda item: item.label):
+        if requirement.readiness is None:
+            continue
+        try:
+            ready_reports, ready_errors = requirement.readiness()
+            reports.extend(ready_reports)
+            errors.extend(ready_errors)
+        except RuntimeError as exc:  # Readiness must fail closed, not break doctor.
+            errors.append(f"{requirement.label} readiness check failed: {exc}")
     return reports, errors, resolved.get("python")
 
 

@@ -231,6 +231,28 @@ def test_host_requirements_reports_missing_python_launcher_and_tools(tmp_path, m
         assert f"missing {name} on service PATH" in errors
 
 
+def test_host_requirements_uses_transport_readiness_without_path_lookup(tmp_path, monkeypatch):
+    """A configured ACP label is a capability, never an executable name."""
+    service = tmp_path / "service-bin"
+    service.mkdir()
+    seen = []
+
+    def which(name, *, path):
+        seen.append((name, path))
+
+    monkeypatch.setattr(arbiter.shutil, "which", which)
+    monkeypatch.setattr(arbiter, "SERVICE_PATH", str(service))
+    requirement = arbiter.AdapterRequirement(
+        "codex-acp", readiness=lambda: (["codex-acp artifact/profile: ready"], []),
+    )
+
+    reports, errors, _ = arbiter.host_requirements([requirement])
+
+    assert "codex-acp artifact/profile: ready" in reports
+    assert "codex-acp" not in [name for name, _path in seen]
+    assert "missing codex-acp on service PATH" not in errors
+
+
 def test_run_checks_uses_private_tmpdir_and_removes_it(tmp_path):
     results = arbiter.run_checks(tmp_path, ['echo "$TMPDIR" > marker; touch "$TMPDIR/leftover"'])
     assert results[0].ok

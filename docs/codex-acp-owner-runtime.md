@@ -1,9 +1,20 @@
 # Owner procedure: isolated Codex ACP 1.11.0
 
 This is an opt-in preparation procedure, not an adapter rollout.  `nc` does
-not register ACP in `ADAPTERS`, add it to `arbiter.host_requirements`, alter
-bootstrap defaults, or launch it from the service.  In particular an adapter
-label in configuration is not treated as an executable name by this procedure.
+not register ACP in `ADAPTERS`, alter bootstrap defaults, or launch it from the
+service.  An owner may set an adapter label to `codex-acp` with absolute
+`acp_runtime` and `acp_auth` paths in `config.json`; ordinary `nc doctor` and
+scheduler host readiness then perform the same offline artifact/profile/auth
+checks.  The label is a transport capability, never an executable name on
+`SERVICE_PATH`.  CLI-backed adapters retain their existing PATH checks.
+
+```json
+{"adapter":"codex-acp","acp_runtime":"/srv/neocortex/acp-1.11.0","acp_auth":"/secure/auth.json"}
+```
+
+These fields hold only owner-selected paths. They do not enable a service
+transport or make ordinary doctor send a prompt; the explicit smoke below
+remains required before any later operational decision.
 
 ## Evidence and install
 

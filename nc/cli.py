@@ -19,6 +19,7 @@ from .acp_runtime import (
     reject_inherited_redirection,
     run_verified_ordinary_turn,
 )
+from .adapter_readiness import configured_requirements
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_identity, repository_lock
 from .scheduler import Scheduler
@@ -470,8 +471,7 @@ def cmd_preflight(args) -> int:
 def cmd_doctor(args) -> int:
     """Report host readiness even if opening the state database is impossible."""
     cfg = Config.load(args.home)
-    adapters = {cfg.adapter, *cfg.adapters.values()}
-    reports, errors, python = arbiter.host_requirements(adapters)
+    reports, errors, python = arbiter.host_requirements(configured_requirements(cfg))
     try:
         state = State(cfg.db_path)
         project = state.one("SELECT id, repo_path, test_cmd FROM project WHERE id=?", (args.project,))

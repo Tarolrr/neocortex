@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from . import arbiter, protocol, turn
+from .adapter_readiness import configured_requirements
 from .adapters import Adapter, assess_session, get_adapter, has_successful_terminal
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_lock
@@ -123,8 +124,7 @@ class Scheduler:
 
     def readiness(self) -> tuple[bool, str]:
         """Check host tools and each project's base checkout once per invocation."""
-        adapters = {self.cfg.adapter, *self.cfg.adapters.values()}
-        reports, errors, python = arbiter.host_requirements(adapters)
+        reports, errors, python = arbiter.host_requirements(configured_requirements(self.cfg))
         if not errors:
             for project in self.state.q("SELECT id, repo_path, test_cmd FROM project ORDER BY id"):
                 if not project["test_cmd"]:

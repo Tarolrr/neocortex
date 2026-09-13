@@ -121,6 +121,27 @@ def sched(cfg, state, script) -> Scheduler:
     return scheduler
 
 
+def test_scheduler_readiness_passes_acp_as_transport_capability(setup, monkeypatch):
+    cfg, state, _repo = setup
+    cfg.adapter = "codex-acp"
+    cfg.acp_runtime = "/secure/acp-runtime"
+    cfg.acp_auth = "/secure/auth.json"
+    received = []
+
+    def requirements(items):
+        received.extend(items)
+        return ["service PATH: fixture"], [], "/fixture/python"
+
+    monkeypatch.setattr("nc.scheduler.arbiter.host_requirements", requirements)
+
+    assert Scheduler(cfg, state).readiness() == (
+        True, "service PATH: fixture\nconfigured project test commands passed",
+    )
+    assert len(received) == 1
+    assert received[0].label == "codex-acp"
+    assert received[0].executable is None
+
+
 def test_accepted_task_is_merged_only_after_a_passing_critic(setup):
     cfg, state, repo = setup
     tid = state.add_task("neocortex", "add marker", "create marker.txt",

@@ -11,9 +11,11 @@ The owner obtains the exact published tarball for
 `@agentclientprotocol/codex-acp@1.11.0` from the [npm version document](https://registry.npmjs.org/@agentclientprotocol/codex-acp/1.11.0).
 Its SRI must be
 `sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ==`.
-The published manifest is the primary artifact evidence for its dependencies
-and Node `engines`; the installer records the *locally resolved* lock and
-`npm ls` receipt separately.  The tagged upstream [manifest](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/package.json)
+The published manifest is the primary artifact evidence for its dependencies;
+the published [Codex 0.153.4 version document](https://registry.npmjs.org/@openai/codex/0.153.4)
+states Node `>=16` and declares the platform optional packages. The installer
+records the *locally resolved* lock and `npm ls` receipt separately.  The
+tagged upstream [manifest](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/package.json)
 and [lockfile](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/package-lock.json)
 identify the intended Codex 0.153.4 and ACP SDK 1.4.0; the source lock is not
 substituted for a resolved installation.
@@ -35,7 +37,10 @@ with no ACP executable is expected and safe.
 
 ## Authentication boundary
 
-The isolated child has a newly created private HOME.  A future explicit owner
+The isolated child has a newly created private HOME.  Codex's
+[file-auth storage source](https://github.com/openai/codex/blob/main/codex-rs/login/src/auth/storage.rs)
+reads `auth.json` from `CODEX_HOME`; that is the source-backed boundary used
+here. A future explicit owner
 activation may use only `prepare_private_home(EXPLICIT_AUTH_JSON, parent=...)`:
 it checks and copies the owner-selected existing Codex `auth.json` with mode
 0600 into that HOME.  It does not run login, mutate or enumerate the original

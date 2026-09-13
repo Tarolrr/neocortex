@@ -494,14 +494,22 @@ def _valid_acp_process(process: dict[str, object]) -> bool:
     )
 
 
-def _sanitize_evidence(value: object) -> object:
-    """Redact every string in the diagnostic-only ACP audit envelope."""
+def _sanitize_evidence(value: object, field: str | None = None) -> object:
+    """Redact diagnostic leaves without changing ACP protocol facts.
+
+    The artifact is an evidence record, not a UI excerpt: correlation ids,
+    decoder fields and ordered AIR observations must survive byte-for-byte.
+    Only free-form diagnostic fields can contain secrets and are shortened for
+    the same reason as terminal diagnostics.
+    """
     if isinstance(value, str):
-        return sanitize_diagnostic(value)
+        return sanitize_diagnostic(value) if field in {
+            "shutdown", "diagnostic", "title", "details",
+        } else value
     if isinstance(value, list):
-        return [_sanitize_evidence(item) for item in value]
+        return [_sanitize_evidence(item, field) for item in value]
     if isinstance(value, dict):
-        return {key: _sanitize_evidence(item) for key, item in value.items()}
+        return {key: _sanitize_evidence(item, key) for key, item in value.items()}
     return value
 
 
@@ -586,7 +594,9 @@ class CodexAcpAdapter(Adapter):
                                    "result_kind": result_kind, "process": process,
                                    "prompt": prompt_fact,
                                    "usage": usage, "shutdown": shutdown}
-        evidence_path.write_text(json.dumps(_sanitize_evidence(payload), sort_keys=True))
+        # Do not sort/rewrite protocol maps: raw correlated observations retain
+        # their producer order; only explicitly diagnostic leaves are redacted.
+        evidence_path.write_text(json.dumps(_sanitize_evidence(payload)))
         exit_code = process.get("exit_code")
         return SessionResult(exit_code if isinstance(exit_code, int) else 1, log_path,
                              _acp_usage_total(usage),

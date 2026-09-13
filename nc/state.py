@@ -781,7 +781,8 @@ class State:
                                evidence_path: str | None = None) -> None:
         self.x(
             "UPDATE run SET exit_code=?, timed_out=?, terminal_category=?,"
-            " terminal_diagnostic=?, host_assessment=?, host_evidence_path=? WHERE id=?",
+            " terminal_diagnostic=?, host_assessment=?,"
+            " host_evidence_path=COALESCE(?, host_evidence_path) WHERE id=?",
             (exit_code, None if timed_out is None else int(timed_out), category,
              diagnostic[:1000], assessment, evidence_path, run_id),
         )

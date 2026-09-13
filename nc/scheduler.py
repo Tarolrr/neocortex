@@ -123,6 +123,9 @@ class Scheduler:
         if ok:
             return None
         # Preflight output is host diagnostics.  It has no task/agent effects.
+        # ACP's run-local typed facts must remain inspectable for *every*
+        # failed probe, not only categories currently deferred by policy.
+        typed_attempt = self._preflight_evidence_path is not None
         # A supported temporary terminal category is deferred by the timer;
         # unknown/permanent readiness failures retain the existing incident path.
         if self._preflight_category in {
@@ -135,6 +138,10 @@ class Scheduler:
                                                 self._preflight_evidence_path)
             log.warning("temporary %s preflight failure: %s", role, detail)
             return "deferred"
+        if typed_attempt:
+            self.state.record_preflight_attempt(
+                role, pair[0], pair[1], self._preflight_category or "local_error", detail,
+                None, self._preflight_usage, self._preflight_evidence_path)
         self.state.incident("preflight", detail)
         log.error("preflight failed: %s", detail)
         return "preflight_failed"

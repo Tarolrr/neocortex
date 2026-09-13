@@ -251,6 +251,8 @@ def _record_outcome_read_failure(state: State, run_id: int, result,
         run_id, exit_code=result.exit_code, timed_out=result.timed_out,
         category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
         assessment="FAILED",
+        evidence_path=(str(result.evidence_path)
+                       if getattr(result, "evidence_path", None) else None),
     )
 
 

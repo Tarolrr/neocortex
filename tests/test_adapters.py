@@ -1,6 +1,7 @@
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -471,6 +472,25 @@ def test_acp_evidence_paths_are_unique_for_shared_preflight_directory(tmp_path, 
     second = adapter.run("x", tmp_path, "two", tmp_path / "probe.log", 1)
     assert first.evidence_path != second.evidence_path
     assert first.evidence_path.exists() and second.evidence_path.exists()
+
+
+def test_acp_planner_never_launches_with_injected_ordinary_policy(tmp_path, monkeypatch):
+    """The ACP seam retains the Adapter advisory-policy boundary."""
+    seen = []
+
+    def ordinary(_cwd):
+        raise AssertionError("ordinary worker policy reached advisory launch")
+
+    def fake_turn(*_args, policy, **_kwargs):
+        seen.append(policy)
+        return SimpleNamespace(process={}, prompt_fact={},
+                               prompt=SimpleNamespace(kind="failed"), shutdown=None)
+
+    monkeypatch.setattr("nc.acp_client.run_codex_acp_turn", fake_turn)
+    adapter = AcpAdapter(["ignored"], object(), policy_factory=ordinary)
+    adapter.run_planner("plan", tmp_path, "m", tmp_path / "planner.log", 1)
+    assert len(seen) == 1
+    assert seen[0].kind == "restricted"
 
 
 @pytest.mark.parametrize("adapter", ["codex", "claude"])

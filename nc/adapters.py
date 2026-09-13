@@ -550,13 +550,17 @@ class CodexAcpAdapter(Adapter):
     name = "codex-acp"
 
     def __init__(self, command: list[str] | tuple[str, ...], launch: CodexAcpLaunchEvidence,
-                 policy_factory=None) -> None:
+                 policy_factory=None, restricted_policy_factory=None) -> None:
         self.command = tuple(command)
         self.launch = launch
         if policy_factory is None:
             from .acp_client import CodexAcpPolicy
             policy_factory = CodexAcpPolicy.ordinary
         self.policy_factory = policy_factory
+        if restricted_policy_factory is None:
+            from .acp_client import CodexAcpPolicy
+            restricted_policy_factory = CodexAcpPolicy.restricted
+        self.restricted_policy_factory = restricted_policy_factory
 
     def available(self) -> bool:
         # Launch evidence, not PATH discovery, authorizes this isolated adapter.
@@ -564,14 +568,17 @@ class CodexAcpAdapter(Adapter):
 
     def run(self, prompt: str, cwd: Path, model: str, log_path: Path,
             timeout_s: int) -> SessionResult:
-        return self._run(prompt, cwd, model, log_path, timeout_s)
+        return self._run(prompt, cwd, model, log_path, timeout_s, self.policy_factory)
 
     def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
                     timeout_s: int) -> SessionResult:
-        return self._run(prompt, cwd, model, log_path, timeout_s)
+        # Advisory sessions must never inherit the ordinary worker policy,
+        # even when a caller injects one for worker transport tests.
+        return self._run(prompt, cwd, model, log_path, timeout_s,
+                         self.restricted_policy_factory)
 
     def _run(self, prompt: str, cwd: Path, model: str, log_path: Path,
-             timeout_s: int) -> SessionResult:
+             timeout_s: int, policy_factory) -> SessionResult:
         # The caller gives every invocation its own log directory.  Include a
         # nonce nevertheless: preflight probes share a parent and each row
         # must retain its own immutable evidence reference.
@@ -580,7 +587,7 @@ class CodexAcpAdapter(Adapter):
         try:
             from .acp_client import run_codex_acp_turn
             turn = run_codex_acp_turn(self.command, launch=self.launch,
-                                      policy=self.policy_factory(cwd), model=model, prompt=prompt,
+                                      policy=policy_factory(cwd), model=model, prompt=prompt,
                                       log_path=log_path, timeout_s=timeout_s)
             process, prompt_fact = dict(turn.process), dict(turn.prompt_fact)
             usage = prompt_fact.get("usage") if isinstance(prompt_fact.get("usage"), dict) else None

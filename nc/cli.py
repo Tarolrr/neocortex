@@ -12,7 +12,12 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from . import arbiter, backup_worker, operations, protocol
-from .acp_runtime import AcpRuntimeNotReady, credential_readiness, inspect_runtime, reject_inherited_redirection
+from .acp_runtime import (
+    AcpRuntimeNotReady,
+    credential_readiness,
+    inspect_runtime,
+    reject_inherited_redirection,
+)
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_identity, repository_lock
 from .scheduler import Scheduler

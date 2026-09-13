@@ -14,7 +14,11 @@ Its SRI must be
 The published manifest is the primary artifact evidence for its dependencies;
 the published [Codex 0.153.4 version document](https://registry.npmjs.org/@openai/codex/0.153.4)
 states Node `>=16` and declares the platform optional packages. The installer
-records the *locally resolved* lock and `npm ls` receipt separately.  The
+uses the reviewed `scripts/codex_acp_runtime.lock.json` with `npm ci`; it never
+generates a lock during installation. That lock contains exact resolved URLs
+and SRI entries, including both published Linux packages
+`0.153.4-linux-x64` and `0.153.4-linux-arm64`. The installer selects and
+checks only the host package. It records `npm ls` separately. The
 tagged upstream [manifest](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/package.json)
 and [lockfile](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/package-lock.json)
 identify the intended Codex 0.153.4 and ACP SDK 1.4.0; the source lock is not
@@ -32,7 +36,7 @@ Linux amd64/arm64, missing matching `@openai/codex-linux-{x64,arm64}`, missing
 resolved ACP/Codex/SDK versions, or a launcher outside the runtime.  It does
 not reuse or update the global bootstrap Codex 0.86.0.  `verify` redoes the
 inspection immediately before any future launch and returns an evidence object
-bound to `/srv/.../bin/codex-acp`, not `codex` on PATH.  Thus a service PATH
+bound to `/srv/.../node_modules/.bin/codex-acp`, not `codex` on PATH.  Thus a service PATH
 with no ACP executable is expected and safe.
 
 ## Authentication boundary
@@ -40,8 +44,8 @@ with no ACP executable is expected and safe.
 The isolated child has a newly created private HOME.  Codex's
 [file-auth storage source](https://github.com/openai/codex/blob/main/codex-rs/login/src/auth/storage.rs)
 reads `auth.json` from `CODEX_HOME`; that is the source-backed boundary used
-here. A future explicit owner
-activation may use only `prepare_private_home(EXPLICIT_AUTH_JSON, parent=...)`:
+here. The explicit `nc acp-ordinary-smoke` opt-in uses only
+`prepare_private_home(EXPLICIT_AUTH_JSON, parent=...)`:
 it checks and copies the owner-selected existing Codex `auth.json` with mode
 0600 into that HOME.  It does not run login, mutate or enumerate the original
 credential store, record credential values, or copy config.  This is a
@@ -60,12 +64,20 @@ boundary; credentials are never printed in diagnostics or receipts.
 ## Explicit smoke and behavior
 
 Only after offline doctor is green may an owner deliberately perform a
-noninteractive, charged handshake smoke with the exact configured model.  It
-must call `inspect_runtime`, prepare/clean the private HOME in `finally`, pass
-the returned absolute command and evidence to the isolated client, and record
-only outcome/process evidence.  That operation, model/network usability, and
-live sandbox enforcement are intentionally not performed by `nc doctor` or
-acceptance tests.
+noninteractive, charged handshake smoke with the exact configured model:
+
+```sh
+nc acp-ordinary-smoke --runtime /srv/neocortex/acp-1.11.0 --auth /secure/auth.json \
+  --private-parent /secure/nc-acp-homes --worktree /srv/project-worktree \
+  --model EXACT_MODEL --prompt 'write and verify the smoke marker' --log /secure/acp-smoke.log
+```
+
+This is the implemented ordinary-role opt-in, not adapter registration and not
+an adapter-name executable lookup. It inspects the runtime again, prepares and
+cleans the same private HOME for auth and enforced config in `finally`, and
+passes only the verified absolute command/evidence to the client. That
+operation, model/network usability, and live sandbox enforcement are
+intentionally not performed by `nc doctor` or acceptance tests.
 
 For the pinned `agent` profile, source-backed settings are `workspaceWrite`,
 `on-request`, and `auto_review`, with network and public web disabled.  A

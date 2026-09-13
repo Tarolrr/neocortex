@@ -520,7 +520,8 @@ def _process_fact(child: AcpSubprocess, timed_out: bool,
 def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence,
                        policy: CodexAcpPolicy, model: str, prompt: str,
                        log_path: Path, timeout_s: float = 60,
-                       environment: Mapping[str, str] | None = None) -> CodexAcpTurn:
+                       environment: Mapping[str, str] | None = None,
+                       private_home: Path | None = None) -> CodexAcpTurn:
     """Run the pinned initialize/new/configure/prompt sequence once.
 
     ``launch`` is the verified codex-acp 1.11.0 artifact/dependency evidence
@@ -539,7 +540,13 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
                                     log_path=str(log_path))
         launch.validate_for(command, _mode_for(policy))
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        config_home = Path(tempfile.mkdtemp(prefix="nc-acp-codex-", dir=log_path.parent))
+        # The explicit owner opt-in supplies a fresh private home containing
+        # only a copied auth.json.  Config is written into that same home so
+        # CODEX_HOME cannot point at a credential-free sibling directory.
+        config_home = (private_home.resolve() if private_home is not None else
+                       Path(tempfile.mkdtemp(prefix="nc-acp-codex-", dir=log_path.parent)))
+        if private_home is not None and not (config_home / ".codex" / "auth.json").is_file():
+            raise AcpClientRejected("private ACP home has no prepared auth.json", log_path=str(log_path))
         _write_pinned_config(policy, config_home)
     except BaseException as exc:
         exc.evidence = getattr(exc, "evidence", AcpTurnEvidence(

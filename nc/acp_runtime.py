@@ -27,6 +27,7 @@ VERSION = "1.11.0"
 INTEGRITY = "sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ=="
 CODEX_VERSION = "0.153.4"
 SDK_VERSION = "1.4.0"
+PROFILE = "agent"
 _PROTECTED = frozenset(("CODEX_PATH", "CODEX_CONFIG", "CODEX_HOME", "HOME",
                         "XDG_CONFIG_HOME", "XDG_DATA_HOME", "INITIAL_AGENT_MODE"))
 _INHERITED_REDIRECTION = frozenset(("CODEX_PATH", "CODEX_CONFIG", "CODEX_HOME",
@@ -59,6 +60,11 @@ def _package_version(path: Path, expected: str, label: str) -> None:
     value = _json(path / "package.json")
     if value.get("version") != expected:
         raise AcpRuntimeNotReady(f"{label} version is not pinned at {expected}")
+
+
+def _platform_package_version(path: Path, arch: str) -> None:
+    """The published platform packages deliberately carry a suffixed version."""
+    _package_version(path, f"{CODEX_VERSION}-linux-{arch}", f"Codex linux-{arch} binary")
 
 
 def _host_platform() -> tuple[str, str]:
@@ -102,7 +108,12 @@ def _verify_installed_tree(root: Path) -> None:
         if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise AcpRuntimeNotReady("installed dependency tree was modified")
         expected.add(path)
-    actual = {path.resolve() for path in (root / "node_modules").rglob("*") if path.is_file()}
+    # npm's .bin entries are symlinks.  They are deliberately covered by the
+    # separate launcher receipt, while this receipt covers installed files.
+    actual = {
+        path.resolve() for path in (root / "node_modules").rglob("*")
+        if path.is_file() and ".bin" not in path.relative_to(root / "node_modules").parts
+    }
     if expected != actual:
         raise AcpRuntimeNotReady("installed dependency tree has unexpected files")
 
@@ -125,6 +136,8 @@ def inspect_runtime(root: Path, *, profile: str = "agent") -> CodexAcpRuntime:
     tarball are independently checked here at every prospective launch.
     """
     root = root.resolve()
+    if profile != PROFILE:
+        raise AcpRuntimeNotReady("unsupported ACP profile; only the pinned agent profile is available")
     host, node_arch = _host_platform()
     receipt = _json(root / "receipt.json")
     if receipt.get("package") != PACKAGE or receipt.get("version") != VERSION:
@@ -141,8 +154,10 @@ def inspect_runtime(root: Path, *, profile: str = "agent") -> CodexAcpRuntime:
     # Codex has a platform optional package; its absence is not portable and
     # must not defer a failure to a later production launch.
     binary_package = modules / "@openai" / f"codex-linux-{node_arch}"
-    _package_version(binary_package, CODEX_VERSION, f"Codex {host} binary")
-    command = root / "bin" / "codex-acp"
+    _platform_package_version(binary_package, node_arch)
+    # npm creates this shim for a package bin.  It is intentionally an
+    # absolute, installed artifact path rather than a PATH lookup.
+    command = modules / ".bin" / "codex-acp"
     if not command.is_file() or not os.access(command, os.X_OK):
         raise AcpRuntimeNotReady("verified absolute codex-acp launcher is missing or not executable")
     resolved = command.resolve()
@@ -155,6 +170,29 @@ def inspect_runtime(root: Path, *, profile: str = "agent") -> CodexAcpRuntime:
         profile=profile,
     )
     return CodexAcpRuntime(root, command, host, evidence)
+
+
+def run_verified_ordinary_turn(*, runtime_root: Path, credential_file: Path,
+                               private_parent: Path, worktree: Path, model: str,
+                               prompt: str, log_path: Path, timeout_s: float = 60):
+    """The sole explicit ordinary-role opt-in; never resolves an adapter label.
+
+    The generated HOME holds both the copied auth file and enforced config.
+    It is removed whether setup, launch, or ACP cleanup fails.
+    """
+    from .acp_client import CodexAcpPolicy, run_codex_acp_turn
+
+    reject_inherited_redirection()
+    runtime = inspect_runtime(runtime_root, profile=PROFILE)
+    home = prepare_private_home(credential_file, parent=private_parent)
+    try:
+        return run_codex_acp_turn(
+            runtime.evidence.command, launch=runtime.evidence,
+            policy=CodexAcpPolicy.ordinary(worktree), model=model, prompt=prompt,
+            log_path=log_path, timeout_s=timeout_s, private_home=home,
+        )
+    finally:
+        cleanup_private_home(home, expected_parent=private_parent)
 
 
 def reject_inherited_redirection(environment: Mapping[str, str] | None = None) -> None:

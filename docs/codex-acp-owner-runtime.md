@@ -39,9 +39,12 @@ The command rejects an existing directory, a bad tarball, anything other than
 Linux amd64/arm64, missing matching `@openai/codex-linux-{x64,arm64}`, missing
 resolved ACP/Codex/SDK versions, or a launcher outside the runtime.  It does
 not reuse or update the global bootstrap Codex 0.86.0.  Before `npm ci`, it
-also reads the executing `node` version and rejects anything below the
-published Codex requirement of Node `>=16` (npm engine warnings are not
-accepted as a successful install).  The published Linux packages contain the
+validates the reviewed non-development graph's effective floor: its exact
+[`open@11.0.1` published manifest](https://registry.npmjs.org/open/11.0.1)
+has `engines.node: >=20`, so it rejects Node
+below 20 even though Codex's own published manifest says `>=16`. npm engine
+warnings are not accepted as a successful install. It records the resolved,
+absolute Node executable, version, and digest. The published Linux packages contain the
 native executables at `vendor/x86_64-unknown-linux-musl/bin/codex` (amd64) and
 `vendor/aarch64-unknown-linux-musl/bin/codex` (arm64), rather than a generic
 `bin/codex`; installation and verification require that exact host path.
@@ -51,8 +54,11 @@ inspection immediately before any future launch: it hashes the installed
 matching reviewed-lock SRI/version entries for ACP, Codex, SDK, and the
 selected platform package. Runtime-local receipts are tree-mutation
 tripwires, not the trust anchor. It returns an evidence object
-bound to `/srv/.../node_modules/.bin/codex-acp`, not `codex` on PATH.  Thus a service PATH
-with no ACP executable is expected and safe.
+bound to that install-recorded absolute Node plus the authenticated
+`dist/index.js` entry point. It does not execute the `.bin` shim, because its
+`/usr/bin/env node` shebang would select Node from service PATH. Thus a service
+PATH with no ACP executable (or no `node`) is expected and safe after the
+absolute interpreter is verified again at launch.
 
 ## Authentication boundary
 
@@ -130,11 +136,12 @@ scripts/codex_acp_runtime.sh rollback /srv/neocortex/acp-1.11.0
 Rollback intentionally does not require launch verification: it is the
 recovery path for an interrupted install or a runtime whose dependency,
 binary, cache, or receipt has been damaged.  It resolves the supplied existing
-directory, rejects `/` and the current worktree, and requires either the
-byte-identical committed reviewed lock or the exact SRI-checked ACP tarball
-inside that directory.  A receipt by itself cannot authorize deletion.  Thus
-an arbitrary or crafted directory is refused, while a partial or tampered
-pinned layout can be removed at the idle boundary.
+directory, rejects `/` and the current worktree, and requires the private,
+mode-restricted install identity created at that exact absolute location by
+`install` (including its owner UID). A reviewed lock or tarball is public and
+cannot authorize deletion; copying either into an unrelated directory is
+refused. The identity is written before fallible installation steps, so a
+partial install left by interruption can still be removed at the idle boundary.
 
 No test installs npm packages, touches credentials, invokes a real model, or
 claims amd64/arm64/sandbox/auth behavior has been live verified.

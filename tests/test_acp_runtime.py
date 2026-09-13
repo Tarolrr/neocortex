@@ -44,13 +44,17 @@ done
     printf '#!/bin/sh\\n' > "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/vendor/$triple/bin/codex"
     chmod +x "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/vendor/$triple/bin/codex"
 """)
-    _stub_executable(tools / "node", """
+    node = tools / "node"
+    node.write_text("""#!/bin/sh
 case "$*" in
+  *--version*) printf '%s\\n' v20.19.0;;
   *process.versions.node*) printf '%s' "${ACP_TEST_NODE_VERSION:-20.19.0}";;
+  *node_modules/open*) printf 20;;
   *codex-acp*) printf 1.11.0;; *'@openai/codex/package.json'*) printf 0.153.4;;
   *sdk/package.json*) printf 1.4.0;; *codex-linux-*) printf '0.153.4-linux-%s' "$ACP_TEST_ARCH";; *) exit 0;;
 esac
 """)
+    node.chmod(0o700)
     runtime = tmp_path / "runtime"
     script = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.sh"
     environment = os.environ | {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
@@ -63,7 +67,7 @@ esac
     monkeypatch.setattr(acp_runtime, "_verify_tarball", lambda _root: None)
     monkeypatch.setattr(acp_runtime, "_verify_sri_derived_contents", lambda *_args: None)
     inspected = acp_runtime.inspect_runtime(runtime)
-    assert inspected.evidence.command == (str(launcher),)
+    assert inspected.evidence.command == (str(node.resolve()), str(launcher.resolve()))
 
 
 def runtime_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, arch: str = "x64") -> Path:
@@ -77,10 +81,12 @@ def runtime_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, arch: str =
         path = root / "node_modules" / package
         path.mkdir(parents=True, exist_ok=True)
         (path / "package.json").write_text('{"version": "' + version + '"}')
+    entrypoint = root / "node_modules" / "@agentclientprotocol" / "codex-acp" / "dist" / "index.js"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("console.log('fixture')\n")
     command = root / "node_modules" / ".bin" / "codex-acp"
     command.parent.mkdir(parents=True)
-    command.write_text("#!/bin/sh\n")
-    command.chmod(0o700)
+    command.symlink_to("../@agentclientprotocol/codex-acp/dist/index.js")
     binary = acp_runtime._platform_binary(
         root / "node_modules" / "@openai" / f"codex-linux-{arch}", arch)
     binary.parent.mkdir(parents=True)
@@ -88,6 +94,12 @@ def runtime_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, arch: str =
     binary.chmod(0o700)
     (root / "launcher.sha256").write_text(
         acp_runtime.hashlib.sha256(command.read_bytes()).hexdigest() + "  node_modules/.bin/codex-acp\n")
+    node = tmp_path / "absolute-node"
+    node.write_text("#!/bin/sh\n[ \"$1\" = --version ] && printf '%s\\n' v20.19.0\n")
+    node.chmod(0o700)
+    (root / "node.json").write_text(
+        '{"path":"' + str(node) + '","version":"20.19.0","sha256":"'
+        + hashlib.sha256(node.read_bytes()).hexdigest() + '","minimum_major":20}')
     (root / "receipt.json").write_text('{"package":"@agentclientprotocol/codex-acp","version":"1.11.0","integrity":"' + acp_runtime.INTEGRITY + '","platform":"linux-amd64"}')
     lines = []
     for path in sorted((root / "node_modules").rglob("*")):
@@ -103,10 +115,20 @@ def runtime_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, arch: str =
 def test_inspection_binds_absolute_command_and_detects_tree_tamper(tmp_path, monkeypatch):
     root = runtime_tree(tmp_path, monkeypatch)
     runtime = acp_runtime.inspect_runtime(root)
-    assert runtime.evidence.command == (str(root / "node_modules" / ".bin" / "codex-acp"),)
+    assert runtime.evidence.command == (
+        str(tmp_path / "absolute-node"),
+        str(root / "node_modules" / "@agentclientprotocol" / "codex-acp" / "dist" / "index.js"),
+    )
     (root / "node_modules" / "@openai" / "codex" / "package.json").write_text("tampered")
     with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="modified"):
         acp_runtime.inspect_runtime(root)
+
+
+def test_public_inspected_launch_command_ignores_service_path(tmp_path, monkeypatch):
+    runtime = acp_runtime.inspect_runtime(runtime_tree(tmp_path, monkeypatch))
+    result = subprocess.run(runtime.evidence.command, env={"PATH": "/nonexistent"},
+                            text=True, capture_output=True, check=False)
+    assert result.returncode == 0
 
 
 def test_inspection_accepts_actual_arm64_platform_artifact(tmp_path, monkeypatch):
@@ -136,7 +158,7 @@ def test_inspection_rejects_legacy_nonpublished_platform_binary_layout(tmp_path,
         acp_runtime.inspect_runtime(root)
 
 
-def test_owner_installer_rejects_node_older_than_pinned_requirement(tmp_path, monkeypatch):
+def test_owner_installer_rejects_node_18_for_locked_transitive_open_engine(tmp_path, monkeypatch):
     source = tmp_path / "source" / "package"
     (source / "dist").mkdir(parents=True)
     (source / "package.json").write_text('{"version":"1.11.0"}')
@@ -148,7 +170,15 @@ def test_owner_installer_rejects_node_older_than_pinned_requirement(tmp_path, mo
     tools.mkdir()
     _stub_executable(tools / "openssl", "printf x")
     _stub_executable(tools / "base64", "cat >/dev/null\nprintf '%s' 'opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ=='")
-    _stub_executable(tools / "node", "printf '%s' 15.0.0")
+    # The root Codex manifest says >=16; this fixture proves the installer
+    # also enforces the reviewed non-dev open@11.0.1 engines.node >=20 floor.
+    _stub_executable(tools / "node", """
+case "$*" in
+  *process.versions.node*) printf '%s' 18.19.0;;
+  *node_modules/open*) printf '%s' 20;;
+  *) exit 0;;
+esac
+""")
     _stub_executable(tools / "npm", "exit 99")
     runtime = tmp_path / "runtime"
     script = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.sh"
@@ -156,7 +186,7 @@ def test_owner_installer_rejects_node_older_than_pinned_requirement(tmp_path, mo
     result = subprocess.run([str(script), "install", str(runtime), str(tarball)],
                             env=environment, text=True, capture_output=True, check=False)
     assert result.returncode != 0
-    assert "requires Node >=16" in result.stderr
+    assert "requires Node >=20" in result.stderr
     assert not runtime.exists()
 
 
@@ -169,7 +199,19 @@ def test_owner_rollback_refuses_a_crafted_receipt_directory(tmp_path: Path) -> N
                             capture_output=True, check=False)
     assert result.returncode != 0
     assert runtime.exists()
-    assert "lacks a reviewed pinned runtime input" in result.stderr
+    assert "not an owner-established" in result.stderr
+
+
+def test_owner_rollback_refuses_copied_reviewed_lock(tmp_path: Path) -> None:
+    runtime = tmp_path / "unrelated"
+    runtime.mkdir()
+    (runtime / "package-lock.json").write_bytes(acp_runtime._REVIEWED_LOCK.read_bytes())
+    script = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.sh"
+    result = subprocess.run([str(script), "rollback", str(runtime)], text=True,
+                            capture_output=True, check=False)
+    assert result.returncode != 0
+    assert runtime.exists()
+    assert "not an owner-established" in result.stderr
 
 
 @pytest.mark.parametrize("damage", ["tampered-dependency", "partial-install"])
@@ -184,6 +226,10 @@ def test_owner_rollback_removes_damaged_or_partial_pinned_layout(
         runtime = tmp_path / "partial-runtime"
         runtime.mkdir()
         (runtime / "package-lock.json").write_bytes(acp_runtime._REVIEWED_LOCK.read_bytes())
+    runtime.chmod(0o700)
+    (runtime / ".nc-acp-owner-install.json").write_text(
+        f"runtime={runtime.resolve()}\nuid={os.getuid()}\nformat=1\n")
+    (runtime / ".nc-acp-owner-install.json").chmod(0o600)
     script = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.sh"
     result = subprocess.run([str(script), "rollback", str(runtime)], text=True,
                             capture_output=True, check=False)

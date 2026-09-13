@@ -15,6 +15,7 @@ import os
 import platform
 import shutil
 import stat
+import subprocess
 import tarfile
 import tempfile
 from collections.abc import Mapping
@@ -29,6 +30,7 @@ INTEGRITY = "sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKOD
 CODEX_VERSION = "0.153.4"
 SDK_VERSION = "1.4.0"
 PROFILE = "agent"
+NODE_MINIMUM_MAJOR = 20
 _REVIEWED_LOCK_SHA256 = "ef7a28b18ecec377058926838c4637231ba6e3d7b1e8463d66a5acacd609d69d"
 _REVIEWED_LOCK = Path(__file__).resolve().parents[1] / "scripts" / "codex_acp_runtime.lock.json"
 _PROTECTED = frozenset(("CODEX_PATH", "CODEX_CONFIG", "CODEX_HOME", "HOME",
@@ -45,6 +47,7 @@ class AcpRuntimeNotReady(RuntimeError):
 class CodexAcpRuntime:
     root: Path
     command: Path
+    node: Path
     platform: str
     evidence: CodexAcpLaunchEvidence
 
@@ -352,6 +355,37 @@ def _verify_launcher(root: Path, command: Path) -> None:
         raise AcpRuntimeNotReady("verified ACP launcher was modified")
 
 
+def _verified_node(root: Path) -> Path:
+    """Return the install-bound Node interpreter, never a PATH lookup."""
+    receipt = _json(root / "node.json")
+    raw_path = receipt.get("path")
+    recorded_version = receipt.get("version")
+    digest = receipt.get("sha256")
+    if (not isinstance(raw_path, str) or not raw_path.startswith("/")
+            or not isinstance(recorded_version, str) or not isinstance(digest, str)
+            or receipt.get("minimum_major") != NODE_MINIMUM_MAJOR):
+        raise AcpRuntimeNotReady("Node interpreter receipt is missing or malformed")
+    node = Path(raw_path).resolve()
+    if not node.is_file() or not os.access(node, os.X_OK):
+        raise AcpRuntimeNotReady("install-bound Node interpreter is missing or not executable")
+    if hashlib.sha256(node.read_bytes()).hexdigest() != digest:
+        raise AcpRuntimeNotReady("install-bound Node interpreter was modified")
+    try:
+        version = subprocess.run((str(node), "--version"), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 text=True, check=True, timeout=5,
+                                 env={"PATH": "/nonexistent"}).stdout.strip().removeprefix("v")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AcpRuntimeNotReady("install-bound Node interpreter cannot be executed") from exc
+    try:
+        major = int(version.split(".", 1)[0])
+    except ValueError as exc:
+        raise AcpRuntimeNotReady("install-bound Node interpreter returned an invalid version") from exc
+    if version != recorded_version or major < NODE_MINIMUM_MAJOR:
+        raise AcpRuntimeNotReady("install-bound Node interpreter does not meet reviewed Node >=20 requirement")
+    return node
+
+
 def inspect_runtime(root: Path, *, profile: str = "agent") -> CodexAcpRuntime:
     """Inspect an installed runtime, refusing PATH and lockfile assertions.
 
@@ -379,25 +413,30 @@ def inspect_runtime(root: Path, *, profile: str = "agent") -> CodexAcpRuntime:
     # must not defer a failure to a later production launch.
     binary_package = modules / "@openai" / f"codex-linux-{node_arch}"
     _platform_package_version(binary_package, node_arch)
-    # npm creates this shim for a package bin.  It is intentionally an
-    # absolute, installed artifact path rather than a PATH lookup.
-    command = modules / ".bin" / "codex-acp"
-    if not command.is_file() or not os.access(command, os.X_OK):
+    # npm's shim has ``#!/usr/bin/env node`` and would therefore reintroduce
+    # service-PATH selection.  Authenticate it for tree integrity, but launch
+    # its JS entry point with the recorded absolute Node interpreter instead.
+    launcher = modules / ".bin" / "codex-acp"
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
         raise AcpRuntimeNotReady("verified absolute codex-acp launcher is missing or not executable")
-    resolved = command.resolve()
+    resolved = launcher.resolve()
     if root not in resolved.parents:
         raise AcpRuntimeNotReady("codex-acp launcher resolves outside isolated runtime")
-    _verify_launcher(root, command)
+    _verify_launcher(root, launcher)
+    command = acp / "dist" / "index.js"
+    if command.resolve() != resolved or not command.is_file():
+        raise AcpRuntimeNotReady("codex-acp launcher does not resolve to its verified JS entry point")
+    node = _verified_node(root)
     binary = _platform_binary(binary_package, node_arch)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise AcpRuntimeNotReady("selected Codex platform binary is missing or not executable")
     evidence = _inspected_launch_evidence(
-        command=(str(command),), package=PACKAGE, package_version=VERSION,
+        command=(str(node), str(command)), package=PACKAGE, package_version=VERSION,
         artifact_integrity=INTEGRITY, codex_version=CODEX_VERSION, sdk_version=SDK_VERSION,
         profile=profile, platform=host, binary_package=str(binary_package.resolve()),
         binary_resolution=str(binary.resolve()),
     )
-    return CodexAcpRuntime(root, command, host, evidence)
+    return CodexAcpRuntime(root, command, node, host, evidence)
 
 
 def run_verified_ordinary_turn(*, runtime_root: Path, credential_file: Path,

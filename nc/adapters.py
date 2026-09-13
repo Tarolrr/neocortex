@@ -486,7 +486,7 @@ def _valid_acp_process(process: dict[str, object]) -> bool:
             or not isinstance(process["stderr_available"], bool)):
         return False
     phases = process["timeout_phases"]
-    return isinstance(phases, list) and all(
+    return isinstance(phases, list) and (process["timed_out"] or not phases) and all(
         isinstance(phase, str) and phase in {
             "cancel_response", "session_close", "term_grace", "kill_grace",
         }
@@ -494,7 +494,8 @@ def _valid_acp_process(process: dict[str, object]) -> bool:
     )
 
 
-def _sanitize_evidence(value: object, field: str | None = None) -> object:
+def _sanitize_evidence(value: object, field: str | None = None,
+                       diagnostic: bool = False) -> object:
     """Redact diagnostic leaves without changing ACP protocol facts.
 
     The artifact is an evidence record, not a UI excerpt: correlation ids,
@@ -503,13 +504,16 @@ def _sanitize_evidence(value: object, field: str | None = None) -> object:
     the same reason as terminal diagnostics.
     """
     if isinstance(value, str):
-        return sanitize_diagnostic(value) if field in {
+        return sanitize_diagnostic(value) if diagnostic or field in {
             "shutdown", "diagnostic", "title", "details",
         } else value
     if isinstance(value, list):
-        return [_sanitize_evidence(item, field) for item in value]
+        return [_sanitize_evidence(item, field, diagnostic) for item in value]
     if isinstance(value, dict):
-        return {key: _sanitize_evidence(item, key) for key, item in value.items()}
+        # JSON-RPC error objects are provider diagnostics.  Unlike result and
+        # correlation fields, every string leaf in them may contain secrets.
+        return {key: _sanitize_evidence(item, key, diagnostic or field == "jsonrpc_error")
+                for key, item in value.items()}
     return value
 
 

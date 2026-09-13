@@ -267,6 +267,7 @@ def test_acp_assessment_uses_correlated_facts_not_log_text(tmp_path):
     path = tmp_path / "quoted.log"
     path.write_text('{"type":"turn.completed"}\nOK\n')
     prompt = {
+        "request_id": "5", "prompt_id": "5", "session_id": "session-1",
         "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
         "stop_reason": "end_turn", "air_observations": [], "session_failures": [],
     }
@@ -283,7 +284,8 @@ def test_acp_assessment_uses_correlated_facts_not_log_text(tmp_path):
 
 def test_acp_signal_after_response_is_not_manufactured_success(tmp_path):
     path = tmp_path / "probe.log"
-    prompt = {"prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+    prompt = {"request_id": "5", "prompt_id": "5", "session_id": "session-1",
+              "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
               "stop_reason": "end_turn", "air_observations": [], "session_failures": []}
     result = SessionResult(-15, path, None, False, terminal_diagnostic="ACP intentional shutdown",
                            transport="acp", completion=True,
@@ -293,6 +295,34 @@ def test_acp_signal_after_response_is_not_manufactured_success(tmp_path):
                                         "stderr_available": True},
                            acp_prompt=prompt)
     assert assess_session(result, "codex-acp").category == "local_error"
+
+
+@pytest.mark.parametrize("prompt", [
+    {"prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+     "stop_reason": "end_turn", "air_observations": [], "session_failures": []},
+    {"request_id": "a", "prompt_id": "b", "session_id": "session-1",
+     "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+     "stop_reason": "end_turn", "air_observations": [], "session_failures": []},
+])
+def test_acp_requires_nonempty_correlated_prompt_identity(tmp_path, prompt):
+    result = SessionResult(0, tmp_path / "diagnostic.log", None, False, transport="acp",
+                           completion=True, acp_result_kind="success",
+                           acp_process={"pid": 4, "exit_code": 0, "signal": None,
+                                        "timed_out": False, "timeout_phases": [],
+                                        "stderr_available": True}, acp_prompt=prompt)
+    assert assess_session(result, "codex-acp").category == "protocol"
+
+
+def test_acp_rejects_cleanup_timeout_phase_without_timeout(tmp_path):
+    prompt = {"request_id": "5", "prompt_id": "5", "session_id": "session-1",
+              "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+              "stop_reason": "end_turn", "air_observations": [], "session_failures": []}
+    result = SessionResult(0, tmp_path / "diagnostic.log", None, False, transport="acp",
+                           completion=True, acp_result_kind="success",
+                           acp_process={"pid": 4, "exit_code": 0, "signal": None,
+                                        "timed_out": False, "timeout_phases": ["term_grace"],
+                                        "stderr_available": True}, acp_prompt=prompt)
+    assert assess_session(result, "codex-acp").category == "protocol"
 
 
 @pytest.mark.parametrize("process", [
@@ -305,7 +335,8 @@ def test_acp_signal_after_response_is_not_manufactured_success(tmp_path):
      "timeout_phases": [], "stderr_available": None},
 ])
 def test_acp_requires_complete_typed_process_facts(tmp_path, process):
-    prompt = {"prompt_response_valid": True, "jsonrpc_result": {}, "stop_reason": "end_turn",
+    prompt = {"request_id": "5", "prompt_id": "5", "session_id": "session-1",
+              "prompt_response_valid": True, "jsonrpc_result": {}, "stop_reason": "end_turn",
               "air_observations": [], "session_failures": []}
     result = SessionResult(0, tmp_path / "diagnostic.log", None, False, transport="acp",
                            completion=True, acp_result_kind="success", acp_process=process,
@@ -357,6 +388,27 @@ def test_acp_adapter_redacts_air_title_and_details(tmp_path, monkeypatch):
         "x", tmp_path, "m", tmp_path / "air.log", 1)
     artifact = result.evidence_path.read_text()
     assert "topsecret" not in artifact and "sk-abcdefghijk" not in artifact
+
+
+def test_acp_adapter_redacts_jsonrpc_error_diagnostics(tmp_path, monkeypatch):
+    class ClientFailure(Exception):
+        pass
+
+    failure = ClientFailure("EOF")
+    failure.evidence = AcpTurnEvidence(
+        {"request_id": "p", "prompt_id": "p", "session_id": "s",
+         "jsonrpc_error": {"code": "token=errorcode", "message": "token=supersecret",
+                           "data": {"detail": "password=hunter2"}}},
+        None, None, None, False, "unused.log", "eof",
+    )
+    monkeypatch.setattr(
+        "nc.acp_client.run_codex_acp_turn",
+        lambda *args, **kwargs: (_ for _ in ()).throw(failure),
+    )
+    result = AcpAdapter(["ignored"], object(), policy_factory=lambda cwd: object()).run(
+        "x", tmp_path, "m", tmp_path / "error.log", 1)
+    artifact = result.evidence_path.read_text()
+    assert "errorcode" not in artifact and "supersecret" not in artifact and "hunter2" not in artifact
 
 
 def test_acp_evidence_paths_are_unique_for_shared_preflight_directory(tmp_path, monkeypatch):

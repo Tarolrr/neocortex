@@ -55,11 +55,20 @@ case "$*" in
 esac
 """)
     node.chmod(0o700)
+    inspected_call = tmp_path / "inspect-call"
+    _stub_executable(tools / "python3", """
+case "$*" in
+  *inspect_runtime*) printf '%s' "$*" > "$ACP_INSPECT_CALL";;
+  *) exit 97;;
+esac
+""")
     runtime = tmp_path / "runtime"
     script = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.sh"
     environment = os.environ | {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
-                                "ACP_TEST_ARCH": node_arch}
+                                "ACP_TEST_ARCH": node_arch,
+                                "ACP_INSPECT_CALL": str(inspected_call)}
     subprocess.run([str(script), "install", str(runtime), str(tarball)], check=True, env=environment)
+    assert "inspect_runtime" in inspected_call.read_text()
     launcher = runtime / "node_modules" / ".bin" / "codex-acp"
     assert launcher.is_symlink()
     assert launcher.resolve() == runtime / "node_modules" / "@agentclientprotocol" / "codex-acp" / "dist" / "index.js"
@@ -190,6 +199,35 @@ esac
                             env=environment, text=True, capture_output=True, check=False)
     assert result.returncode != 0
     assert "requires Node >=20" in result.stderr
+    assert not runtime.exists()
+
+
+def test_owner_installer_rejects_modified_reviewed_lock_before_npm(tmp_path: Path) -> None:
+    """An edited repository lock must never become npm's install input."""
+    source_script = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.sh"
+    source_lock = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.lock.json"
+    staged = tmp_path / "scripts"
+    staged.mkdir()
+    script = staged / source_script.name
+    script.write_text(source_script.read_text())
+    script.chmod(0o700)
+    (staged / source_lock.name).write_bytes(source_lock.read_bytes() + b"\n")
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    npm_called = tmp_path / "npm-called"
+    _stub_executable(tools / "npm", 'touch "$ACP_NPM_CALLED"')
+    runtime = tmp_path / "runtime"
+    tarball = tmp_path / "unused.tgz"
+    tarball.touch()
+    result = subprocess.run(
+        [str(script), "install", str(runtime), str(tarball)],
+        env=os.environ | {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                          "ACP_NPM_CALLED": str(npm_called)},
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "dependency lock was modified" in result.stderr
+    assert not npm_called.exists()
     assert not runtime.exists()
 
 

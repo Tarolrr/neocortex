@@ -8,6 +8,7 @@ readonly version='1.11.0'
 readonly integrity='sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ=='
 readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly reviewed_lock="$script_dir/codex_acp_runtime.lock.json"
+readonly reviewed_lock_sha256='ef7a28b18ecec377058926838c4637231ba6e3d7b1e8463d66a5acacd609d69d'
 readonly node_floor=20
 usage() { echo "usage: $0 install RUNTIME_DIR TARBALL | verify RUNTIME_DIR | rollback RUNTIME_DIR" >&2; exit 2; }
 [[ $# -ge 2 ]] || usage
@@ -21,6 +22,13 @@ case "$action" in
 install)
   [[ $# -eq 3 ]] || usage; tarball=$(realpath "$3")
   [[ ! -e "$runtime" ]] || { echo 'runtime already exists; choose a new idle-boundary directory' >&2; exit 1; }
+  # Authenticate the committed graph *before* npm reads it.  This is the same
+  # immutable lock trust anchor enforced by inspect_runtime at every launch;
+  # do not let a locally edited lock turn this into an arbitrary npm resolve.
+  test -f "$reviewed_lock" || { echo 'reviewed ACP lock is missing' >&2; exit 1; }
+  [[ "$(sha256sum "$reviewed_lock" | awk '{print $1}')" == "$reviewed_lock_sha256" ]] || {
+    echo 'reviewed ACP dependency lock was modified' >&2; exit 1;
+  }
   actual="sha512-$(openssl dgst -sha512 -binary "$tarball" | base64 -w0)"
   [[ "$actual" == "$integrity" ]] || { echo 'tarball integrity mismatch' >&2; exit 1; }
   mkdir -m 700 "$runtime"; trap 'rm -rf "$runtime"' ERR
@@ -37,7 +45,6 @@ install)
   # checked tarball.  npm ci deliberately does *not* install its root project,
   # so install its exact dependencies first, then unpack that verified root
   # artifact and create the same local bin link npm would create for it.
-  test -f "$reviewed_lock" || { echo 'reviewed ACP lock is missing' >&2; exit 1; }
   tar -xOf "$runtime/codex-acp-1.11.0.tgz" package/package.json > "$runtime/package.json"
   # npm only warns about engines by default.  Gate the executable that will
   # perform this exact install before it can create a successful receipt.
@@ -77,6 +84,13 @@ install)
     echo 'published Codex platform artifact lacks expected native binary' >&2; exit 1;
   }
   printf '{"package":"%s","version":"%s","integrity":"%s","platform":"%s"}\n' "$package" "$version" "$integrity" "$platform" > "$runtime/receipt.json"
+  # An install is not successful merely because npm produced directories or
+  # the headline versions match.  Run the exact use-time inspector now, so
+  # its lock, SRI/cache, tree, launcher, Node, platform, and receipt checks
+  # fail closed before this command can announce a usable runtime.
+  PYTHONPATH="$script_dir/..${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'from pathlib import Path; from nc.acp_runtime import inspect_runtime; import sys; print(inspect_runtime(Path(sys.argv[1])).command)' \
+    "$runtime"
   trap - ERR; echo "installed isolated $package@$version; run verify before explicit owner smoke";;
 verify)
   python -c 'from pathlib import Path; from nc.acp_runtime import inspect_runtime; import sys; r=inspect_runtime(Path(sys.argv[1])); print(r.command)' "$runtime";;

@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS run (
     timed_out  INTEGER,
     terminal_category TEXT,
     terminal_diagnostic TEXT,
-    host_assessment TEXT
+    host_assessment TEXT,
+    host_evidence_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_seq (
@@ -200,6 +201,8 @@ class State:
                 category TEXT NOT NULL,
                 diagnostic TEXT NOT NULL,
                 defer_until REAL,
+                usage INTEGER,
+                evidence_path TEXT,
                 created_at REAL NOT NULL
             )
         """)
@@ -235,8 +238,11 @@ class State:
             ("run", "terminal_category", "TEXT"),
             ("run", "terminal_diagnostic", "TEXT"),
             ("run", "host_assessment", "TEXT"),
+            ("run", "host_evidence_path", "TEXT"),
             ("run", "defer_until", "REAL"),
             ("preflight_attempt", "defer_until", "REAL"),
+            ("preflight_attempt", "usage", "INTEGER"),
+            ("preflight_attempt", "evidence_path", "TEXT"),
         ):
             known = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             if column not in known:
@@ -581,11 +587,13 @@ class State:
 
     def record_preflight_attempt(self, role: str, adapter: str, model: str,
                                  category: str, diagnostic: str,
-                                 defer_until: float | None = None) -> None:
+                                 defer_until: float | None = None, usage: int | None = None,
+                                 evidence_path: str | None = None) -> None:
         """Keep provider readiness failures observable without creating an incident."""
-        self.x("INSERT INTO preflight_attempt(role,adapter,model,category,diagnostic,defer_until,created_at)"
-               " VALUES(?,?,?,?,?,?,?)",
-               (role, adapter, model, category, diagnostic[:1000], defer_until, time.time()))
+        self.x("INSERT INTO preflight_attempt(role,adapter,model,category,diagnostic,defer_until,usage,evidence_path,created_at)"
+               " VALUES(?,?,?,?,?,?,?,?,?)",
+               (role, adapter, model, category, diagnostic[:1000], defer_until, usage,
+                evidence_path, time.time()))
 
     def complete_plan_review(self, review_id: int, proposal_id: int, spec: str,
                              run_id: int, findings: str, recommendation: str) -> bool:
@@ -769,12 +777,14 @@ class State:
 
     def record_host_assessment(self, run_id: int, *, exit_code: int | None,
                                timed_out: bool | None, category: str,
-                               diagnostic: str, assessment: str) -> None:
+                               diagnostic: str, assessment: str,
+                               evidence_path: str | None = None) -> None:
         self.x(
             "UPDATE run SET exit_code=?, timed_out=?, terminal_category=?,"
-            " terminal_diagnostic=?, host_assessment=? WHERE id=?",
+            " terminal_diagnostic=?, host_assessment=?,"
+            " host_evidence_path=COALESCE(?, host_evidence_path) WHERE id=?",
             (exit_code, None if timed_out is None else int(timed_out), category,
-             diagnostic[:1000], assessment, run_id),
+             diagnostic[:1000], assessment, evidence_path, run_id),
         )
 
     def incident(self, kind: str, detail: str) -> int:

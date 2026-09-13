@@ -12,10 +12,11 @@ import logging
 import sqlite3
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 from . import arbiter, protocol, turn
-from .adapters import Adapter, assess_session, get_adapter, has_successful_terminal
+from .adapters import Adapter, assess_session, get_adapter, has_successful_completion
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_lock
 from .state import State
@@ -36,6 +37,8 @@ class Scheduler:
         self._preflight_pairs: set[tuple[str, str]] = set()
         self._preflight_category: str | None = None
         self._preflight_diagnostic = ""
+        self._preflight_usage: int | None = None
+        self._preflight_evidence_path: str | None = None
         self._in_run = False
         self._preflight_role = "worker"
 
@@ -63,21 +66,30 @@ class Scheduler:
         if free_mb is not None and free_mb < self.cfg.min_free_mb:
             return False, f"only {free_mb} MB RAM available"
 
-        probe_dir = self.cfg.home / "preflight"
+        # A probe's evidence is retained by its attempt row.  It cannot share
+        # a fixed log/evidence filename with later adapter/model probes.
+        probe_dir = self.cfg.home / "preflight" / f"probe-{time.time_ns()}-{uuid.uuid4().hex}"
         probe_dir.mkdir(parents=True, exist_ok=True)
         model = self.cfg.model_for(role)
         result = adapter.run(
             "Reply with exactly: OK", probe_dir, model,
             probe_dir / "probe.log", self.cfg.preflight_timeout_s,
         )
+        self._preflight_usage = result.tokens
+        self._preflight_evidence_path = (str(result.evidence_path)
+                                         if result.evidence_path is not None else None)
         assessment = assess_session(result, adapter.name)
         self._preflight_category = assessment.category if assessment.failed else None
         self._preflight_diagnostic = assessment.diagnostic
-        text = result.log_path.read_text(errors="replace")
-        # Production adapters use machine streams: success is their final
-        # terminal event, rather than prose which could be tool output.
-        if assessment.failed or not has_successful_terminal(adapter.name, result.log_path):
-            tail = text.strip()[-500:]
+        # ACP completion is correlated typed evidence.  Its diagnostic log is
+        # deliberately optional and must not become a second protocol parser.
+        if assessment.failed or not has_successful_completion(result, adapter.name):
+            tail = ""
+            if result.transport != "acp":
+                try:
+                    tail = result.log_path.read_text(errors="replace").strip()[-500:]
+                except OSError:
+                    tail = "diagnostic log unavailable"
             return False, f"model {model} is not usable ({assessment.category}): {tail}"
         return True, f"model {model} responds, {free_mb} MB free"
 
@@ -90,6 +102,8 @@ class Scheduler:
         self._preflight_role = role
         self._preflight_category = None
         self._preflight_diagnostic = ""
+        self._preflight_usage = None
+        self._preflight_evidence_path = None
         self._preflight_pairs.add(pair)
         try:
             ok, detail = self.preflight()
@@ -103,10 +117,21 @@ class Scheduler:
                 return "preflight_failed"
             self._preflight_category = assessment.category
             self._preflight_diagnostic = assessment.diagnostic
-            ok, detail = False, f"model {pair[1]} is not usable ({assessment.category}): {assessment.diagnostic}"
+            ok, detail = False, (
+                f"model {pair[1]} is not usable ({assessment.category}): {assessment.diagnostic}"
+            )
         if ok:
+            # Typed ACP probes retain their independent evidence even on
+            # success; otherwise usage and host facts are orphaned artifacts.
+            if self._preflight_evidence_path is not None:
+                self.state.record_preflight_attempt(
+                    role, pair[0], pair[1], "success", detail, None,
+                    self._preflight_usage, self._preflight_evidence_path)
             return None
         # Preflight output is host diagnostics.  It has no task/agent effects.
+        # ACP's run-local typed facts must remain inspectable for *every*
+        # failed probe, not only categories currently deferred by policy.
+        typed_attempt = self._preflight_evidence_path is not None
         # A supported temporary terminal category is deferred by the timer;
         # unknown/permanent readiness failures retain the existing incident path.
         if self._preflight_category in {
@@ -114,9 +139,15 @@ class Scheduler:
         }:
             self.state.record_preflight_attempt(role, pair[0], pair[1],
                                                 self._preflight_category, detail,
-                                                self._defer_until(self._preflight_diagnostic))
+                                                self._defer_until(self._preflight_diagnostic),
+                                                self._preflight_usage,
+                                                self._preflight_evidence_path)
             log.warning("temporary %s preflight failure: %s", role, detail)
             return "deferred"
+        if typed_attempt:
+            self.state.record_preflight_attempt(
+                role, pair[0], pair[1], self._preflight_category or "local_error", detail,
+                None, self._preflight_usage, self._preflight_evidence_path)
         self.state.incident("preflight", detail)
         log.error("preflight failed: %s", detail)
         return "preflight_failed"

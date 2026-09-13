@@ -514,6 +514,7 @@ def _process_fact(child: AcpSubprocess, timed_out: bool,
         "timed_out": timed_out,
         "timeout_phases": list(timeout_phases),
         "stderr_available": bool(child.diagnostics),
+        "supervisor_terminated": child.supervisor_terminated,
     }
 
 
@@ -719,6 +720,15 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
                     prompt_fact["jsonrpc_error"] = retained_response["error"]
             if evidence.usage is not None:
                 prompt_fact["usage"] = evidence.usage
+            # The decoder reports whether the correlated terminal reply was
+            # canonical.  This bridge deliberately has a stricter completion
+            # surface: until AIR policy is mapped, any retained provider
+            # condition remains a conservative failed turn while retaining
+            # the canonical result and structured evidence for host review.
+            if decoded.kind == "success" and decoded.failures:
+                return AcpPromptResult("failed", decoded.stop_reason,
+                                       "ACP reported session failure",
+                                       decoded.failures, decoded.usage)
             return decoded
 
         try:

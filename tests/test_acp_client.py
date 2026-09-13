@@ -182,6 +182,9 @@ if scenario == "delayed_post_response_exit":
     time.sleep(.15); sys.exit(9)
 failure = {"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"warning","title":"retry","actions":["retry"]}
 if scenario == "warning": send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+if scenario == "warning_recovery":
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"progress"}}}})
 if scenario == "raw_extension":
     failure["providerExtension"] = {"nested": ["retained", {"shape": "exact"}]}
     send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
@@ -240,6 +243,13 @@ def test_fake_terminal_and_recoverable_evidence(tmp_path: Path, scenario: str, k
     assert turn.prompt.kind == kind
     if scenario in {"terminal", "warning"}:
         assert turn.prompt_fact["air_observations"]
+
+
+def test_fake_warning_progress_then_end_turn_is_recovered_success(tmp_path: Path) -> None:
+    turn = run(tmp_path, "warning_recovery")
+    assert turn.prompt.kind == "success"
+    assert turn.prompt_fact["air_observations"]
+    assert turn.prompt_fact["session_failures"] == []
 
 
 def test_fake_permission_is_denied_noninteractively(tmp_path: Path) -> None:

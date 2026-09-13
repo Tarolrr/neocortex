@@ -314,13 +314,12 @@ def test_acp_unexpected_signal_is_local_error_without_diagnostic_authority(tmp_p
     assert "unexpectedly" in assessment.diagnostic
 
 
-@pytest.mark.parametrize(("severity", "category", "actions"), [
-    ("warning", "service", ["retry"]),
-    ("error", "limit", ["new_session"]),
+@pytest.mark.parametrize(("severity", "category", "actions", "expected"), [
+    ("warning", "service", ["retry"], "protocol"),
+    ("error", "limit", ["new_session"], "unknown"),
 ])
-def test_acp_valid_air_failure_is_conservative_unknown_not_protocol_or_success(
-        tmp_path, severity, category, actions):
-    """AIR policy belongs to the later mapping task, not completion parsing."""
+def test_acp_valid_air_failure_respects_recovery_and_typed_policy(
+        tmp_path, severity, category, actions, expected):
     prompt = {
         "request_id": "5", "prompt_id": "5", "session_id": "session-1",
         "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
@@ -337,7 +336,19 @@ def test_acp_valid_air_failure_is_conservative_unknown_not_protocol_or_success(
                                         "stderr_available": True,
                                         "supervisor_terminated": False}, acp_prompt=prompt)
     assessment = assess_session(result, "codex-acp")
-    assert (assessment.status, assessment.category) == ("FAILED", "unknown")
+    assert assessment.category == expected
+
+
+def test_acp_recovered_warning_with_progress_is_host_success(tmp_path):
+    """The bridge clears recovered AIR from the active set, retaining raw audit data."""
+    warning = {"id": "air-1", "revision": 1, "category": "service", "severity": "warning",
+               "title": "recovered", "actions": ["retry"]}
+    result = _acp_air_result(tmp_path, [])
+    result.completion = True
+    result.acp_result_kind = "success"
+    assert result.acp_prompt is not None
+    result.acp_prompt["air_observations"] = [warning]
+    assert assess_session(result, "codex-acp").status == "SUCCESS"
 
 
 def _acp_air_result(tmp_path, failures, *, process=None):

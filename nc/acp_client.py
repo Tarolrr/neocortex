@@ -252,7 +252,8 @@ class _TurnEvidenceCollector:
             self._mark_raw_overflow("AIR decoder projection exceeds local limit")
             raise
         usage = _project_usage(update.get("usage")) if update.get("sessionUpdate") == "usage_update" else None
-        if air is None and usage is None:
+        progress = update.get("sessionUpdate") == "agent_message_chunk"
+        if air is None and usage is None and not progress:
             return
         projected: dict[str, object] = {}
         if air is not None:
@@ -271,6 +272,13 @@ class _TurnEvidenceCollector:
             # through the failure envelope beyond the published limit.
             self._add(record, raw_failure if raw_failure is not _MISSING
                       and _incident_belongs(raw_failure, self.prompt_id) else _MISSING)
+        elif progress:
+            # This carries no agent content; it is solely the structured
+            # recovery boundary for a preceding AIR warning.
+            self._add({"method": "session/update", "params": {
+                "sessionId": self.session_id,
+                "update": {"sessionUpdate": "agent_message_chunk"},
+            }})
 
     def prompt_response(self, value: object) -> None:
         if not isinstance(value, dict):
@@ -701,15 +709,44 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
             decoded = decode_acp_prompt_result(
                 decoder_wire, request_id=str(prompt_id), session_id=session_id,
             )
+            # A warning is no longer active only after independently
+            # structured agent progress *following* the AIR update.  Keep an
+            # unrecovered warning active despite its canonical decoder shape;
+            # raw AIR remains audit evidence in both cases.
+            def air_update(item: object) -> bool:
+                if not isinstance(item, dict) or item.get("method") != "session/update":
+                    return False
+                params = item.get("params")
+                return isinstance(params, dict) and _project_air(params.get("update")) is not None
+
+            def progress_update(item: object) -> bool:
+                if not isinstance(item, dict) or item.get("method") != "session/update":
+                    return False
+                params = item.get("params")
+                if not isinstance(params, dict) or params.get("sessionId") != session_id:
+                    return False
+                update = params.get("update")
+                return isinstance(update, dict) and update.get("sessionUpdate") == "agent_message_chunk"
+
+            last_air = max((index for index, item in enumerate(evidence.records) if air_update(item)),
+                           default=-1)
+            recovered_warning = any(
+                progress_update(item)
+                for item in evidence.records[last_air + 1:]
+            )
             prompt_fact = {
                 "request_id": str(prompt_id), "session_id": session_id, "prompt_id": str(prompt_id),
                 "prompt_response_valid": decoded.kind != "protocol_invalid",
                 "stop_reason": decoded.stop_reason, "air_observations": evidence.air_observations,
+                # Recovered warnings remain losslessly in ``air_observations``
+                # but are not active failures in the host-facing effective set.
                 "session_failures": [
                     {"id": item.incident_id, "revision": item.revision, "category": item.category,
                      "severity": item.severity, "title": item.title, "actions": list(item.actions),
                      **({"details": item.details} if item.details is not None else {})}
                     for item in decoded.failures
+                    if not (decoded.kind == "success" and recovered_warning
+                            and item.severity == "warning")
                 ],
             }
             retained_response = evidence.records[-1]
@@ -720,12 +757,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
                     prompt_fact["jsonrpc_error"] = retained_response["error"]
             if evidence.usage is not None:
                 prompt_fact["usage"] = evidence.usage
-            # The decoder reports whether the correlated terminal reply was
-            # canonical.  This bridge deliberately has a stricter completion
-            # surface: until AIR policy is mapped, any retained provider
-            # condition remains a conservative failed turn while retaining
-            # the canonical result and structured evidence for host review.
-            if decoded.kind == "success" and decoded.failures:
+            if decoded.kind == "success" and decoded.failures and not recovered_warning:
                 return AcpPromptResult("failed", decoded.stop_reason,
                                        "ACP reported session failure",
                                        decoded.failures, decoded.usage)

@@ -466,8 +466,10 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
     # particular, do not use titles, details, stderr, or an apparent live ACP
     # parent to guess whether a connection failure was remote.
     failures = prompt.get("session_failures")
-    if isinstance(failures, list) and failures and all(is_air_session_failure(item)
-                                                       for item in failures):
+    if (isinstance(failures, list) and failures
+            and all(is_air_session_failure(item) for item in failures)
+            and any(isinstance(item, dict) and item.get("severity") == "error"
+                    for item in failures)):
         return _assess_air_failures(prompt, failures)
     if result.acp_result_kind != "success" or result.completion is not True:
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")

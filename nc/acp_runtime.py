@@ -15,12 +15,13 @@ import os
 import platform
 import shutil
 import stat
+import tarfile
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from .acp_client import CodexAcpLaunchEvidence
+from .acp_client import CodexAcpLaunchEvidence, _inspected_launch_evidence
 
 PACKAGE = "@agentclientprotocol/codex-acp"
 VERSION = "1.11.0"
@@ -141,6 +142,74 @@ def _verify_installed_tree(root: Path) -> None:
         raise AcpRuntimeNotReady("installed dependency tree has unexpected files")
 
 
+def _cache_tarball(root: Path, integrity: str) -> Path:
+    """Locate npm cacache content by its SRI digest, never by a mutable index."""
+    try:
+        algorithm, encoded = integrity.split("-", 1)
+        digest = base64.b64decode(encoded, validate=True).hex()
+    except (ValueError, TypeError) as exc:
+        raise AcpRuntimeNotReady("reviewed lock has malformed package integrity") from exc
+    if algorithm != "sha512" or len(digest) != 128:
+        raise AcpRuntimeNotReady("reviewed lock has unsupported package integrity")
+    path = root / "npm-cache" / "_cacache" / "content-v2" / "sha512" / digest[:2] / digest[2:4] / digest[4:]
+    if not path.is_file() or hashlib.sha512(path.read_bytes()).hexdigest() != digest:
+        raise AcpRuntimeNotReady("cached package artifact is missing or does not match reviewed SRI")
+    return path
+
+
+def _tar_contents(path: Path) -> dict[str, str]:
+    try:
+        with tarfile.open(path, "r:gz") as archive:
+            result = {}
+            for member in archive.getmembers():
+                if not member.isfile() or not member.name.startswith("package/"):
+                    continue
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise AcpRuntimeNotReady("package artifact has unreadable member")
+                result[member.name.removeprefix("package/")] = hashlib.sha256(stream.read()).hexdigest()
+            return result
+    except (OSError, tarfile.TarError) as exc:
+        raise AcpRuntimeNotReady("cached package artifact is invalid") from exc
+
+
+def _verify_package_contents(root: Path, relative: str, artifact: Path) -> None:
+    expected = _tar_contents(artifact)
+    directory = root / relative
+    actual = {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in directory.rglob("*") if path.is_file()}
+    if expected != actual:
+        raise AcpRuntimeNotReady("installed package contents differ from SRI-verified artifact")
+
+
+def _verify_sri_derived_contents(root: Path, lock: dict[str, object]) -> None:
+    """Authenticate installed package bytes against immutable lock SRI values.
+
+    npm's cache stores each fetched tarball under its content digest.  The
+    installer retains that cache inside the isolated runtime, so a rewritten
+    receipt cannot hide a changed dependency: every installed package is
+    compared to bytes whose SHA-512 is the reviewed lock's SRI.
+    """
+    packages = lock.get("packages")
+    if not isinstance(packages, dict):
+        raise AcpRuntimeNotReady("reviewed ACP dependency lock is malformed")
+    # The ACP root is compared to the separately pinned published tarball.
+    _verify_package_contents(root, "node_modules/@agentclientprotocol/codex-acp",
+                             root / "codex-acp-1.11.0.tgz")
+    for relative, entry in packages.items():
+        if not isinstance(relative, str) or not relative.startswith("node_modules/"):
+            continue
+        if not isinstance(entry, dict) or entry.get("dev"):
+            continue
+        directory = root / relative
+        if not directory.is_dir():
+            continue  # optional packages for another OS/CPU are intentionally absent
+        integrity = entry.get("integrity")
+        if not isinstance(integrity, str):
+            raise AcpRuntimeNotReady("reviewed lock lacks installed package integrity")
+        _verify_package_contents(root, relative, _cache_tarball(root, integrity))
+
+
 def _verify_reviewed_resolution(root: Path, node_arch: str) -> None:
     """Bind installed package metadata to the immutable reviewed lock.
 
@@ -198,6 +267,7 @@ def _verify_reviewed_resolution(root: Path, node_arch: str) -> None:
             raise AcpRuntimeNotReady("installed transitive dependency differs from reviewed lock")
         if not isinstance(entry.get("integrity"), str):
             raise AcpRuntimeNotReady("reviewed lock lacks transitive dependency integrity")
+    _verify_sri_derived_contents(root, lock)
 
 
 def _verify_launcher(root: Path, command: Path) -> None:
@@ -250,7 +320,7 @@ def inspect_runtime(root: Path, *, profile: str = "agent") -> CodexAcpRuntime:
     binary = _platform_binary(binary_package, node_arch)
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise AcpRuntimeNotReady("selected Codex platform binary is missing or not executable")
-    evidence = CodexAcpLaunchEvidence(
+    evidence = _inspected_launch_evidence(
         command=(str(command),), package=PACKAGE, package_version=VERSION,
         artifact_integrity=INTEGRITY, codex_version=CODEX_VERSION, sdk_version=SDK_VERSION,
         profile=profile, platform=host, binary_package=str(binary_package.resolve()),
@@ -271,7 +341,9 @@ def run_verified_ordinary_turn(*, runtime_root: Path, credential_file: Path,
 
     reject_inherited_redirection()
     runtime = inspect_runtime(runtime_root, profile=PROFILE)
-    home = prepare_private_home(credential_file, parent=private_parent)
+    _require_private_parent_isolated(private_parent, worktree, runtime.root)
+    home = prepare_private_home(credential_file, parent=private_parent,
+                                disallow_within=(worktree, runtime.root))
     try:
         return run_codex_acp_turn(
             runtime.evidence.command, launch=runtime.evidence,
@@ -292,7 +364,8 @@ def reject_inherited_redirection(environment: Mapping[str, str] | None = None) -
         raise AcpRuntimeNotReady("inherited Codex/config redirection is forbidden: " + ", ".join(names))
 
 
-def prepare_private_home(credential_file: Path, *, parent: Path) -> Path:
+def prepare_private_home(credential_file: Path, *, parent: Path,
+                         disallow_within: tuple[Path, ...] = ()) -> Path:
     """Make a short-lived private HOME by read-only, noninteractive reuse.
 
     The owner supplies the *existing* Codex ``auth.json`` explicitly.  No login
@@ -300,6 +373,8 @@ def prepare_private_home(credential_file: Path, *, parent: Path) -> Path:
     returned nor written to receipts/logs.
     """
     credential_file = credential_file.resolve()
+    if any(_overlaps(parent, forbidden) for forbidden in disallow_within):
+        raise AcpRuntimeNotReady("credential readiness error: private-home parent overlaps protected path")
     try:
         mode = credential_file.stat().st_mode
         value = json.loads(credential_file.read_text())
@@ -317,6 +392,27 @@ def prepare_private_home(credential_file: Path, *, parent: Path) -> Path:
     except BaseException:
         shutil.rmtree(home, ignore_errors=True)
         raise
+
+
+def _overlaps(first: Path, second: Path) -> bool:
+    """Resolved containment test, including an existing symlink parent."""
+    first, second = first.resolve(), second.resolve()
+    return first == second or first in second.parents or second in first.parents
+
+
+def _require_private_parent_isolated(parent: Path, worktree: Path, runtime: Path) -> None:
+    parent = parent.resolve()
+    # The repository root is inferred from the worktree's .git file/dir so a
+    # sibling worktree cannot become a credential-bearing writable location.
+    repository = worktree.resolve()
+    git = repository / ".git"
+    if git.is_file():
+        # A linked worktree's repository common dir is not a safe home either.
+        repository = git.resolve().parent
+    forbidden = (worktree.resolve(), runtime.resolve(), repository)
+    if any(_overlaps(parent, path) for path in forbidden):
+        raise AcpRuntimeNotReady(
+            "credential readiness error: private-home parent overlaps worktree, runtime, or repository")
 
 
 def credential_readiness(credential_file: Path) -> str:

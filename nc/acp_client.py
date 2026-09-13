@@ -12,7 +12,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -29,6 +29,7 @@ _MAX_AIR_ACTION_BYTES = 256
 _MAX_RAW_AIR_FAILURE_BYTES = 8 * 1024
 _MAX_JSONRPC_ERROR_BYTES = 4 * 1024
 _MISSING = object()
+_LAUNCH_EVIDENCE_CAPABILITY = object()
 
 _ORDINARY_MODE = "agent"
 # These are the effective sandbox values of ``AgentMode.Agent`` in the pinned
@@ -86,11 +87,16 @@ class CodexAcpLaunchEvidence:
     codex_version: str
     sdk_version: str
     profile: str
-    platform: str = ""
-    binary_package: str = ""
-    binary_resolution: str = ""
+    platform: str
+    binary_package: str
+    binary_resolution: str
+    # A record made up of strings is not an attestation.  Only the runtime
+    # inspector receives this unexported capability when it constructs one.
+    _capability: object | None = field(default=None, repr=False, compare=False)
 
     def validate_for(self, command: Sequence[str], profile: str) -> None:
+        if self._capability is not _LAUNCH_EVIDENCE_CAPABILITY:
+            raise AcpClientRejected("launch evidence was not produced by runtime inspection")
         if tuple(command) != self.command:
             raise AcpClientRejected("launch command does not match verified ACP evidence")
         if (self.package != _PINNED_ACP_PACKAGE
@@ -99,10 +105,15 @@ class CodexAcpLaunchEvidence:
                 or self.codex_version != _PINNED_CODEX_VERSION
                 or self.sdk_version != _PINNED_SDK_VERSION):
             raise AcpClientRejected("launch evidence does not match pinned ACP contract")
-        if self.platform and (not self.binary_package or not self.binary_resolution):
+        if not self.platform or not self.binary_package or not self.binary_resolution:
             raise AcpClientRejected("launch evidence lacks verified platform binary resolution")
         if self.profile != profile:
             raise AcpClientRejected("launch evidence does not bind the selected ACP profile")
+
+
+def _inspected_launch_evidence(**values: str) -> CodexAcpLaunchEvidence:
+    """Internal capability boundary used solely by ``inspect_runtime``."""
+    return CodexAcpLaunchEvidence(**values, _capability=_LAUNCH_EVIDENCE_CAPABILITY)
 
 
 @dataclass(frozen=True)

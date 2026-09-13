@@ -59,6 +59,7 @@ esac
     assert launcher.resolve() == runtime / "node_modules" / "@agentclientprotocol" / "codex-acp" / "dist" / "index.js"
     assert (launcher.resolve()).is_file()
     monkeypatch.setattr(acp_runtime, "_verify_tarball", lambda _root: None)
+    monkeypatch.setattr(acp_runtime, "_verify_sri_derived_contents", lambda *_args: None)
     inspected = acp_runtime.inspect_runtime(runtime)
     assert inspected.evidence.command == (str(launcher),)
 
@@ -92,6 +93,7 @@ def runtime_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, arch: str =
             lines.append(acp_runtime.hashlib.sha256(path.read_bytes()).hexdigest() + "  " + str(path.relative_to(root)))
     (root / "installed.sha256").write_text("\n".join(lines) + "\n")
     monkeypatch.setattr(acp_runtime, "_verify_tarball", lambda _root: None)
+    monkeypatch.setattr(acp_runtime, "_verify_sri_derived_contents", lambda *_args: None)
     monkeypatch.setattr(acp_runtime, "_host_platform", lambda: ("linux-amd64", "x64"))
     return root
 
@@ -179,6 +181,15 @@ def test_private_home_is_explicit_and_cleanup_is_scoped(tmp_path):
     assert not home.exists()
     with pytest.raises(acp_runtime.AcpRuntimeNotReady):
         acp_runtime.cleanup_private_home(tmp_path, expected_parent=parent)
+
+
+def test_private_home_refuses_a_protected_overlap(tmp_path: Path) -> None:
+    source = tmp_path / "auth.json"
+    source.write_text('{"OPENAI_API_KEY": "fixture"}')
+    source.chmod(0o600)
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="overlaps"):
+        acp_runtime.prepare_private_home(source, parent=tmp_path / "worktree" / "homes",
+                                         disallow_within=(tmp_path / "worktree",))
 
 
 def test_redirection_is_rejected():

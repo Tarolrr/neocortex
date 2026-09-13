@@ -40,7 +40,9 @@ install)
     echo "unsupported Node runtime '$node_version'; pinned Codex 0.153.4 requires Node >=16" >&2; false;
   }
   cp "$reviewed_lock" "$runtime/package-lock.json"
-  npm ci --ignore-scripts --omit=dev --prefix "$runtime"
+  # Keep immutable content-addressed tarballs.  Use-time inspection compares
+  # the extracted files to these bytes using the reviewed lock SRI values.
+  npm ci --ignore-scripts --omit=dev --cache "$runtime/npm-cache" --prefix "$runtime"
   acp_dir="$runtime/node_modules/@agentclientprotocol/codex-acp"
   mkdir -p "$acp_dir" "$runtime/node_modules/.bin"
   tar -xzf "$runtime/codex-acp-1.11.0.tgz" -C "$acp_dir" --strip-components=1

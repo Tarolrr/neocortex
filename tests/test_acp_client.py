@@ -15,6 +15,7 @@ from nc.acp_client import (
     AcpClientRejected,
     CodexAcpLaunchEvidence,
     CodexAcpPolicy,
+    _inspected_launch_evidence,
     run_codex_acp_turn,
 )
 from nc.acp_wire import AcpProcessTimeout, AcpSubprocess, AcpTransportEof, AcpUnexpectedExit
@@ -211,9 +212,24 @@ def verified_launch(command: list[str], **overrides: str) -> CodexAcpLaunchEvide
         "codex_version": "0.153.4",
         "sdk_version": "1.4.0",
         "profile": "agent",
+        "platform": "linux-amd64",
+        "binary_package": "/isolated/codex-linux-x64",
+        "binary_resolution": "/isolated/codex",
     }
     values.update(overrides)
-    return CodexAcpLaunchEvidence(**values)  # type: ignore[arg-type]
+    return _inspected_launch_evidence(**values)  # type: ignore[arg-type]
+
+
+def test_plain_string_launch_evidence_is_not_an_attestation(tmp_path: Path) -> None:
+    command = fake_server("success")
+    forged = CodexAcpLaunchEvidence(
+        command=tuple(command), package="@agentclientprotocol/codex-acp", package_version="1.11.0",
+        artifact_integrity="sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ==",
+        codex_version="0.153.4", sdk_version="1.4.0", profile="agent", platform="linux-amd64",
+        binary_package="/claim", binary_resolution="/claim/bin")
+    with pytest.raises(AcpClientRejected, match="runtime inspection"):
+        run_codex_acp_turn(command, launch=forged, policy=CodexAcpPolicy.ordinary(tmp_path),
+                           model="model", prompt="hello", log_path=tmp_path / "acp.log")
 
 
 def run(tmp_path: Path, scenario: str, **kwargs: object):

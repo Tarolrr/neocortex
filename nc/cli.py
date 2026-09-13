@@ -12,6 +12,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from . import arbiter, backup_worker, operations, protocol
+from .acp_runtime import AcpRuntimeNotReady, credential_readiness, inspect_runtime, reject_inherited_redirection
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_identity, repository_lock
 from .scheduler import Scheduler
@@ -490,6 +491,24 @@ def cmd_doctor(args) -> int:
     return 0
 
 
+def cmd_acp_doctor(args) -> int:
+    """Offline ACP preparation diagnostic; never prompts, logs in, or launches."""
+    try:
+        reject_inherited_redirection()
+        runtime = inspect_runtime(Path(args.runtime), profile=args.profile)
+        print(f"ACP artifact: ready ({runtime.platform}; {runtime.command})")
+        print("ACP profile: ready (agent / workspaceWrite / on-request / auto_review)")
+        if args.auth:
+            print("ACP auth: " + credential_readiness(Path(args.auth)))
+        else:
+            print("ACP auth: not checked (pass --auth /absolute/path/to/auth.json)")
+        print("ACP model/network/sandbox: unverified; owner smoke is a separate explicit operation")
+        return 0
+    except AcpRuntimeNotReady as exc:
+        print("ACP readiness ERROR: " + str(exc), file=sys.stderr)
+        return 1
+
+
 def cmd_health(args) -> int:
     cfg, state = _open(args)
     print(f"database: {cfg.db_path}")
@@ -774,6 +793,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("doctor", help="check service host tools and one project's base checkout")
     sp.add_argument("--project", required=True)
     sp.set_defaults(func=cmd_doctor)
+    sp = sub.add_parser("acp-doctor", help="offline isolated ACP artifact/profile/auth readiness")
+    sp.add_argument("--runtime", required=True)
+    sp.add_argument("--profile", default="agent")
+    sp.add_argument("--auth", help="explicit existing Codex auth.json; read-only check")
+    sp.set_defaults(func=cmd_acp_doctor)
     sub.add_parser("health", help="show state database and counts").set_defaults(func=cmd_health)
     sub.add_parser("step", help="run exactly one agent turn").set_defaults(func=cmd_step)
 

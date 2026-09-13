@@ -127,5 +127,14 @@ STOP/cancellation/owned-process checks):
 scripts/codex_acp_runtime.sh rollback /srv/neocortex/acp-1.11.0
 ```
 
+Rollback intentionally does not require launch verification: it is the
+recovery path for an interrupted install or a runtime whose dependency,
+binary, cache, or receipt has been damaged.  It resolves the supplied existing
+directory, rejects `/` and the current worktree, and requires either the
+byte-identical committed reviewed lock or the exact SRI-checked ACP tarball
+inside that directory.  A receipt by itself cannot authorize deletion.  Thus
+an arbitrary or crafted directory is refused, while a partial or tampered
+pinned layout can be removed at the idle boundary.
+
 No test installs npm packages, touches credentials, invokes a real model, or
 claims amd64/arm64/sandbox/auth behavior has been live verified.

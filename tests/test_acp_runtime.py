@@ -169,7 +169,26 @@ def test_owner_rollback_refuses_a_crafted_receipt_directory(tmp_path: Path) -> N
                             capture_output=True, check=False)
     assert result.returncode != 0
     assert runtime.exists()
-    assert "not the verified pinned isolated runtime" in result.stderr
+    assert "lacks a reviewed pinned runtime input" in result.stderr
+
+
+@pytest.mark.parametrize("damage", ["tampered-dependency", "partial-install"])
+def test_owner_rollback_removes_damaged_or_partial_pinned_layout(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str) -> None:
+    """Recovery authenticates immutable inputs, not launch readiness."""
+    if damage == "tampered-dependency":
+        runtime = runtime_tree(tmp_path, monkeypatch)
+        (runtime / "node_modules" / "@openai" / "codex" / "package.json").write_text("tampered")
+    else:
+        # An interrupted install can stop after its immutable lock is copied.
+        runtime = tmp_path / "partial-runtime"
+        runtime.mkdir()
+        (runtime / "package-lock.json").write_bytes(acp_runtime._REVIEWED_LOCK.read_bytes())
+    script = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.sh"
+    result = subprocess.run([str(script), "rollback", str(runtime)], text=True,
+                            capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert not runtime.exists()
 
 
 def test_inspection_rejects_unpinned_profile(tmp_path, monkeypatch):

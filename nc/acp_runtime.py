@@ -194,8 +194,9 @@ def _verify_sri_derived_contents(root: Path, lock: dict[str, object]) -> None:
     if not isinstance(packages, dict):
         raise AcpRuntimeNotReady("reviewed ACP dependency lock is malformed")
     # The ACP root is compared to the separately pinned published tarball.
-    _verify_package_contents(root, "node_modules/@agentclientprotocol/codex-acp",
-                             root / "codex-acp-1.11.0.tgz")
+    artifacts: dict[str, Path] = {
+        "node_modules/@agentclientprotocol/codex-acp": root / "codex-acp-1.11.0.tgz"
+    }
     for relative, entry in packages.items():
         if not isinstance(relative, str) or not relative.startswith("node_modules/"):
             continue
@@ -207,7 +208,64 @@ def _verify_sri_derived_contents(root: Path, lock: dict[str, object]) -> None:
         integrity = entry.get("integrity")
         if not isinstance(integrity, str):
             raise AcpRuntimeNotReady("reviewed lock lacks installed package integrity")
-        _verify_package_contents(root, relative, _cache_tarball(root, integrity))
+        artifacts[relative] = _cache_tarball(root, integrity)
+    for relative, artifact in artifacts.items():
+        # Absent optional OS/CPU packages were excluded above.  Every present
+        # package, including the ACP root, must exactly be its reviewed tarball.
+        if (root / relative).is_dir():
+            _verify_package_contents(root, relative, artifact)
+    _verify_complete_node_modules_tree(root, artifacts)
+
+
+def _verify_complete_node_modules_tree(root: Path, artifacts: Mapping[str, Path]) -> None:
+    """Reject paths which are not derivable from reviewed package artifacts.
+
+    ``installed.sha256`` is only a corruption receipt: it cannot authorize a
+    path because it lives beside the install.  This builds the allowed tree
+    from SRI-authenticated tarballs and the reviewed lock.  npm bin links are
+    allowed only when their names and targets come from a package's ``bin``.
+    """
+    modules = root / "node_modules"
+    allowed_files: set[Path] = set()
+    allowed_dirs: set[Path] = {modules, modules / ".bin"}
+    allowed_links: dict[Path, Path] = {}
+    for relative, artifact in artifacts.items():
+        directory = root / relative
+        if not directory.is_dir():
+            continue
+        contents = _tar_contents(artifact)
+        for name in contents:
+            target = directory / name
+            allowed_files.add(target)
+            allowed_dirs.update(target.parents)
+        try:
+            manifest = json.loads((directory / "package.json").read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AcpRuntimeNotReady("installed package has invalid manifest") from exc
+        bins = manifest.get("bin") if isinstance(manifest, dict) else None
+        if isinstance(bins, str):
+            # npm uses the unscoped portion of a package name for string bins.
+            name = relative.rsplit("/", 1)[-1]
+            bins = {name: bins}
+        if isinstance(bins, dict):
+            bin_dir = directory.parent / ".bin"
+            allowed_dirs.add(bin_dir)
+            for name, target in bins.items():
+                if isinstance(name, str) and isinstance(target, str) and target in contents:
+                    allowed_links[bin_dir / name] = (directory / target).resolve()
+    # The root ACP is deliberately unpacked after npm ci, so create its normal
+    # bin mapping from its authenticated manifest too.
+    for path in modules.rglob("*"):
+        if path.is_symlink():
+            expected = allowed_links.get(path)
+            if expected is None or path.resolve() != expected:
+                raise AcpRuntimeNotReady("installed dependency tree has unexpected npm link")
+        elif path.is_file() and path not in allowed_files:
+            raise AcpRuntimeNotReady("installed dependency tree has unexpected files")
+        elif path.is_dir() and path not in allowed_dirs:
+            raise AcpRuntimeNotReady("installed dependency tree has unexpected directories")
+    if set(allowed_links) != {path for path in modules.rglob("*") if path.is_symlink()}:
+        raise AcpRuntimeNotReady("installed dependency tree is missing required npm links")
 
 
 def _verify_reviewed_resolution(root: Path, node_arch: str) -> None:
@@ -346,7 +404,7 @@ def run_verified_ordinary_turn(*, runtime_root: Path, credential_file: Path,
                                 disallow_within=(worktree, runtime.root))
     try:
         return run_codex_acp_turn(
-            runtime.evidence.command, launch=runtime.evidence,
+            runtime.evidence.command, runtime_root=runtime.root,
             policy=CodexAcpPolicy.ordinary(worktree), model=model, prompt=prompt,
             log_path=log_path, timeout_s=timeout_s, private_home=home,
         )

@@ -158,6 +158,18 @@ def test_owner_installer_rejects_node_older_than_pinned_requirement(tmp_path, mo
     assert not runtime.exists()
 
 
+def test_owner_rollback_refuses_a_crafted_receipt_directory(tmp_path: Path) -> None:
+    runtime = tmp_path / "not-a-runtime"
+    runtime.mkdir()
+    (runtime / "receipt.json").write_text("{}")
+    script = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.sh"
+    result = subprocess.run([str(script), "rollback", str(runtime)], text=True,
+                            capture_output=True, check=False)
+    assert result.returncode != 0
+    assert runtime.exists()
+    assert "not the verified pinned isolated runtime" in result.stderr
+
+
 def test_inspection_rejects_unpinned_profile(tmp_path, monkeypatch):
     with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="profile"):
         acp_runtime.inspect_runtime(runtime_tree(tmp_path, monkeypatch), profile="arbitrary")
@@ -168,6 +180,20 @@ def test_inspection_rejects_rewritten_installed_lock(tmp_path, monkeypatch):
     (root / "package-lock.json").write_text("{}")
     with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="reviewed exact lock"):
         acp_runtime.inspect_runtime(root)
+
+
+def test_sri_tree_check_rejects_extra_empty_package_directory(tmp_path, monkeypatch):
+    """A rewritten local hash receipt cannot authorize an extra empty path."""
+    root = tmp_path / "runtime"
+    package = root / "node_modules" / "known"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text('{"bin": {}}')
+    artifact = tmp_path / "known.tgz"
+    monkeypatch.setattr(acp_runtime, "_tar_contents", lambda _artifact: {"package.json": "x"})
+    acp_runtime._verify_complete_node_modules_tree(root, {"node_modules/known": artifact})
+    (root / "node_modules" / "unreviewed").mkdir()
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="unexpected directories"):
+        acp_runtime._verify_complete_node_modules_tree(root, {"node_modules/known": artifact})
 
 
 def test_private_home_is_explicit_and_cleanup_is_scoped(tmp_path):

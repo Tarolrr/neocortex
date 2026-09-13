@@ -16,7 +16,7 @@ from nc.acp_client import (
     CodexAcpLaunchEvidence,
     CodexAcpPolicy,
     _inspected_launch_evidence,
-    run_codex_acp_turn,
+    _run_codex_acp_turn,
 )
 from nc.acp_wire import AcpProcessTimeout, AcpSubprocess, AcpTransportEof, AcpUnexpectedExit
 
@@ -228,13 +228,13 @@ def test_plain_string_launch_evidence_is_not_an_attestation(tmp_path: Path) -> N
         codex_version="0.153.4", sdk_version="1.4.0", profile="agent", platform="linux-amd64",
         binary_package="/claim", binary_resolution="/claim/bin")
     with pytest.raises(AcpClientRejected, match="runtime inspection"):
-        run_codex_acp_turn(command, launch=forged, policy=CodexAcpPolicy.ordinary(tmp_path),
+        _run_codex_acp_turn(command, launch=forged, policy=CodexAcpPolicy.ordinary(tmp_path),
                            model="model", prompt="hello", log_path=tmp_path / "acp.log")
 
 
 def run(tmp_path: Path, scenario: str, **kwargs: object):
     command = fake_server(scenario)
-    return run_codex_acp_turn(command, launch=verified_launch(command),
+    return _run_codex_acp_turn(command, launch=verified_launch(command),
                                policy=CodexAcpPolicy.ordinary(tmp_path),
                                model="model", prompt="hello", log_path=tmp_path / "acp.log",
                                timeout_s=kwargs.pop("timeout_s", 1), **kwargs)
@@ -257,7 +257,7 @@ def test_private_auth_is_at_codex_home_and_absolute_launcher_ignores_path(tmp_pa
     command = [sys.executable, "-c", code]
     try:
         with pytest.raises(AcpUnexpectedExit):
-            run_codex_acp_turn(command, launch=verified_launch(command),
+            _run_codex_acp_turn(command, launch=verified_launch(command),
                                 policy=CodexAcpPolicy.ordinary(tmp_path), model="model", prompt="hello",
                                 log_path=tmp_path / "acp.log", timeout_s=1, private_home=home,
                                 environment={"PATH": "", "OBSERVED": str(observed), "CODEX_PATH": "/bad",
@@ -521,7 +521,7 @@ def test_restricted_policy_is_explicit_but_fails_closed_without_source_backing(t
     marker = tmp_path / "restricted-server-started"
     command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
     with pytest.raises(AcpClientRejected, match="unsupported by the pinned artifact"):
-        run_codex_acp_turn(
+        _run_codex_acp_turn(
             command, launch=verified_launch(command, profile="agent"), policy=policy,
             model="model", prompt="hello", log_path=tmp_path / "restricted.log",
         )
@@ -552,7 +552,7 @@ def test_unverified_launch_contract_is_rejected_before_server_starts(
     marker = tmp_path / "server-started"
     command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
     with pytest.raises(AcpClientRejected, match="launch evidence"):
-        run_codex_acp_turn(command, launch=verified_launch(command, **overrides),
+        _run_codex_acp_turn(command, launch=verified_launch(command, **overrides),
                             policy=CodexAcpPolicy.ordinary(tmp_path), model="model", prompt="hello",
                             log_path=tmp_path / "unverified.log")
     assert not marker.exists()
@@ -563,7 +563,7 @@ def test_launch_evidence_cannot_authorize_a_different_command(tmp_path: Path) ->
     marker = tmp_path / "wrong-server-started"
     actual = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
     with pytest.raises(AcpClientRejected, match="does not match"):
-        run_codex_acp_turn(actual, launch=verified_launch(expected),
+        _run_codex_acp_turn(actual, launch=verified_launch(expected),
                             policy=CodexAcpPolicy.ordinary(tmp_path), model="model", prompt="hello",
                             log_path=tmp_path / "wrong.log")
     assert not marker.exists()

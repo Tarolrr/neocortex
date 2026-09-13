@@ -533,19 +533,39 @@ def _process_fact(child: AcpSubprocess, timed_out: bool,
     }
 
 
-def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence,
+def run_codex_acp_turn(command: Sequence[str], *, runtime_root: Path,
                        policy: CodexAcpPolicy, model: str, prompt: str,
                        log_path: Path, timeout_s: float = 60,
                        environment: Mapping[str, str] | None = None,
                        private_home: Path | None = None) -> CodexAcpTurn:
     """Run the pinned initialize/new/configure/prompt sequence once.
 
-    ``launch`` is the verified codex-acp 1.11.0 artifact/dependency evidence
-    bound to ``command``.  It is checked before a child exists; the live ACP
+    The runtime is inspected again at this use point; caller-provided command
+    and version strings are never launch verification.  The live ACP
     v1/AIR handshake is then checked before session creation.  No installation,
     authentication, outcome-file handling, or role validation is performed
     here.  Exceptions are deliberate fail-closed evidence.
     """
+    # Import lazily to avoid the runtime/client import cycle.  This public
+    # boundary deliberately makes artifact inspection non-optional.
+    from .acp_runtime import inspect_runtime
+
+    runtime = inspect_runtime(runtime_root)
+    if tuple(command) != runtime.evidence.command:
+        raise AcpClientRejected("launch command does not match inspected isolated runtime",
+                                log_path=str(log_path))
+    return _run_codex_acp_turn(command, launch=runtime.evidence, policy=policy,
+                               model=model, prompt=prompt, log_path=log_path,
+                               timeout_s=timeout_s, environment=environment,
+                               private_home=private_home)
+
+
+def _run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence,
+                        policy: CodexAcpPolicy, model: str, prompt: str,
+                        log_path: Path, timeout_s: float = 60,
+                        environment: Mapping[str, str] | None = None,
+                        private_home: Path | None = None) -> CodexAcpTurn:
+    """Protocol engine after the public entry point has inspected the runtime."""
     # Setup is fallible too.  Give every setup exception the same stable
     # envelope as a post-launch failure, including the caller's log reference.
     try:

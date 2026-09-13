@@ -65,6 +65,16 @@ install)
 verify)
   python -c 'from pathlib import Path; from nc.acp_runtime import inspect_runtime; import sys; r=inspect_runtime(Path(sys.argv[1])); print(r.command)' "$runtime";;
 rollback)
-  [[ -f "$runtime/receipt.json" ]] || { echo 'refusing rollback without runtime receipt' >&2; exit 1; }
+  [[ $# -eq 2 ]] || usage
+  # Do not treat a receipt filename as authority to delete.  Resolve an
+  # existing directory first, reject broad filesystem targets, then require
+  # the same complete use-time inspection as launch/verify.
+  runtime=$(realpath -e "$runtime")
+  [[ -d "$runtime" && "$runtime" != / && "$runtime" != "$PWD" ]] || {
+    echo 'refusing unsafe rollback target' >&2; exit 1;
+  }
+  python -c 'from pathlib import Path; from nc.acp_runtime import inspect_runtime; import sys; inspect_runtime(Path(sys.argv[1]))' "$runtime" || {
+    echo 'refusing rollback: target is not the verified pinned isolated runtime' >&2; exit 1;
+  }
   rm -rf -- "$runtime"; echo 'isolated runtime removed (only perform while ACP is idle)';;
 *) usage;; esac

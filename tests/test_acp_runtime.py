@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 from pathlib import Path
@@ -374,6 +375,48 @@ def test_sri_tree_check_rejects_hidden_lock_not_matching_reviewed_resolution(tmp
     cache.write_bytes(artifact.read_bytes())
     lock = {"lockfileVersion": 3, "packages": {"node_modules/dependency": {"integrity": sri}}}
     with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="hidden lock"):
+        acp_runtime._verify_sri_derived_contents(root, lock)
+
+
+def test_sri_tree_check_rejects_deleted_required_dependency_after_receipt_rewrite(
+        tmp_path: Path) -> None:
+    """Local receipts cannot turn a deleted production package into optional."""
+    root = tmp_path / "runtime"
+    acp_dir = root / "node_modules" / "@agentclientprotocol" / "codex-acp"
+    zod_dir = root / "node_modules" / "zod"
+    root_artifact = root / "codex-acp-1.11.0.tgz"
+    zod_artifact = tmp_path / "zod.tgz"
+    _fixture_package_tarball(root_artifact, {
+        "package.json": '{"bin": {"codex-acp": "dist/index.js"}}',
+        "dist/index.js": "#!/usr/bin/env node\n",
+    })
+    _fixture_package_tarball(zod_artifact, {"package.json": '{"version": "4.4.3"}'})
+    for artifact, directory in ((root_artifact, acp_dir), (zod_artifact, zod_dir)):
+        with tarfile.open(artifact, "r:gz") as archive:
+            archive.extractall(directory.parent, filter="data")
+        (directory.parent / "package").rename(directory)
+    launcher = root / "node_modules" / ".bin" / "codex-acp"
+    launcher.parent.mkdir()
+    launcher.symlink_to("../@agentclientprotocol/codex-acp/dist/index.js")
+    digest = hashlib.sha512(zod_artifact.read_bytes()).digest()
+    sri = "sha512-" + base64.b64encode(digest).decode()
+    encoded = digest.hex()
+    cache = root / "npm-cache" / "_cacache" / "content-v2" / "sha512" / encoded[:2] / encoded[2:4] / encoded[4:]
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(zod_artifact.read_bytes())
+    zod_entry = {"version": "4.4.3", "integrity": sri}
+    lock = {"lockfileVersion": 3, "packages": {"node_modules/zod": zod_entry}}
+    (root / "node_modules" / ".package-lock.json").write_text(json.dumps({
+        "lockfileVersion": 3, "packages": {"node_modules/zod": zod_entry},
+    }))
+    # Simulate an attacker deleting zod then regenerating both mutable local
+    # receipts.  The reviewed lock/SRI cache must still require zod on Linux.
+    shutil.rmtree(zod_dir)
+    (root / "node_modules" / ".package-lock.json").write_text(json.dumps({
+        "lockfileVersion": 3, "packages": {},
+    }))
+    (root / "installed.sha256").write_text("rewritten local receipt\n")
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="missing required platform package"):
         acp_runtime._verify_sri_derived_contents(root, lock)
 
 

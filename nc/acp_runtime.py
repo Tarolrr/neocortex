@@ -185,7 +185,43 @@ def _verify_package_contents(root: Path, relative: str, artifact: Path) -> None:
         raise AcpRuntimeNotReady("installed package contents differ from SRI-verified artifact")
 
 
-def _verify_sri_derived_contents(root: Path, lock: dict[str, object]) -> None:
+def _lock_entry_applies(entry: Mapping[str, object], *, system: str, arch: str) -> bool:
+    """Whether npm may install this lock entry on this host.
+
+    ``os`` and ``cpu`` use npm's allow-list / ``!`` deny-list syntax.  This is
+    intentionally derived from the reviewed lock rather than from whatever
+    happens to remain in ``node_modules`` after an interrupted or altered
+    install.
+    """
+    def matches(value: str, rules: object) -> bool:
+        if rules is None:
+            return True
+        if not isinstance(rules, list) or not all(isinstance(item, str) for item in rules):
+            raise AcpRuntimeNotReady("reviewed lock has malformed platform constraints")
+        positive = [item for item in rules if not item.startswith("!")]
+        negative = [item[1:] for item in rules if item.startswith("!")]
+        return value not in negative and (not positive or value in positive)
+
+    return matches(system, entry.get("os")) and matches(arch, entry.get("cpu"))
+
+
+def _expected_installed_packages(
+        lock: dict[str, object], *, arch: str) -> dict[str, dict[str, object]]:
+    """Return the complete production, host-applicable reviewed package set."""
+    packages = lock.get("packages")
+    if not isinstance(packages, dict):
+        raise AcpRuntimeNotReady("reviewed ACP dependency lock is malformed")
+    expected: dict[str, dict[str, object]] = {}
+    for relative, entry in packages.items():
+        if (not isinstance(relative, str) or not relative.startswith("node_modules/")
+                or not isinstance(entry, dict) or entry.get("dev")):
+            continue
+        if _lock_entry_applies(entry, system="linux", arch=arch):
+            expected[relative] = entry
+    return expected
+
+
+def _verify_sri_derived_contents(root: Path, lock: dict[str, object], *, arch: str | None = None) -> None:
     """Authenticate installed package bytes against immutable lock SRI values.
 
     npm's cache stores each fetched tarball under its content digest.  The
@@ -193,35 +229,33 @@ def _verify_sri_derived_contents(root: Path, lock: dict[str, object]) -> None:
     receipt cannot hide a changed dependency: every installed package is
     compared to bytes whose SHA-512 is the reviewed lock's SRI.
     """
-    packages = lock.get("packages")
-    if not isinstance(packages, dict):
-        raise AcpRuntimeNotReady("reviewed ACP dependency lock is malformed")
+    if arch is None:
+        _, arch = _host_platform()
+    expected = _expected_installed_packages(lock, arch=arch)
     # The ACP root is compared to the separately pinned published tarball.
     artifacts: dict[str, Path] = {
         "node_modules/@agentclientprotocol/codex-acp": root / "codex-acp-1.11.0.tgz"
     }
-    for relative, entry in packages.items():
-        if not isinstance(relative, str) or not relative.startswith("node_modules/"):
-            continue
-        if not isinstance(entry, dict) or entry.get("dev"):
-            continue
+    for relative, entry in expected.items():
         directory = root / relative
         if not directory.is_dir():
-            continue  # optional packages for another OS/CPU are intentionally absent
+            raise AcpRuntimeNotReady("installed dependency tree is missing required platform package")
         integrity = entry.get("integrity")
         if not isinstance(integrity, str):
             raise AcpRuntimeNotReady("reviewed lock lacks installed package integrity")
         artifacts[relative] = _cache_tarball(root, integrity)
     for relative, artifact in artifacts.items():
-        # Absent optional OS/CPU packages were excluded above.  Every present
-        # package, including the ACP root, must exactly be its reviewed tarball.
+        # Inapplicable optional OS/CPU packages were excluded by the reviewed
+        # lock's constraints.  Every applicable package, including the ACP
+        # root, must exactly be its reviewed tarball.
         if (root / relative).is_dir():
             _verify_package_contents(root, relative, artifact)
-    _verify_complete_node_modules_tree(root, artifacts, lock)
+    _verify_complete_node_modules_tree(root, artifacts, lock, arch=arch)
 
 
 def _verify_complete_node_modules_tree(
-        root: Path, artifacts: Mapping[str, Path], lock: dict[str, object] | None = None) -> None:
+        root: Path, artifacts: Mapping[str, Path], lock: dict[str, object] | None = None,
+        *, arch: str | None = None) -> None:
     """Reject paths which are not derivable from reviewed package artifacts.
 
     ``installed.sha256`` is only a corruption receipt: it cannot authorize a
@@ -234,7 +268,7 @@ def _verify_complete_node_modules_tree(
     allowed_dirs: set[Path] = {modules, modules / ".bin"}
     allowed_links: dict[Path, Path] = {}
     if lock is not None:
-        _verify_npm_hidden_lock(root, lock)
+        _verify_npm_hidden_lock(root, lock, arch=arch)
         # npm ci writes this installation-state lock.  It is not a package
         # tarball member, but _verify_npm_hidden_lock binds every one of its
         # resolved package entries to the reviewed lock before allowing it.
@@ -283,7 +317,7 @@ def _verify_complete_node_modules_tree(
         raise AcpRuntimeNotReady("installed dependency tree is missing required npm links")
 
 
-def _verify_npm_hidden_lock(root: Path, lock: dict[str, object]) -> None:
+def _verify_npm_hidden_lock(root: Path, lock: dict[str, object], *, arch: str | None = None) -> None:
     """Authenticate npm ci's generated ``node_modules/.package-lock.json``.
 
     The hidden lock is normal npm output and is included in the local hash
@@ -298,13 +332,15 @@ def _verify_npm_hidden_lock(root: Path, lock: dict[str, object]) -> None:
     if (not isinstance(reviewed_packages, dict) or not isinstance(hidden_packages, dict)
             or hidden.get("lockfileVersion") != lock.get("lockfileVersion")):
         raise AcpRuntimeNotReady("npm hidden lock is missing or differs from reviewed resolution")
-    expected: dict[str, object] = {}
-    for relative, entry in reviewed_packages.items():
-        if (not isinstance(relative, str) or not relative.startswith("node_modules/")
-                or not isinstance(entry, dict) or entry.get("dev")
-                or not (root / relative).is_dir()):
-            continue
-        expected[relative] = entry
+    if arch is None:
+        _, arch = _host_platform()
+    expected: dict[str, object] = {
+        relative: entry for relative, entry in _expected_installed_packages(lock, arch=arch).items()
+        # ACP is manually unpacked after npm ci and never belongs in npm's
+        # generated hidden lock.  Every other applicable production entry is
+        # required even if a local receipt was rewritten after deletion.
+        if relative != "node_modules/@agentclientprotocol/codex-acp"
+    }
     if hidden_packages != expected:
         raise AcpRuntimeNotReady("npm hidden lock is missing or differs from reviewed resolution")
 
@@ -374,7 +410,7 @@ def _verify_reviewed_resolution(root: Path, node_arch: str) -> None:
             raise AcpRuntimeNotReady("installed transitive dependency differs from reviewed lock")
         if not isinstance(entry.get("integrity"), str):
             raise AcpRuntimeNotReady("reviewed lock lacks transitive dependency integrity")
-    _verify_sri_derived_contents(root, lock)
+    _verify_sri_derived_contents(root, lock, arch=node_arch)
 
 
 def _verify_launcher(root: Path, command: Path) -> None:

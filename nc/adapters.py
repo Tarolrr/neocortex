@@ -461,21 +461,68 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
                               f"ACP process terminated unexpectedly by signal {signal_number}")
     if process["exit_code"] != 0:
         return HostAssessment("FAILED", "local_error", "ACP process did not exit successfully")
-    # A decoder-normalized AIR condition is valid transport evidence but has
-    # no scheduler mapping yet.  It must remain a conservative host failure,
-    # rather than becoming either protocol corruption or a warning-success.
+    # AIR is structured provider evidence, but only a single canonical active
+    # error record can select the deliberately small timer policy below.  In
+    # particular, do not use titles, details, stderr, or an apparent live ACP
+    # parent to guess whether a connection failure was remote.
     failures = prompt.get("session_failures")
     if isinstance(failures, list) and failures and all(is_air_session_failure(item)
                                                        for item in failures):
-        without_failures = dict(prompt)
-        without_failures["session_failures"] = []
-        if is_completion_candidate(without_failures):
-            return HostAssessment("FAILED", "unknown", "ACP reported session failure")
+        return _assess_air_failures(prompt, failures)
     if result.acp_result_kind != "success" or result.completion is not True:
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
     if not is_completion_candidate(prompt):
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
     return HostAssessment("SUCCESS", "none", "")
+
+
+def _assess_air_failures(prompt: dict[str, object], failures: list[object]) -> HostAssessment:
+    """Map one canonical active AIR error conservatively.
+
+    This is intentionally a table over AIR fields, never prose.  AIR actions
+    remain display data: ``login`` and ``new_session`` neither authenticate
+    nor cause an internal retry/session replacement.  More than one active
+    error, unknown actions/categories, malformed/corrupt prompt evidence, and
+    every non-table category fail closed as ``unknown``.
+    """
+    # A malformed record makes the decoder's prompt fact noncanonical.  Do
+    # not allow another, valid-looking record later in the observation list to
+    # obtain a deferral.
+    if prompt.get("prompt_response_valid") is not True:
+        return HostAssessment("FAILED", "protocol", "ACP prompt evidence is malformed")
+    active = [failure for failure in failures
+              if isinstance(failure, dict) and failure.get("severity") == "error"]
+    if len(active) != 1:
+        return HostAssessment("FAILED", "unknown", "ACP has conflicting active session failures")
+    failure = active[0]
+    category = failure["category"]
+    actions = failure["actions"]
+    # is_air_session_failure above establishes these types.  Keep the check
+    # explicit at this policy boundary so future extensions cannot inherit a
+    # retry decision accidentally.
+    if not isinstance(category, str) or not isinstance(actions, list):
+        return HostAssessment("FAILED", "unknown", "ACP AIR category or actions are unknown")
+    diagnostic = sanitize_diagnostic(
+        f"ACP AIR {category} revision {failure['revision']} actions={actions}: {failure['title']}"
+    )
+    if any(action not in {"retry", "new_session", "login"} for action in actions):
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    has_retry = "retry" in actions
+    # Canonical active AIR policy table.  No row establishes subscription
+    # identity, a quota reset, authentication, or an upstream overload field.
+    if category == "limit" and has_retry:
+        return HostAssessment("FAILED", "throttled", diagnostic)
+    if category == "service" and has_retry:
+        return HostAssessment("FAILED", "transient", diagnostic)
+    if category == "limit":
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    if category == "access":
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    if category == "request":
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    # Connection includes a local App Server death and is therefore never a
+    # remote-transient inference.  Unknown is likewise deliberately inert.
+    return HostAssessment("FAILED", "unknown", diagnostic)
 
 
 def _valid_acp_process(process: dict[str, object]) -> bool:

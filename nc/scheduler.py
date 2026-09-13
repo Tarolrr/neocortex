@@ -39,6 +39,7 @@ class Scheduler:
         self._preflight_diagnostic = ""
         self._preflight_usage: int | None = None
         self._preflight_evidence_path: str | None = None
+        self._preflight_is_acp = False
         self._in_run = False
         self._preflight_role = "worker"
 
@@ -76,6 +77,7 @@ class Scheduler:
             probe_dir / "probe.log", self.cfg.preflight_timeout_s,
         )
         self._preflight_usage = result.tokens
+        self._preflight_is_acp = result.transport == "acp"
         self._preflight_evidence_path = (str(result.evidence_path)
                                          if result.evidence_path is not None else None)
         assessment = assess_session(result, adapter.name)
@@ -104,6 +106,7 @@ class Scheduler:
         self._preflight_diagnostic = ""
         self._preflight_usage = None
         self._preflight_evidence_path = None
+        self._preflight_is_acp = False
         self._preflight_pairs.add(pair)
         try:
             ok, detail = self.preflight()
@@ -139,6 +142,9 @@ class Scheduler:
         }:
             self.state.record_preflight_attempt(role, pair[0], pair[1],
                                                 self._preflight_category, detail,
+                                                # AIR supplies no reset-time field; its
+                                                # diagnostic prose is never an epoch.
+                                                None if self._preflight_is_acp else
                                                 self._defer_until(self._preflight_diagnostic),
                                                 self._preflight_usage,
                                                 self._preflight_evidence_path)

@@ -51,6 +51,15 @@ if scenario == "unsupported_profile":
     response(init, {"protocolVersion":2, "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}})
     assert sys.stdin.readline() == ""
     sys.exit(0)
+if scenario in {"bool_protocol_version", "bool_air_version"}:
+    profile = {"protocolVersion": True, "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}}
+    if scenario == "bool_air_version":
+        profile["protocolVersion"] = 1
+        profile["_meta"]["jetbrains"]["air"]["version"] = True
+    response(init, profile)
+    # The rejected initialize profile must not create a session.
+    assert sys.stdin.readline() == ""
+    sys.exit(0)
 response(init, {"protocolVersion":1, "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}})
 new = read()
 mode = "agent"
@@ -90,7 +99,9 @@ if scenario in {"usage_eof", "air_overflow"}:
         failure["revision"] = number + 1
         send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
     time.sleep(.2); sys.exit(0)
-if scenario == "timeout":
+if scenario == "usage_timeout":
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":{"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"error","title":"retained","details":"full detail","actions":[]}}}},"sessionUpdate":"usage_update","usage":{"inputTokens":2,"outputTokens":3},"toolPayload":"must-not-retain"}}})
+if scenario in {"timeout", "usage_timeout"}:
     cancel = read()
     assert cancel["method"] == "session/cancel"
     # This is deliberately late: it proves cancellation is not completion.
@@ -171,13 +182,17 @@ if scenario == "delayed_post_response_exit":
     time.sleep(.15); sys.exit(9)
 failure = {"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"warning","title":"retry","actions":["retry"]}
 if scenario == "warning": send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+if scenario == "raw_extension":
+    failure["providerExtension"] = {"nested": ["retained", {"shape": "exact"}]}
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
 if scenario == "foreign_incident":
     # Same session, but a late failure emitted by an earlier prompt.
     failure["id"] = "previous-prompt:x"
     failure["severity"] = "error"
     send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
-if scenario == "terminal":
+if scenario in {"terminal", "terminal_details"}:
     failure["severity"] = "error"
+    if scenario == "terminal_details": failure["details"] = "provider detail"
     response(prompt, {"stopReason":"end_turn","_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}})
 else: response(prompt, {"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":3}})
 time.sleep(.2)
@@ -309,6 +324,20 @@ def test_usage_and_air_are_retained_when_prompt_ends_in_eof(tmp_path: Path) -> N
     assert "toolPayload" not in str(evidence.prompt)
 
 
+def test_usage_and_raw_air_are_retained_when_prompt_times_out(tmp_path: Path) -> None:
+    with pytest.raises(AcpProcessTimeout) as raised:
+        run(tmp_path, "usage_timeout", timeout_s=.1)
+    evidence = raised.value.evidence
+    assert evidence.prompt is not None
+    assert evidence.prompt["air_observations"] == [{
+        "id": evidence.prompt["prompt_id"] + ":x", "revision": 1,
+        "category": "service", "severity": "error", "title": "retained",
+        "details": "full detail", "actions": [],
+    }]
+    assert evidence.usage == {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5}
+    assert "toolPayload" not in str(evidence.prompt)
+
+
 def test_notification_flood_after_air_failure_fails_closed_with_evidence(tmp_path: Path) -> None:
     from nc.acp_client import AcpEvidenceOverflow
 
@@ -349,6 +378,25 @@ def test_unknown_air_warning_uses_decoder_effective_completion_semantics(tmp_pat
     assert is_completion_candidate(turn.prompt_fact)
 
 
+def test_raw_air_observation_keeps_bounded_unknown_extension_separately(tmp_path: Path) -> None:
+    turn = run(tmp_path, "raw_extension")
+    raw = turn.prompt_fact["air_observations"]
+    assert raw[0]["providerExtension"] == {"nested": ["retained", {"shape": "exact"}]}
+    assert "providerExtension" not in turn.prompt_fact["session_failures"][0]
+
+
+def test_effective_air_record_preserves_title_and_details_separately(tmp_path: Path) -> None:
+    # Use a normal terminal exchange so this asserts the effective, decoder
+    # reconciled record rather than only the failure envelope above.
+    # ``terminal_details`` shares the fake server's terminal path below.
+    turn = run(tmp_path, "terminal_details")
+    assert turn.prompt_fact["session_failures"] == [{
+        "id": turn.prompt_fact["prompt_id"] + ":x", "revision": 1,
+        "category": "service", "severity": "error", "title": "retry",
+        "details": "provider detail", "actions": ["retry"],
+    }]
+
+
 def test_uncertain_cleanup_has_typed_failure_envelope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Simulate unavailable cgroup membership proof after the fake server has
     # exited.  The child is reaped, but that is deliberately insufficient to
@@ -387,6 +435,16 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
         assert raised.value.process["pid"] > 0
         assert isinstance(raised.value.shutdown, str)
         assert raised.value.process["timed_out"] is False
+
+
+@pytest.mark.parametrize("scenario", ["bool_protocol_version", "bool_air_version"])
+def test_fake_boolean_initialize_versions_are_rejected_before_session_creation(
+    tmp_path: Path, scenario: str,
+) -> None:
+    with pytest.raises(AcpClientRejected, match="does not advertise") as raised:
+        run(tmp_path, scenario)
+    assert raised.value.process["exit_code"] == 0
+    assert "intentional shutdown" in raised.value.shutdown
 
 
 @pytest.mark.parametrize(("scenario", "phase"), [

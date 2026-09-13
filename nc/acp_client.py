@@ -26,7 +26,9 @@ _MAX_EVIDENCE_BYTES = 64 * 1024
 _MAX_AIR_TEXT_BYTES = 4 * 1024
 _MAX_AIR_ACTIONS = 64
 _MAX_AIR_ACTION_BYTES = 256
+_MAX_RAW_AIR_FAILURE_BYTES = 8 * 1024
 _MAX_JSONRPC_ERROR_BYTES = 4 * 1024
+_MISSING = object()
 
 _ORDINARY_MODE = "agent"
 # These are the effective sandbox values of ``AgentMode.Agent`` in the pinned
@@ -152,10 +154,11 @@ class AcpTurnEvidence:
 
     The collector retains at most 128 correlated AIR/terminal records and
     64 KiB of their JSON representation.  Usage is a single independent last
-    complete snapshot, rather than a notification history.  AIR text is
-    limited to 4 KiB per field and actions to 64 x 256 bytes.  It never
-    retains transcript or tool updates.  Overflow is a failure, rather than a
-    dropped observation.
+    complete snapshot, rather than a notification history.  Each raw AIR
+    ``sessionFailure`` is retained as exact JSON only up to 8 KiB; the
+    separate decoder projection limits AIR text to 4 KiB per field and
+    actions to 64 x 256 bytes.  It never retains transcript or tool updates.
+    Overflow is a failure, rather than a dropped observation.
     """
 
     prompt: AcpPromptFact | None
@@ -179,17 +182,52 @@ class _TurnEvidenceCollector:
         self.air_observations: list[object] = []
         self.usage: dict[str, int] | None = None
 
-    def _add(self, value: object) -> None:
+    def _add(self, value: object, raw_air_failure: object = _MISSING) -> None:
         try:
             size = len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
         except (TypeError, ValueError):
             self.overflow = True
             raise AcpEvidenceOverflow("ACP evidence-overflow: unserializable authoritative evidence")
-        if len(self.records) >= _MAX_EVIDENCE_RECORDS or self.bytes + size > _MAX_EVIDENCE_BYTES:
+        raw_size = 0
+        if raw_air_failure is not _MISSING:
+            try:
+                raw_size = len(json.dumps(raw_air_failure, separators=(",", ":"), ensure_ascii=False).encode())
+            except (TypeError, ValueError):
+                self.overflow = True
+                raise AcpEvidenceOverflow("ACP evidence-overflow: unserializable raw AIR evidence")
+        if len(self.records) >= _MAX_EVIDENCE_RECORDS or self.bytes + size + raw_size > _MAX_EVIDENCE_BYTES:
             self.overflow = True
             raise AcpEvidenceOverflow("ACP evidence-overflow: correlated evidence limit exceeded")
         self.records.append(value)
-        self.bytes += size
+        self.bytes += size + raw_size
+        if raw_air_failure is not _MISSING:
+            self.air_observations.append(raw_air_failure)
+
+    def _raw_failure(self, update: object) -> object:
+        """Return a detached, bounded exact sessionFailure value if present."""
+        present, value = _raw_air_failure(update)
+        if not present:
+            return _MISSING
+        try:
+            encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()
+        except (TypeError, ValueError):
+            self.overflow = True
+            self.air_observations.append({"evidence_status": "evidence_overflow",
+                                          "reason": "unserializable AIR sessionFailure"})
+            raise AcpEvidenceOverflow("ACP evidence-overflow: unserializable raw AIR evidence")
+        if len(encoded) > _MAX_RAW_AIR_FAILURE_BYTES:
+            self.overflow = True
+            self.air_observations.append({"evidence_status": "evidence_overflow",
+                                          "reason": "AIR sessionFailure exceeds local limit"})
+            raise AcpEvidenceOverflow("ACP evidence-overflow: raw AIR sessionFailure exceeds local limit")
+        # A JSON round trip detaches a mutable parser object and is the exact
+        # bounded wire value, including unknown fields and malformed shapes.
+        return json.loads(encoded)
+
+    def _mark_raw_overflow(self, reason: str) -> None:
+        """Expose loss explicitly when a decoder-bound projection overflows."""
+        self.overflow = True
+        self.air_observations.append({"evidence_status": "evidence_overflow", "reason": reason})
 
     def prompt_request(self, value: dict[str, object], prompt_id: int, session_id: str) -> None:
         self.prompt_id, self.session_id = prompt_id, session_id
@@ -207,15 +245,18 @@ class _TurnEvidenceCollector:
         update = params.get("update")
         if not isinstance(update, dict):
             return
-        air = _project_air(update)
+        raw_failure = self._raw_failure(update)
+        try:
+            air = _project_air(update)
+        except AcpEvidenceOverflow:
+            self._mark_raw_overflow("AIR decoder projection exceeds local limit")
+            raise
         usage = _project_usage(update.get("usage")) if update.get("sessionUpdate") == "usage_update" else None
         if air is None and usage is None:
             return
         projected: dict[str, object] = {}
-        raw_failure: object | None = None
         if air is not None:
             projected["_meta"] = {"jetbrains": {"air": air}}
-            raw_failure = air.get("sessionFailure")
         if usage is not None:
             # Usage reports are snapshots.  Do not turn a notification flood
             # into a bounded transcript merely to give the decoder a value.
@@ -228,9 +269,8 @@ class _TurnEvidenceCollector:
             # Commit the raw audit observation only with its bounded decoder
             # record.  In particular, a rejected overflow record cannot leak
             # through the failure envelope beyond the published limit.
-            self._add(record)
-            if raw_failure is not None and _incident_belongs(raw_failure, self.prompt_id):
-                self.air_observations.append(raw_failure)
+            self._add(record, raw_failure if raw_failure is not _MISSING
+                      and _incident_belongs(raw_failure, self.prompt_id) else _MISSING)
 
     def prompt_response(self, value: object) -> None:
         if not isinstance(value, dict):
@@ -239,10 +279,11 @@ class _TurnEvidenceCollector:
         # Prompt result extensions may carry arbitrary content too.  The
         # decoder has authority only over these terminal fields.
         retained: dict[str, object] = {"id": value.get("id")}
-        raw_failure: object | None = None
+        raw_failure = _MISSING
         if "result" in value:
             result = value["result"]
             if isinstance(result, dict):
+                raw_failure = self._raw_failure(result)
                 terminal: dict[str, object] = {}
                 if "stopReason" in result:
                     # A non-string is retained only as the invalid marker;
@@ -253,12 +294,13 @@ class _TurnEvidenceCollector:
                 if usage is not None:
                     terminal["usage"] = usage
                     self.usage = usage
-                air = _project_air(result)
+                try:
+                    air = _project_air(result)
+                except AcpEvidenceOverflow:
+                    self._mark_raw_overflow("AIR decoder projection exceeds local limit")
+                    raise
                 if air is not None:
                     terminal["_meta"] = {"jetbrains": {"air": air}}
-                    raw_failure = air.get("sessionFailure")
-                else:
-                    raw_failure = None
                 retained["result"] = terminal
             else:
                 retained["result"] = None
@@ -274,9 +316,8 @@ class _TurnEvidenceCollector:
                 }
             else:
                 retained["error"] = None
-        self._add(retained)
-        if raw_failure is not None and _incident_belongs(raw_failure, self.prompt_id):
-            self.air_observations.append(raw_failure)
+        self._add(retained, raw_failure if raw_failure is not _MISSING
+                  and _incident_belongs(raw_failure, self.prompt_id) else _MISSING)
 
 
 def _project_usage(value: object) -> dict[str, int] | None:
@@ -330,6 +371,19 @@ def _project_air(update: object) -> dict[str, object] | None:
         # arbitrary provider object/string as evidence.
         projected["sessionFailure"] = None
     return projected
+
+
+def _raw_air_failure(update: object) -> tuple[bool, object]:
+    """Find an AIR sessionFailure without normalizing its wire value."""
+    if not isinstance(update, dict) or not isinstance(update.get("_meta"), dict):
+        return False, None
+    try:
+        air = update["_meta"]["jetbrains"]["air"]
+    except (KeyError, TypeError):
+        return False, None
+    if not isinstance(air, dict) or "sessionFailure" not in air:
+        return False, None
+    return True, air["sessionFailure"]
 
 
 def _bounded_text(value: str, limit: int, field: str) -> str:
@@ -675,7 +729,8 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
             "stop_reason": decoded.stop_reason, "air_observations": observations,
             "session_failures": [
                 {"id": item.incident_id, "revision": item.revision, "category": item.category,
-                 "severity": item.severity, "title": item.diagnostic, "actions": list(item.actions)}
+                 "severity": item.severity, "title": item.title, "actions": list(item.actions),
+                 **({"details": item.details} if item.details is not None else {})}
                 for item in decoded.failures
             ],
         }

@@ -39,6 +39,8 @@ class AirFailureEvidence:
     category: str
     actions: tuple[str, ...]
     severity: Literal["warning", "error"]
+    title: str
+    details: str | None
     diagnostic: str
     unknown_category: str | None = None
     unknown_actions: tuple[str, ...] = ()
@@ -194,8 +196,8 @@ def _failure(value: object) -> tuple[AirFailureEvidence | None, str | None]:
     unknown_actions = tuple(action for action in actions if action not in _KNOWN_ACTIONS)
     diagnostic = _diagnostic(f"{title}: {details}" if details else title)
     return AirFailureEvidence(incident_id, revision, category if unknown_category is None else "unknown",
-                              tuple(actions), severity, diagnostic, unknown_category,
-                              unknown_actions), None
+                              tuple(actions), severity, title, details, diagnostic,
+                              unknown_category, unknown_actions), None
 
 
 def decode_acp_prompt_result(

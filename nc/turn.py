@@ -221,6 +221,7 @@ def _record_host(state: State, run_id: int, result, assessment: HostAssessment) 
         run_id, exit_code=result.exit_code, timed_out=result.timed_out,
         category=assessment.category, diagnostic=assessment.diagnostic,
         assessment=assessment.status,
+        evidence_path=(str(result.evidence_path) if getattr(result, "evidence_path", None) else None),
     )
     _set_defer_until(state, run_id, assessment.diagnostic)
 

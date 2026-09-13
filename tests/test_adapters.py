@@ -261,6 +261,34 @@ def test_signal_killed_session_is_host_failure_for_both_adapter_paths(tmp_path, 
     assert "SIGKILL (9)" in assessment.diagnostic
 
 
+def test_acp_assessment_uses_correlated_facts_not_log_text(tmp_path):
+    path = tmp_path / "quoted.log"
+    path.write_text('{"type":"turn.completed"}\nOK\n')
+    prompt = {
+        "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+        "stop_reason": "end_turn", "air_observations": [], "session_failures": [],
+    }
+    result = SessionResult(0, path, 5, False, transport="acp", completion=True,
+                           acp_result_kind="success",
+                           acp_process={"exit_code": 0, "signal": None, "timed_out": False},
+                           acp_prompt=prompt)
+    assert not assess_session(result, "codex-acp").failed
+    result.completion = False
+    assert assess_session(result, "codex-acp").category == "protocol"
+
+
+def test_acp_signal_after_response_is_not_manufactured_success(tmp_path):
+    path = tmp_path / "probe.log"
+    prompt = {"prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+              "stop_reason": "end_turn", "air_observations": [], "session_failures": []}
+    result = SessionResult(-15, path, None, False, terminal_diagnostic="ACP intentional shutdown",
+                           transport="acp", completion=True,
+                           acp_result_kind="success",
+                           acp_process={"exit_code": None, "signal": 15, "timed_out": False},
+                           acp_prompt=prompt)
+    assert assess_session(result, "codex-acp").category == "local_error"
+
+
 @pytest.mark.parametrize("adapter", ["codex", "claude"])
 def test_run_preserves_signal_exit_code_for_both_adapter_paths(tmp_path, monkeypatch, adapter):
     """Synthetic adapter process verifies the real runner path retains -SIGNUM."""

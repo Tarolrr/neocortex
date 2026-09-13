@@ -13,6 +13,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from .acp_contract import is_completion_candidate
+
+if TYPE_CHECKING:
+    from .acp_client import CodexAcpLaunchEvidence, CodexAcpPolicy
 
 # codex exec's text footer is two lines: "tokens used\n26,457".
 TOKENS_RE = re.compile(
@@ -109,6 +115,14 @@ def _usage_total(usage: object, adapter: str) -> int | None:
     return sum(values)
 
 
+def _acp_usage_total(usage: object) -> int | None:
+    """ACP snapshots use camelCase and their explicit total is authoritative."""
+    if not isinstance(usage, dict):
+        return None
+    total = usage.get("totalTokens", usage.get("total_tokens"))
+    return total if isinstance(total, int) and not isinstance(total, bool) and total >= 0 else None
+
+
 def parse_stream_tokens(adapter: str, text: str) -> int | None:
     """Read usage only from the final machine-stream terminal event.
 
@@ -144,6 +158,15 @@ class SessionResult:
     # can contain quoted provider errors from prompts, tools, or summaries.
     terminal_category: str | None = None
     terminal_diagnostic: str = ""
+    # ``legacy`` retains the historic CLI stream rules.  ACP is deliberately
+    # fact-only: its log is diagnostic output and never completion authority.
+    transport: str = "legacy"
+    completion: bool | None = None
+    acp_result_kind: str | None = None
+    acp_process: dict[str, object] | None = None
+    acp_prompt: dict[str, object] | None = None
+    acp_cleanup_uncertain: bool = False
+    evidence_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +256,13 @@ def has_successful_terminal(adapter: str, log_path: Path) -> bool:
     if adapter == "claude":
         return event.get("type") == "result" and event.get("is_error") is not True
     return False
+
+
+def has_successful_completion(result: SessionResult, adapter: str) -> bool:
+    """Return typed completion evidence, with the old stream rule for CLIs."""
+    if result.transport == "acp":
+        return result.completion is True
+    return has_successful_terminal(adapter, result.log_path)
 
 
 def _error_text(event: dict[str, object]) -> str:
@@ -368,6 +398,8 @@ def _structured_terminal(adapter: str, text: str) -> tuple[str, str] | None:
 
 def assess_session(result: SessionResult, _adapter: str) -> HostAssessment:
     """Apply host evidence precedence before an outcome can have effects."""
+    if result.transport == "acp":
+        return _assess_acp(result)
     if result.timed_out:
         return HostAssessment("FAILED", "host_timeout", "host timeout")
     # On POSIX, subprocess reports a signal-terminated child as -SIGNUM.
@@ -403,6 +435,30 @@ def assess_session(result: SessionResult, _adapter: str) -> HostAssessment:
     return HostAssessment("SUCCESS", "none", "")
 
 
+def _assess_acp(result: SessionResult) -> HostAssessment:
+    """Assess only correlated ACP facts; ACP stderr is never a protocol input."""
+    process, prompt = result.acp_process, result.acp_prompt
+    if not isinstance(process, dict) or not isinstance(prompt, dict):
+        return HostAssessment("FAILED", "protocol", "ACP completion evidence is absent")
+    if result.acp_cleanup_uncertain or "containment uncertain" in result.terminal_diagnostic.lower():
+        return HostAssessment("FAILED", "local_error", "ACP cleanup containment is uncertain")
+    if process.get("timed_out") is True:
+        return HostAssessment("FAILED", "host_timeout", "ACP host deadline expired")
+    signal_number = process.get("signal")
+    if isinstance(signal_number, int) and not isinstance(signal_number, bool):
+        shutdown = result.terminal_diagnostic.lower()
+        category = "local_error" if "intentional shutdown" in shutdown else "host_timeout"
+        detail = ("ACP deliberately terminated by supervisor after response"
+                  if category == "local_error" else f"ACP process terminated by signal {signal_number}")
+        return HostAssessment("FAILED", category, detail)
+    if process.get("exit_code") != 0:
+        return HostAssessment("FAILED", "local_error", "ACP process did not exit successfully")
+    if (result.acp_result_kind != "success" or result.completion is not True
+            or not is_completion_candidate(prompt)):
+        return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
+    return HostAssessment("SUCCESS", "none", "")
+
+
 class Adapter:
     name = "adapter"
 
@@ -417,6 +473,68 @@ class Adapter:
                     timeout_s: int) -> SessionResult:
         """Launch the restricted advisory policy; never alias this to ``run``."""
         raise NotImplementedError
+
+
+class CodexAcpAdapter(Adapter):
+    """Injectable ACP bridge.  It is intentionally absent from ``ADAPTERS``."""
+
+    name = "codex-acp"
+
+    def __init__(self, command: list[str] | tuple[str, ...], launch: CodexAcpLaunchEvidence,
+                 policy_factory=None) -> None:
+        self.command = tuple(command)
+        self.launch = launch
+        if policy_factory is None:
+            from .acp_client import CodexAcpPolicy
+            policy_factory = CodexAcpPolicy.ordinary
+        self.policy_factory = policy_factory
+
+    def available(self) -> bool:
+        # Launch evidence, not PATH discovery, authorizes this isolated adapter.
+        return bool(self.command)
+
+    def run(self, prompt: str, cwd: Path, model: str, log_path: Path,
+            timeout_s: int) -> SessionResult:
+        return self._run(prompt, cwd, model, log_path, timeout_s)
+
+    def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
+                    timeout_s: int) -> SessionResult:
+        return self._run(prompt, cwd, model, log_path, timeout_s)
+
+    def _run(self, prompt: str, cwd: Path, model: str, log_path: Path,
+             timeout_s: int) -> SessionResult:
+        evidence_path = log_path.with_name("acp-evidence.json")
+        try:
+            from .acp_client import run_codex_acp_turn
+            turn = run_codex_acp_turn(self.command, launch=self.launch,
+                                      policy=self.policy_factory(cwd), model=model, prompt=prompt,
+                                      log_path=log_path, timeout_s=timeout_s)
+            process, prompt_fact = dict(turn.process), dict(turn.prompt_fact)
+            completion = turn.prompt.kind == "success" and is_completion_candidate(prompt_fact)
+            shutdown = turn.shutdown or ""
+            result_kind = turn.prompt.kind
+            cleanup_uncertain = "containment uncertain" in shutdown.lower()
+        except BaseException as exc:
+            evidence = getattr(exc, "evidence", None)
+            process = dict(getattr(evidence, "process", None) or getattr(exc, "process", None) or {})
+            prompt_fact = dict(getattr(evidence, "prompt", None) or {})
+            completion, shutdown = False, str(getattr(evidence, "shutdown", "") or exc)
+            result_kind = "local_failure"
+            cleanup_uncertain = bool(getattr(evidence, "cleanup_uncertain", False))
+        payload: dict[str, Any] = {"transport": "acp", "completion": completion,
+                                   "result_kind": result_kind, "process": process, "prompt": prompt_fact,
+                                   "shutdown": sanitize_diagnostic(shutdown)}
+        evidence_path.write_text(json.dumps(payload, sort_keys=True))
+        exit_code = process.get("exit_code")
+        return SessionResult(exit_code if isinstance(exit_code, int) else 1, log_path,
+                             _acp_usage_total(prompt_fact.get("usage")),
+                             process.get("timed_out") is True, None,
+                             sanitize_diagnostic(shutdown), "acp", completion,
+                             result_kind, process, prompt_fact, cleanup_uncertain, evidence_path)
+
+
+# Short alias for tests and future callers which describe the transport, not its vendor.
+AcpAdapter = CodexAcpAdapter
 
 
 def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionResult:

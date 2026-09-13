@@ -417,8 +417,13 @@ def inspect_runtime(root: Path, *, profile: str = "agent") -> CodexAcpRuntime:
     # service-PATH selection.  Authenticate it for tree integrity, but launch
     # its JS entry point with the recorded absolute Node interpreter instead.
     launcher = modules / ".bin" / "codex-acp"
-    if not launcher.is_file() or not os.access(launcher, os.X_OK):
-        raise AcpRuntimeNotReady("verified absolute codex-acp launcher is missing or not executable")
+    # This is an npm bin *link*, not the executable we invoke.  Its normal
+    # target is JavaScript and may legitimately lack an executable bit because
+    # the absolute, install-bound Node interpreter below runs it directly.
+    # Requiring X_OK here would reject a valid published layout and tempt a
+    # caller to invoke the PATH-sensitive ``#!/usr/bin/env node`` shim.
+    if not launcher.is_symlink() or not launcher.is_file():
+        raise AcpRuntimeNotReady("verified absolute codex-acp launcher is missing or not a valid npm link")
     resolved = launcher.resolve()
     if root not in resolved.parents:
         raise AcpRuntimeNotReady("codex-acp launcher resolves outside isolated runtime")

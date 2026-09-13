@@ -95,7 +95,10 @@ def runtime_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, arch: str =
     (root / "launcher.sha256").write_text(
         acp_runtime.hashlib.sha256(command.read_bytes()).hexdigest() + "  node_modules/.bin/codex-acp\n")
     node = tmp_path / "absolute-node"
-    node.write_text("#!/bin/sh\n[ \"$1\" = --version ] && printf '%s\\n' v20.19.0\n")
+    # Behave like an absolute Node interpreter for both its version probe and
+    # the later JS-entrypoint launch.  The test is about PATH independence,
+    # not a shell ``test`` command's false-status propagation.
+    node.write_text("#!/bin/sh\n[ \"$1\" = --version ] && printf '%s\\n' v20.19.0\nexit 0\n")
     node.chmod(0o700)
     (root / "node.json").write_text(
         '{"path":"' + str(node) + '","version":"20.19.0","sha256":"'

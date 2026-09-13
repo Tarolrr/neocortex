@@ -584,7 +584,14 @@ def credential_readiness(credential_file: Path) -> str:
 
 
 def _supported_auth(value: object) -> bool:
-    """Pinned Codex file-auth records: API key or OAuth token record only."""
+    """Accept only file-auth material deserializable by pinned Codex 0.153.4.
+
+    In that release ``tokens`` is ``TokenData``, not an arbitrary OAuth-like
+    mapping: its required ``id_token`` uses a custom serde deserializer which
+    parses the JWT payload.  Reproduce that inexpensive, offline structural
+    check here so readiness cannot bless a file that the pinned binary will
+    reject before it can perform its noninteractive refresh.
+    """
     if not isinstance(value, dict):
         return False
     api_key = value.get("OPENAI_API_KEY")
@@ -592,8 +599,38 @@ def _supported_auth(value: object) -> bool:
         return True
     tokens = value.get("tokens")
     return (isinstance(tokens, dict)
+            and _pinned_id_token(tokens.get("id_token"))
             and isinstance(tokens.get("access_token"), str) and bool(tokens["access_token"].strip())
-            and isinstance(tokens.get("refresh_token"), str) and bool(tokens["refresh_token"].strip()))
+            and isinstance(tokens.get("refresh_token"), str) and bool(tokens["refresh_token"].strip())
+            and ("account_id" not in tokens
+                 or tokens["account_id"] is None
+                 or isinstance(tokens["account_id"], str)))
+
+
+def _pinned_id_token(value: object) -> bool:
+    """Mirror 0.153.4's ``deserialize_id_token`` enough to fail closed.
+
+    The pinned Rust parser checks for three nonempty JWT segments, decodes the
+    middle segment with ``URL_SAFE_NO_PAD``, and deserializes it as an object.
+    It intentionally does not verify the JWT signature at auth-file load time;
+    readiness must not claim stronger offline verification than that runtime
+    behavior.  Token values and decoded claims stay entirely in memory.
+    """
+    if not isinstance(value, str):
+        return False
+    parts = value.split(".")
+    if len(parts) < 3 or not all(parts[:3]) or "=" in parts[1]:
+        return False
+    try:
+        # Rust's URL_SAFE_NO_PAD accepts unpadded base64url.  Python requires
+        # padding restoration solely for decoding; reject non-url-safe input.
+        payload = parts[1]
+        if any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for char in payload):
+            return False
+        decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        return isinstance(json.loads(decoded), dict)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def cleanup_private_home(home: Path, *, expected_parent: Path) -> None:

@@ -361,7 +361,10 @@ def test_private_parent_rejects_linked_worktree_common_gitdir(tmp_path: Path) ->
 
 def test_private_home_is_explicit_and_cleanup_is_scoped(tmp_path):
     source = tmp_path / "auth.json"
-    source.write_text('{"tokens": {"access_token": "fixture", "refresh_token": "fixture"}}')
+    source.write_text(
+        '{"tokens": {"id_token": "e30.e30.c2ln", "access_token": "fixture", '
+        '"refresh_token": "fixture"}}'
+    )
     source.chmod(0o600)
     parent = tmp_path / "private"
     home = acp_runtime.prepare_private_home(source, parent=parent)
@@ -402,3 +405,29 @@ def test_credential_readiness_rejects_unrecognised_json(tmp_path: Path) -> None:
     source.chmod(0o600)
     with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="unsupported"):
         acp_runtime.credential_readiness(source)
+
+
+@pytest.mark.parametrize("id_token", (None, "not-a-jwt", "e30.not-json.c2ln", "e30.e30."))
+def test_credential_readiness_rejects_oauth_without_pinned_token_data_shape(
+        tmp_path: Path, id_token: str | None) -> None:
+    """0.153.4 TokenData requires a parseable id_token, not merely refresh."""
+    source = tmp_path / "auth.json"
+    tokens: dict[str, str] = {"access_token": "fixture", "refresh_token": "fixture"}
+    if id_token is not None:
+        tokens["id_token"] = id_token
+    import json
+    source.write_text(json.dumps({"tokens": tokens}))
+    source.chmod(0o600)
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="unsupported"):
+        acp_runtime.credential_readiness(source)
+
+
+def test_credential_readiness_accepts_parseable_pinned_oauth_token_data(tmp_path: Path) -> None:
+    source = tmp_path / "auth.json"
+    # URL-safe, unpadded JSON objects: exactly the parse depth 0.153.4 uses.
+    source.write_text(
+        '{"tokens":{"id_token":"e30.eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ.c2ln",'
+        '"access_token":"fixture","refresh_token":"fixture","account_id":null}}'
+    )
+    source.chmod(0o600)
+    assert "readable" in acp_runtime.credential_readiness(source)

@@ -73,15 +73,19 @@ absolute interpreter is verified again at launch.
 
 ## Authentication boundary
 
-The isolated child has a newly created private HOME.  Codex's
-[file-auth storage source](https://github.com/openai/codex/blob/main/codex-rs/login/src/auth/storage.rs)
-reads `auth.json` from `CODEX_HOME`; that is the source-backed boundary used
+The isolated child has a newly created private HOME.  The exact Codex 0.153.4
+[file-auth storage source](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/login/src/auth/storage.rs)
+reads `auth.json` from `CODEX_HOME`; its pinned
+[TokenData parser](https://github.com/openai/codex/blob/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/login/src/token_data.rs)
+requires `id_token`, `access_token`, and `refresh_token`, and parses the ID
+token's base64url JSON JWT payload. That is the source-backed boundary used
 here. The explicit `nc acp-ordinary-smoke` opt-in uses only
 `prepare_private_home(EXPLICIT_AUTH_JSON, parent=...)`:
 it checks and copies the owner-selected existing Codex `auth.json` with mode
 0600 to `CODEX_HOME/auth.json`, the exact upstream lookup path. It accepts
-only a nonempty `OPENAI_API_KEY` record or OAuth `tokens.access_token` plus
-`tokens.refresh_token`, so unsupported auth storage fails offline. It does not
+only a nonempty `OPENAI_API_KEY` record or OAuth `tokens` having nonempty
+`id_token`, `access_token`, and `refresh_token`; the ID token must pass that
+pinned offline parser. Unsupported auth storage fails offline. It does not
 run login, mutate or enumerate the original
 credential store, record credential values, or copy config.  This is a
 read-only reuse boundary; an unreadable, empty, malformed, or unsupported
@@ -116,8 +120,11 @@ passes only the verified absolute command/evidence to the client. That
 operation, model/network usability, and live sandbox enforcement are
 intentionally not performed by `nc doctor` or acceptance tests.
 
-For the pinned `agent` profile, source-backed settings are `workspaceWrite`,
-`on-request`, and `auto_review`, with network and public web disabled. Treat
+For the pinned 1.11.0 `agent` profile, the exact tagged
+[AgentMode source](https://github.com/agentclientprotocol/codex-acp/blob/51d6247ac7448485bfcf534b813196fafc26df59/src/AgentMode.ts)
+sets `workspaceWrite`, `on-request`, and `auto_review`, with
+`networkAccess: false`; the enforced private config also sets
+`web_search = "disabled"`. Treat
 the paid smoke as a pass only if the log and filesystem show all of these:
 
 1. `.nc-acp-smoke` exists inside the selected worktree, the configured build

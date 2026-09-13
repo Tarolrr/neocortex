@@ -245,7 +245,10 @@ def test_private_auth_is_at_codex_home_and_absolute_launcher_ignores_path(tmp_pa
     from nc import acp_runtime
 
     auth = tmp_path / "source-auth.json"
-    auth.write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
+    auth.write_text(
+        '{"tokens":{"id_token":"e30.e30.c2ln","access_token":"fixture",'
+        '"refresh_token":"fixture"}}'
+    )
     auth.chmod(0o600)
     home = acp_runtime.prepare_private_home(auth, parent=tmp_path / "homes")
     observed = tmp_path / "observed.json"

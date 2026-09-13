@@ -12,8 +12,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from .acp_contract import is_effective_completion
-
 ResultKind = Literal["success", "failed", "cancelled", "protocol_invalid"]
 _KNOWN_CATEGORIES = {"connection", "access", "limit", "request", "service", "unknown"}
 _KNOWN_ACTIONS = {"retry", "new_session", "login"}
@@ -303,10 +301,13 @@ def decode_acp_prompt_result(
         return AcpPromptResult("cancelled", stop_reason, None, evidence, usage)
     if stop_reason != "end_turn":
         return AcpPromptResult("failed", stop_reason, None, evidence, usage)
-    if is_effective_completion(stop_reason, (item.severity for item in evidence)):
+    # Warnings are recoverable observations.  The bridge determines whether
+    # subsequent structured progress clears them from its active policy set.
+    if not evidence or all(item.severity == "warning" for item in evidence):
         return AcpPromptResult("success", stop_reason, None, evidence, usage)
     errors = [item for item in evidence if item.severity == "error"]
-    return AcpPromptResult("failed", stop_reason, errors[-1].diagnostic or None, evidence, usage)
+    diagnostic = errors[-1].diagnostic if errors else "ACP reported session failure"
+    return AcpPromptResult("failed", stop_reason, diagnostic or None, evidence, usage)
 
 
 # A short public name is convenient for a future adapter without making it one.

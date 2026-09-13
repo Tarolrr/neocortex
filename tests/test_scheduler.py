@@ -12,7 +12,8 @@ from pathlib import Path
 import pytest
 
 from nc import cli, operations, protocol, turn
-from nc.adapters import SessionResult
+from nc.acp_decoder import decode_acp_prompt_result
+from nc.adapters import AcpAdapter, SessionResult
 from nc.config import Config
 from nc.lifecycle import LifecycleBusy, lifecycle_lock
 from nc.scheduler import Scheduler
@@ -1671,6 +1672,48 @@ class TimerFlakyAdapter(ScriptedAdapter):
         return result
 
 
+class AcpTimerFlakyAdapter(ScriptedAdapter):
+    """Isolated ACP facts for timer policy tests; no ACP transport is started."""
+
+    name = "codex-acp"
+
+    def __init__(self, script, category, actions, *, local_failure=False):
+        super().__init__(script)
+        self.category = category
+        self.actions = actions
+        self.local_failure = local_failure
+        self.temporary_failures = 1
+
+    def run(self, *args, **kwargs):
+        result = super().run(*args, **kwargs)
+        result.transport = "acp"
+        result.completion = True
+        result.acp_result_kind = "success"
+        result.acp_process = {
+            "pid": 41, "exit_code": 0, "signal": None, "timed_out": False,
+            "timeout_phases": [], "stderr_available": True,
+            "supervisor_terminated": False,
+        }
+        failures = []
+        if self.temporary_failures:
+            self.temporary_failures -= 1
+            failures = [{
+                "id": "air-1", "revision": 1, "category": self.category,
+                "severity": "error", "title": "isolated provider condition",
+                "actions": self.actions,
+            }]
+            if self.local_failure:
+                result.acp_process["exit_code"] = 1
+        result.acp_prompt = {
+            "request_id": "p", "prompt_id": "p", "session_id": "s",
+            "prompt_response_valid": True,
+            "jsonrpc_result": {"stopReason": "end_turn"},
+            "stop_reason": "end_turn", "air_observations": failures,
+            "session_failures": failures,
+        }
+        return result
+
+
 def timer_invocation(cfg, state, adapter):
     """Fresh Scheduler instance: equivalent to the next five-minute timer run."""
     scheduler = Scheduler(cfg, state)
@@ -1682,7 +1725,11 @@ def timer_invocation(cfg, state, adapter):
 
 
 @pytest.mark.parametrize("role", ["worker", "critic", "planner", "plan_critic"])
-def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
+@pytest.mark.parametrize(("category", "actions"), [
+    ("limit", ["retry"]), ("service", ["retry"]),
+])
+def test_acp_timer_invocation_defers_each_role_and_later_applies_once(
+        setup, role, category, actions):
     """A provider outage ends this timer run; its next run resumes logical work."""
     cfg, state, _repo = setup
     def partial(cwd, outcome_path):
@@ -1691,10 +1738,10 @@ def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
         outcome_path.write_text(json.dumps({"outcome": "YIELD", "summary": "interrupted"}))
     if role == "worker":
         task = state.add_task("neocortex", "worker outage", "objective", [])
-        adapter = TimerFlakyAdapter([
+        adapter = AcpTimerFlakyAdapter([
             partial,
             commit_and_emit("complete", "ok\n", {"outcome": "DONE", "summary": "done"}),
-        ], captured_codex_limit=True)
+        ], category, actions)
         # Undelivered feedback must survive the failed host session.
         state.add_agent(f"worker-{task}", "worker", "neocortex", task, "model")
         state.set_task(task, status="in_progress")
@@ -1706,22 +1753,22 @@ def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
         state.set_agent(f"worker-{task}", state="blocked")
         state.add_agent(f"critic-{task}-1", "critic", "neocortex", task, "model")
         state.send(protocol.FEEDBACK, "owner", f"critic-{task}-1", {"text": "retain"}, task)
-        adapter = TimerFlakyAdapter([
+        adapter = AcpTimerFlakyAdapter([
             partial,
             emit({"outcome": "DONE", "verdict": "rework", "findings": ["fix"]}),
-        ], captured_codex_limit=True)
+        ], category, actions)
     elif role == "planner":
         planner, _ = state.planner_feedback(None, "retain revision wake", "model")
-        adapter = TimerFlakyAdapter([
+        adapter = AcpTimerFlakyAdapter([
             partial,
             emit({"outcome": "DONE", "summary": "proposal", "proposal": [planner_spec()]}),
-        ], captured_codex_limit=True)
+        ], category, actions)
     else:
         proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
-        adapter = TimerFlakyAdapter([
+        adapter = AcpTimerFlakyAdapter([
             partial,
             emit({"outcome": "DONE", "recommendation": "keep", "findings": ["sound"]}),
-        ], captured_codex_limit=True)
+        ], category, actions)
         adapter.run_planner = adapter.run
 
     # The first invocation makes exactly one dispatch and returns on deferral.
@@ -1761,6 +1808,85 @@ def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
                            (review["id"],))
         assert review["status"] == "done"
         assert [row["status"] for row in attempts] == ["retryable", "done"]
+
+
+@pytest.mark.parametrize(("category", "actions", "local_failure", "expected"), [
+    ("limit", [], False, "unknown"),
+    ("access", ["login"], False, "unknown"),
+    ("connection", ["retry"], False, "unknown"),
+    ("service", ["retry"], True, "local_error"),
+])
+def test_acp_nondeferrable_failures_keep_worker_failure_policy(
+        setup, category, actions, local_failure, expected):
+    """Typed ACP quota/access/connection and local facts never enter T009."""
+    cfg, state, _repo = setup
+    task = state.add_task("neocortex", "nondeferrable ACP", "objective", [])
+    adapter = AcpTimerFlakyAdapter(
+        [emit({"outcome": "YIELD", "summary": "partial retained"})],
+        category, actions, local_failure=local_failure)
+    timer_invocation(cfg, state, adapter)
+    host = state.one("SELECT terminal_category AS category FROM run ORDER BY id DESC LIMIT 1")
+    agent = state.one("SELECT turns FROM agent WHERE role='worker' ORDER BY id LIMIT 1")
+    assert host["category"] == expected
+    assert state.one("SELECT attempts FROM task WHERE id=?", (task,))[0] == 1
+    assert agent["turns"] == 1
+
+
+@pytest.mark.parametrize(("category", "expected"), [
+    ("limit", "throttled"),
+    ("service", "transient"),
+])
+def test_decoded_air_failure_through_acp_adapter_defers_timer(
+        setup, monkeypatch, category, expected):
+    """A decoder-failed canonical AIR terminal reaches T009 through the adapter.
+
+    The fake is the isolated ACP transport seam.  It returns the same decoded
+    ``failed`` result and correlated facts that the real client gives
+    ``CodexAcpAdapter`` for an active AIR error; it does not use restricted
+    ACP or a fabricated successful completion.
+    """
+    cfg, state, _repo = setup
+    task = state.add_task("neocortex", "adapter AIR outage", "objective", [])
+    failure = {
+        "id": "p:failure", "revision": 1, "category": category,
+        "severity": "error", "title": "typed provider condition", "actions": ["retry"],
+    }
+    wire = [
+        {"id": "p", "method": "session/prompt", "params": {"sessionId": "s"}},
+        {"method": "session/update", "params": {"sessionId": "s", "update": {
+            "_meta": {"jetbrains": {"air": {"version": 1, "sessionFailure": failure}}},
+        }}},
+        {"id": "p", "result": {"stopReason": "end_turn"}},
+    ]
+    decoded = decode_acp_prompt_result(wire, request_id="p", session_id="s")
+    assert decoded.kind == "failed"
+    prompt_fact = {
+        "request_id": "p", "prompt_id": "p", "session_id": "s",
+        "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+        "stop_reason": "end_turn", "air_observations": [failure],
+        "session_failures": [{
+            "id": item.incident_id, "revision": item.revision, "category": item.category,
+            "severity": item.severity, "title": item.title, "actions": list(item.actions),
+        } for item in decoded.failures],
+    }
+
+    def fake_turn(*_args, **_kwargs):
+        return type("FakeAcpTurn", (), {
+            "prompt": decoded,
+            "prompt_fact": prompt_fact,
+            "process": {"pid": 43, "exit_code": 0, "signal": None, "timed_out": False,
+                        "timeout_phases": [], "stderr_available": True,
+                        "supervisor_terminated": False},
+            "shutdown": None,
+        })()
+
+    monkeypatch.setattr("nc.acp_client.run_codex_acp_turn", fake_turn)
+    adapter = AcpAdapter(["isolated-fake-acp"], object(), policy_factory=lambda _cwd: object())
+    timer_invocation(cfg, state, adapter)
+    run = state.one("SELECT terminal_category FROM run ORDER BY id DESC LIMIT 1")
+    assert run["terminal_category"] == expected
+    assert state.one("SELECT attempts FROM task WHERE id=?", (task,))[0] == 0
+    assert state.one("SELECT turns FROM agent WHERE role='worker' ORDER BY id LIMIT 1")[0] == 0
 
 
 def test_timer_outages_exceed_task_and_turn_budgets_without_breaker(setup):
@@ -1837,6 +1963,47 @@ def test_preflight_reset_in_log_tail_is_not_trusted_without_terminal_evidence(se
         scheduler._in_run = False
     attempt = state.one("SELECT defer_until FROM preflight_attempt")
     assert attempt["defer_until"] is None
+
+
+def test_acp_preflight_success_persists_typed_evidence_without_a_log(setup, monkeypatch):
+    """Successful ACP probes retain usage/process facts instead of orphaning them."""
+    cfg, state, _repo = setup
+    scheduler = Scheduler(cfg, state)
+    evidence = cfg.home / "preflight-evidence.json"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text('{"usage":{"totalTokens":7}}')
+
+    class AcpProbe:
+        name = "codex-acp"
+
+        def available(self):
+            return True
+
+        def run(self, _prompt, _cwd, _model, log_path, _timeout):
+            return SessionResult(
+                0, log_path, 7, False, transport="acp", completion=True,
+                acp_result_kind="success", evidence_path=evidence,
+                acp_usage={"totalTokens": 7},
+                acp_process={"pid": 77, "exit_code": 0, "signal": None,
+                             "timed_out": False, "timeout_phases": [],
+                             "stderr_available": False, "supervisor_terminated": False},
+                acp_prompt={"request_id": "p", "prompt_id": "p", "session_id": "s",
+                            "prompt_response_valid": True,
+                            "jsonrpc_result": {"stopReason": "end_turn"},
+                            "stop_reason": "end_turn", "air_observations": [],
+                            "session_failures": []},
+            )
+
+    scheduler._adapter_for = lambda _role: AcpProbe()
+    monkeypatch.setattr(scheduler, "_free_mb", lambda: 9999)
+    scheduler._in_run = True
+    try:
+        assert scheduler._preflight_selected("worker") is None
+    finally:
+        scheduler._in_run = False
+    attempt = state.one("SELECT * FROM preflight_attempt")
+    assert (attempt["category"], attempt["usage"], attempt["evidence_path"]) == (
+        "success", 7, str(evidence))
 
 
 @pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])

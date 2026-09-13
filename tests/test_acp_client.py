@@ -183,6 +183,9 @@ if scenario == "delayed_post_response_exit":
     time.sleep(.15); sys.exit(9)
 failure = {"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"warning","title":"retry","actions":["retry"]}
 if scenario == "warning": send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+if scenario == "warning_recovery":
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"progress"}}}})
 if scenario == "raw_extension":
     failure["providerExtension"] = {"nested": ["retained", {"shape": "exact"}]}
     send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
@@ -285,13 +288,28 @@ def test_fake_success_has_independent_shutdown_evidence(tmp_path: Path) -> None:
     assert turn.live_sandbox_enforcement_verified is False
 
 
-@pytest.mark.parametrize("scenario,kind", [("terminal", "failed"), ("warning", "success"),
-                                              ("error", "failed"), ("malformed", "protocol_invalid")])
+@pytest.mark.parametrize("scenario,kind", [("terminal", "failed"), ("error", "failed"),
+                                              ("malformed", "protocol_invalid")])
 def test_fake_terminal_and_recoverable_evidence(tmp_path: Path, scenario: str, kind: str) -> None:
     turn = run(tmp_path, scenario)
     assert turn.prompt.kind == kind
-    if scenario in {"terminal", "warning"}:
+    if scenario == "terminal":
         assert turn.prompt_fact["air_observations"]
+
+
+def test_fake_warning_progress_then_end_turn_is_recovered_success(tmp_path: Path) -> None:
+    turn = run(tmp_path, "warning_recovery")
+    assert turn.prompt.kind == "success"
+    assert turn.prompt_fact["air_observations"]
+    assert turn.prompt_fact["session_failures"] == []
+
+
+def test_fake_warning_then_successful_end_turn_is_recovered_success(tmp_path: Path) -> None:
+    """A canonical completion clears a known update warning without progress."""
+    turn = run(tmp_path, "warning")
+    assert turn.prompt.kind == "success"
+    assert turn.prompt_fact["air_observations"]
+    assert turn.prompt_fact["session_failures"] == []
 
 
 def test_fake_permission_is_denied_noninteractively(tmp_path: Path) -> None:
@@ -416,31 +434,32 @@ def test_fake_numeric_bidirectional_request_id_overlap_is_not_prompt_response(tm
     assert run(tmp_path, "numeric_overlap").prompt.kind == "success"
 
 
-def test_fake_stale_air_revision_cannot_override_decoder_effective_failure(tmp_path: Path) -> None:
+def test_fake_stale_air_revision_cannot_override_recovered_warning(tmp_path: Path) -> None:
     turn = run(tmp_path, "stale_duplicate")
     assert turn.prompt.kind == "success"
     assert turn.prompt.failures[0].revision == 2
-    assert turn.prompt_fact["session_failures"][0]["revision"] == 2
+    assert turn.prompt_fact["session_failures"] == []
 
 
-def test_unknown_air_warning_uses_decoder_effective_completion_semantics(tmp_path: Path) -> None:
+def test_unknown_air_warning_remains_a_conservative_decoder_failure(tmp_path: Path) -> None:
     from nc.acp_contract import is_completion_candidate
 
     turn = run(tmp_path, "unknown_warning")
-    assert turn.prompt.kind == "success"
+    assert turn.prompt.kind == "failed"
     assert turn.prompt_fact["session_failures"] == [{
         "id": turn.prompt_fact["prompt_id"] + ":future", "revision": 1,
         "category": "unknown", "severity": "warning", "title": "future warning",
         "actions": ["future_action"],
     }]
-    assert is_completion_candidate(turn.prompt_fact)
+    assert not is_completion_candidate(turn.prompt_fact)
 
 
 def test_raw_air_observation_keeps_bounded_unknown_extension_separately(tmp_path: Path) -> None:
     turn = run(tmp_path, "raw_extension")
     raw = turn.prompt_fact["air_observations"]
     assert raw[0]["providerExtension"] == {"nested": ["retained", {"shape": "exact"}]}
-    assert "providerExtension" not in turn.prompt_fact["session_failures"][0]
+    assert not hasattr(turn.prompt.failures[0], "providerExtension")
+    assert turn.prompt_fact["session_failures"] == []
 
 
 def test_effective_air_record_preserves_title_and_details_separately(tmp_path: Path) -> None:

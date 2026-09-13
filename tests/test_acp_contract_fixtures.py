@@ -75,10 +75,10 @@ def prompt_fact(wire):
     [
         ("acp-success.synthetic.json", True),
         ("acp-typed-terminal.synthetic.json", False),
-        ("acp-warning-success.synthetic.json", True),
+        ("acp-warning-success.synthetic.json", False),
         ("acp-quota.synthetic.json", False),
-        ("acp-retryable-limit.synthetic.json", True),
-        ("acp-retryable-service.synthetic.json", True),
+        ("acp-retryable-limit.synthetic.json", False),
+        ("acp-retryable-service.synthetic.json", False),
         ("acp-access.synthetic.json", False),
         ("acp-request.synthetic.json", False),
         ("acp-cancelled.synthetic.json", False),
@@ -157,14 +157,14 @@ def test_emitted_failure_shape_and_quota_mapping_are_not_invented():
     }]
 
 
-def test_air_revisions_are_ordered_but_do_not_signal_recovery():
+def test_air_revisions_are_ordered_but_do_not_signal_completion():
     wire = json.loads((FIXTURES / "acp-revision-update.synthetic.json").read_text())
     assert wire["attribution"] == "synthetic; not a captured incident"
     fact = prompt_fact(wire)
     assert [(item["id"], item["revision"]) for item in fact["session_failures"]] == [
         ("p11:retry", 1), ("p11:retry", 2),
     ]
-    assert is_completion_candidate(fact)
+    assert not is_completion_candidate(fact)
 
 
 def test_retry_recovery_is_turn_progress_then_success_without_air_clear_revision():

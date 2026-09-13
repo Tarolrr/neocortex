@@ -13,6 +13,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from .acp_contract import is_air_session_failure, is_completion_candidate
+
+if TYPE_CHECKING:
+    from .acp_client import CodexAcpLaunchEvidence
 
 # codex exec's text footer is two lines: "tokens used\n26,457".
 TOKENS_RE = re.compile(
@@ -109,6 +115,14 @@ def _usage_total(usage: object, adapter: str) -> int | None:
     return sum(values)
 
 
+def _acp_usage_total(usage: object) -> int | None:
+    """ACP snapshots use camelCase and their explicit total is authoritative."""
+    if not isinstance(usage, dict):
+        return None
+    total = usage.get("totalTokens", usage.get("total_tokens"))
+    return total if isinstance(total, int) and not isinstance(total, bool) and total >= 0 else None
+
+
 def parse_stream_tokens(adapter: str, text: str) -> int | None:
     """Read usage only from the final machine-stream terminal event.
 
@@ -144,6 +158,18 @@ class SessionResult:
     # can contain quoted provider errors from prompts, tools, or summaries.
     terminal_category: str | None = None
     terminal_diagnostic: str = ""
+    # ``legacy`` retains the historic CLI stream rules.  ACP is deliberately
+    # fact-only: its log is diagnostic output and never completion authority.
+    transport: str = "legacy"
+    completion: bool | None = None
+    acp_result_kind: str | None = None
+    acp_process: dict[str, object] | None = None
+    acp_prompt: dict[str, object] | None = None
+    acp_cleanup_uncertain: bool = False
+    evidence_path: Path | None = None
+    # A collector snapshot is retained independently from the prompt fact so
+    # accounting survives EOF and other post-response local failures.
+    acp_usage: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +259,13 @@ def has_successful_terminal(adapter: str, log_path: Path) -> bool:
     if adapter == "claude":
         return event.get("type") == "result" and event.get("is_error") is not True
     return False
+
+
+def has_successful_completion(result: SessionResult, adapter: str) -> bool:
+    """Return typed completion evidence, with the old stream rule for CLIs."""
+    if result.transport == "acp":
+        return result.completion is True
+    return has_successful_terminal(adapter, result.log_path)
 
 
 def _error_text(event: dict[str, object]) -> str:
@@ -368,6 +401,8 @@ def _structured_terminal(adapter: str, text: str) -> tuple[str, str] | None:
 
 def assess_session(result: SessionResult, _adapter: str) -> HostAssessment:
     """Apply host evidence precedence before an outcome can have effects."""
+    if result.transport == "acp":
+        return _assess_acp(result)
     if result.timed_out:
         return HostAssessment("FAILED", "host_timeout", "host timeout")
     # On POSIX, subprocess reports a signal-terminated child as -SIGNUM.
@@ -403,6 +438,192 @@ def assess_session(result: SessionResult, _adapter: str) -> HostAssessment:
     return HostAssessment("SUCCESS", "none", "")
 
 
+def _assess_acp(result: SessionResult) -> HostAssessment:
+    """Assess only correlated ACP facts; ACP stderr is never a protocol input."""
+    process, prompt = result.acp_process, result.acp_prompt
+    if not isinstance(process, dict) or not isinstance(prompt, dict):
+        return HostAssessment("FAILED", "protocol", "ACP completion evidence is absent")
+    # A zero exit status without the rest of the independently observed
+    # process envelope is not process success.  In particular, do not let a
+    # hand-written partial fact paper over an unobserved signal or cleanup.
+    if not _valid_acp_process(process):
+        return HostAssessment("FAILED", "protocol", "ACP process evidence is incomplete")
+    if result.acp_cleanup_uncertain:
+        return HostAssessment("FAILED", "local_error", "ACP cleanup containment is uncertain")
+    if process.get("timed_out") is True:
+        return HostAssessment("FAILED", "host_timeout", "ACP host deadline expired")
+    signal_number = process["signal"]
+    if signal_number is not None:
+        if process["supervisor_terminated"]:
+            return HostAssessment("FAILED", "local_error",
+                                  "ACP deliberately terminated by supervisor after response")
+        return HostAssessment("FAILED", "local_error",
+                              f"ACP process terminated unexpectedly by signal {signal_number}")
+    if process["exit_code"] != 0:
+        return HostAssessment("FAILED", "local_error", "ACP process did not exit successfully")
+    # A retry action cannot turn a cancelled, truncated, or otherwise
+    # noncanonical prompt into a timer-retryable provider condition.  Require
+    # the independent terminal result before consulting active AIR evidence.
+    # The decoder deliberately calls active AIR errors ``failed`` (and the
+    # adapter therefore marks completion false).  That decoder-failed state is
+    # still a clean canonical terminal envelope, but only when it carries the
+    # validated active AIR evidence below.  Do not generalize this exception
+    # to JSON-RPC, local, cancellation, or arbitrary failed prompt outcomes.
+    failures = prompt.get("session_failures")
+    active_air_errors = (
+        isinstance(failures, list) and bool(failures)
+        and all(is_air_session_failure(item) for item in failures)
+        and any(isinstance(item, dict) and item.get("severity") == "error"
+                for item in failures)
+    )
+    normal_completion = result.acp_result_kind == "success" and result.completion is True
+    decoded_air_failure = result.acp_result_kind == "failed" and result.completion is False
+    if (not _is_canonical_acp_terminal(prompt)
+            or not (normal_completion or (decoded_air_failure and active_air_errors))):
+        return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
+    # AIR is structured provider evidence, but only one canonical active
+    # effective record, which must be an error, can select the deliberately
+    # small timer policy below.  In
+    # particular, do not use titles, details, stderr, or an apparent live ACP
+    # parent to guess whether a connection failure was remote.
+    if active_air_errors:
+        return _assess_air_failures(prompt, failures)
+    if not is_completion_candidate(prompt):
+        return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
+    return HostAssessment("SUCCESS", "none", "")
+
+
+def _is_canonical_acp_terminal(prompt: dict[str, object]) -> bool:
+    """Validate the terminal prompt envelope before AIR policy selection.
+
+    Active AIR errors deliberately prevent ``is_completion_candidate``: they
+    are failures, not agent outcomes.  They still need a correlated successful
+    ``end_turn`` response so a retry hint cannot override cancellation,
+    max-token exhaustion, JSON-RPC failure, or an unknown stop reason.
+    """
+    request_id = prompt.get("request_id")
+    prompt_id = prompt.get("prompt_id")
+    session_id = prompt.get("session_id")
+    response = prompt.get("jsonrpc_result")
+    return (
+        prompt.get("prompt_response_valid") is True
+        and isinstance(request_id, str) and bool(request_id)
+        and isinstance(prompt_id, str) and bool(prompt_id)
+        and request_id == prompt_id
+        and isinstance(session_id, str) and bool(session_id)
+        and isinstance(response, dict)
+        and response.get("stopReason") == "end_turn"
+        and prompt.get("stop_reason") == "end_turn"
+        and "jsonrpc_error" not in prompt
+    )
+
+
+def _assess_air_failures(prompt: dict[str, object], failures: list[object]) -> HostAssessment:
+    """Map one canonical active AIR error conservatively.
+
+    This is intentionally a table over AIR fields, never prose.  AIR actions
+    remain display data: ``login`` and ``new_session`` neither authenticate
+    nor cause an internal retry/session replacement.  More than one active
+    effective failure (including warnings), unknown actions/categories,
+    malformed/corrupt prompt evidence, and every non-table category fail
+    closed as ``unknown``.
+    """
+    # A malformed record makes the decoder's prompt fact noncanonical.  Do
+    # not allow another, valid-looking record later in the observation list to
+    # obtain a deferral.
+    if prompt.get("prompt_response_valid") is not True:
+        return HostAssessment("FAILED", "protocol", "ACP prompt evidence is malformed")
+    # ``session_failures`` is already the decoder's complete effective set.
+    # A warning that has not been recovered is still active evidence, so it
+    # must participate in this cardinality check.  Filtering it out here
+    # would let an unrelated retryable error select a timer policy despite a
+    # concurrent (possibly extension-action) provider condition.
+    active = failures
+    if len(active) != 1:
+        return HostAssessment("FAILED", "unknown", "ACP has conflicting active session failures")
+    failure = active[0]
+    if not isinstance(failure, dict) or failure.get("severity") != "error":
+        return HostAssessment("FAILED", "unknown", "ACP active session failure is not an eligible error")
+    category = failure["category"]
+    actions = failure["actions"]
+    # is_air_session_failure above establishes these types.  Keep the check
+    # explicit at this policy boundary so future extensions cannot inherit a
+    # retry decision accidentally.
+    if not isinstance(category, str) or not isinstance(actions, list):
+        return HostAssessment("FAILED", "unknown", "ACP AIR category or actions are unknown")
+    diagnostic = sanitize_diagnostic(
+        f"ACP AIR {category} revision {failure['revision']} actions={actions}: {failure['title']}"
+    )
+    if any(action not in {"retry", "new_session", "login"} for action in actions):
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    has_retry = "retry" in actions
+    # Canonical active AIR policy table.  No row establishes subscription
+    # identity, a quota reset, authentication, or an upstream overload field.
+    if category == "limit" and has_retry:
+        return HostAssessment("FAILED", "throttled", diagnostic)
+    if category == "service" and has_retry:
+        return HostAssessment("FAILED", "transient", diagnostic)
+    if category == "limit":
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    if category == "access":
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    if category == "request":
+        return HostAssessment("FAILED", "unknown", diagnostic)
+    # Connection includes a local App Server death and is therefore never a
+    # remote-transient inference.  Unknown is likewise deliberately inert.
+    return HostAssessment("FAILED", "unknown", diagnostic)
+
+
+def _valid_acp_process(process: dict[str, object]) -> bool:
+    """Validate the complete, independently captured local process envelope."""
+    required = {"pid", "exit_code", "signal", "timed_out", "timeout_phases", "stderr_available",
+                "supervisor_terminated"}
+    if not required <= process.keys():
+        return False
+    pid, code, signum = process["pid"], process["exit_code"], process["signal"]
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if code is not None and (not isinstance(code, int) or isinstance(code, bool) or code < 0):
+        return False
+    if signum is not None and (
+            not isinstance(signum, int) or isinstance(signum, bool) or signum <= 0):
+        return False
+    if (not isinstance(process["timed_out"], bool)
+            or not isinstance(process["stderr_available"], bool)
+            or not isinstance(process["supervisor_terminated"], bool)):
+        return False
+    phases = process["timeout_phases"]
+    return isinstance(phases, list) and (process["timed_out"] or not phases) and all(
+        isinstance(phase, str) and phase in {
+            "cancel_response", "session_close", "term_grace", "kill_grace",
+        }
+        for phase in phases
+    )
+
+
+def _sanitize_evidence(value: object, field: str | None = None,
+                       diagnostic: bool = False) -> object:
+    """Redact diagnostic leaves without changing ACP protocol facts.
+
+    The artifact is an evidence record, not a UI excerpt: correlation ids,
+    decoder fields and ordered AIR observations must survive byte-for-byte.
+    Only free-form diagnostic fields can contain secrets and are shortened for
+    the same reason as terminal diagnostics.
+    """
+    if isinstance(value, str):
+        return sanitize_diagnostic(value) if diagnostic or field in {
+            "shutdown", "diagnostic", "title", "details",
+        } else value
+    if isinstance(value, list):
+        return [_sanitize_evidence(item, field, diagnostic) for item in value]
+    if isinstance(value, dict):
+        # JSON-RPC error objects are provider diagnostics.  Unlike result and
+        # correlation fields, every string leaf in them may contain secrets.
+        return {key: _sanitize_evidence(item, key, diagnostic or field == "jsonrpc_error")
+                for key, item in value.items()}
+    return value
+
+
 class Adapter:
     name = "adapter"
 
@@ -417,6 +638,94 @@ class Adapter:
                     timeout_s: int) -> SessionResult:
         """Launch the restricted advisory policy; never alias this to ``run``."""
         raise NotImplementedError
+
+
+class CodexAcpAdapter(Adapter):
+    """Injectable ACP bridge.  It is intentionally absent from ``ADAPTERS``."""
+
+    name = "codex-acp"
+
+    def __init__(self, command: list[str] | tuple[str, ...], launch: CodexAcpLaunchEvidence,
+                 policy_factory=None, restricted_policy_factory=None) -> None:
+        self.command = tuple(command)
+        self.launch = launch
+        if policy_factory is None:
+            from .acp_client import CodexAcpPolicy
+            policy_factory = CodexAcpPolicy.ordinary
+        self.policy_factory = policy_factory
+        if restricted_policy_factory is None:
+            from .acp_client import CodexAcpPolicy
+            restricted_policy_factory = CodexAcpPolicy.restricted
+        self.restricted_policy_factory = restricted_policy_factory
+
+    def available(self) -> bool:
+        # Launch evidence, not PATH discovery, authorizes this isolated adapter.
+        return bool(self.command)
+
+    def run(self, prompt: str, cwd: Path, model: str, log_path: Path,
+            timeout_s: int) -> SessionResult:
+        return self._run(prompt, cwd, model, log_path, timeout_s, self.policy_factory)
+
+    def run_planner(self, prompt: str, cwd: Path, model: str, log_path: Path,
+                    timeout_s: int) -> SessionResult:
+        # Advisory sessions must never inherit the ordinary worker policy,
+        # even when a caller injects one for worker transport tests.
+        return self._run(prompt, cwd, model, log_path, timeout_s,
+                         self.restricted_policy_factory)
+
+    def _run(self, prompt: str, cwd: Path, model: str, log_path: Path,
+             timeout_s: int, policy_factory) -> SessionResult:
+        # The caller gives every invocation its own log directory.  Include a
+        # nonce nevertheless: preflight probes share a parent and each row
+        # must retain its own immutable evidence reference.
+        evidence_path = log_path.with_name(f"acp-evidence-{uuid.uuid4().hex}.json")
+        usage: dict[str, int] | None = None
+        try:
+            from .acp_client import run_codex_acp_turn
+            turn = run_codex_acp_turn(self.command, launch=self.launch,
+                                      policy=policy_factory(cwd), model=model, prompt=prompt,
+                                      log_path=log_path, timeout_s=timeout_s)
+            process, prompt_fact = dict(turn.process), dict(turn.prompt_fact)
+            usage = prompt_fact.get("usage") if isinstance(prompt_fact.get("usage"), dict) else None
+            completion = turn.prompt.kind == "success" and is_completion_candidate(prompt_fact)
+            shutdown = turn.shutdown or ""
+            result_kind = turn.prompt.kind
+            cleanup_uncertain = "containment uncertain" in shutdown.lower()
+        # The bridge turns every client-side termination into persisted negative
+        # evidence; this includes cancellation/interrupt exceptions that are not
+        # ordinary ``Exception`` subclasses.
+        except BaseException as exc:  # noqa: BLE001
+            evidence = getattr(exc, "evidence", None)
+            process = dict(getattr(evidence, "process", None)
+                           or getattr(exc, "process", None) or {})
+            prompt_fact = dict(getattr(evidence, "prompt", None) or {})
+            raw_usage = getattr(evidence, "usage", None)
+            usage = dict(raw_usage) if isinstance(raw_usage, dict) else None
+            if usage is None and isinstance(prompt_fact.get("usage"), dict):
+                usage = prompt_fact["usage"]
+            if usage is not None and "usage" not in prompt_fact:
+                prompt_fact["usage"] = usage
+            completion, shutdown = False, str(getattr(evidence, "shutdown", "") or exc)
+            result_kind = "local_failure"
+            cleanup_uncertain = bool(getattr(evidence, "cleanup_uncertain", False))
+        payload: dict[str, Any] = {"transport": "acp", "completion": completion,
+                                   "result_kind": result_kind, "process": process,
+                                   "prompt": prompt_fact,
+                                   "usage": usage, "shutdown": shutdown}
+        # Do not sort/rewrite protocol maps: raw correlated observations retain
+        # their producer order; only explicitly diagnostic leaves are redacted.
+        evidence_path.write_text(json.dumps(_sanitize_evidence(payload)))
+        exit_code = process.get("exit_code")
+        return SessionResult(exit_code if isinstance(exit_code, int) else 1, log_path,
+                             _acp_usage_total(usage),
+                             process.get("timed_out") is True, None,
+                             sanitize_diagnostic(shutdown), "acp", completion,
+                             result_kind, process, prompt_fact, cleanup_uncertain,
+                             evidence_path, usage)
+
+
+# Short alias for tests and future callers which describe the transport, not its vendor.
+AcpAdapter = CodexAcpAdapter
 
 
 def _run(cmd: list[str], cwd: Path, log_path: Path, timeout_s: int) -> SessionResult:

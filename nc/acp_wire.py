@@ -180,11 +180,13 @@ class AcpSubprocess:
         self._stderr_done = threading.Event()
         self._closed = False
         self._intentional_shutdown = False
+        self._supervisor_sent_termination = False
         # A nonzero exit observed before this client sends a containment
         # signal is process failure evidence, even when it happens while
         # orderly stdin-EOF cleanup is in progress.
         self.shutdown_failure: AcpUnexpectedExit | None = None
         self._shutdown_failure_during_cleanup = False
+        self._post_response_failure_observed = False
         # This is deliberately separate from a process exit code: closing a
         # server is cleanup, not a successful ACP result.
         self.shutdown_outcome: str | None = None
@@ -228,6 +230,7 @@ class AcpSubprocess:
                         "timed_out": bool(self.timeout_phases),
                         "timeout_phases": list(self.timeout_phases),
                         "stderr_available": bool(self.diagnostics),
+                        "supervisor_terminated": self.supervisor_terminated,
                     }
                     exc.acp_launch_shutdown = self.shutdown_outcome
                     exc.acp_launch_cleanup_uncertain = self.cleanup_uncertain
@@ -300,6 +303,10 @@ class AcpSubprocess:
             return
         code = self.proc.returncode
         if isinstance(code, int) and code != 0:
+            # Preserve the observation boundary across finally/close().  A
+            # later poll may race with cleanup, but this exit was established
+            # before the client started deliberate shutdown.
+            self._post_response_failure_observed = True
             raise AcpUnexpectedExit(self._exit_message(code))
 
     def _raise_if_intentional_shutdown(self) -> None:
@@ -353,8 +360,15 @@ class AcpSubprocess:
         # evidence that its ACP process tree has gone away.
         try:
             os.killpg(self.proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+            self._supervisor_sent_termination = True
         except (ProcessLookupError, PermissionError):
             pass
+
+    @property
+    def supervisor_terminated(self) -> bool:
+        """Whether our orderly cleanup, rather than a child failure, killed it."""
+        return (self._intentional_shutdown and self._supervisor_sent_termination
+                and self.shutdown_failure is None)
 
     def _wait_for_exit(self, timeout: float) -> bool:
         """Reap the direct child in a bounded cleanup phase.
@@ -482,6 +496,7 @@ class AcpSubprocess:
         uncertainty = "; containment uncertain" if self.cleanup_uncertain else ""
         prefix = "ACP process failure during deliberate shutdown" if (
             self.shutdown_failure and self._shutdown_failure_during_cleanup
+            and not self._post_response_failure_observed
         ) else (
             "ACP process exit observed before deliberate shutdown" if self.shutdown_failure else (
             "ACP intentional shutdown" if preexisting_exit is None else (

@@ -221,8 +221,13 @@ def _record_host(state: State, run_id: int, result, assessment: HostAssessment) 
         run_id, exit_code=result.exit_code, timed_out=result.timed_out,
         category=assessment.category, diagnostic=assessment.diagnostic,
         assessment=assessment.status,
+        evidence_path=(str(result.evidence_path) if getattr(result, "evidence_path", None) else None),
     )
-    _set_defer_until(state, run_id, assessment.diagnostic)
+    # ACP AIR has no reset-time field.  Its title/details are untrusted prose,
+    # so a typed throttled/service deferral always uses the existing timer
+    # wake rather than extracting an epoch from diagnostics.
+    if result.transport != "acp":
+        _set_defer_until(state, run_id, assessment.diagnostic)
 
 
 def _record_exception_host(state: State, run_id: int,
@@ -250,6 +255,8 @@ def _record_outcome_read_failure(state: State, run_id: int, result,
         run_id, exit_code=result.exit_code, timed_out=result.timed_out,
         category="local_error", diagnostic=sanitize_diagnostic(str(exc)),
         assessment="FAILED",
+        evidence_path=(str(result.evidence_path)
+                       if getattr(result, "evidence_path", None) else None),
     )
 
 

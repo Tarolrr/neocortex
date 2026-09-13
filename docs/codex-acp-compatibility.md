@@ -126,8 +126,9 @@ in `session/update` `params.update._meta.jetbrains.air.sessionFailure` before a
   later prompt result. Retain every raw AIR observation in observation order,
 including malformed values, alongside only complete validated records. A
 validated record requires a nonempty string `id`, positive integer `revision`,
-known category/severity, string `title`, and an actions array containing only
-`retry`, `new_session`, or `login` (optional `details` is a string). Revisions
+known category/severity, string `title`, and a string actions array; actions
+outside `retry`, `new_session`, or `login` are retained as unknown extensions
+and cannot authorize deferral (optional `details` is a string). Revisions
 update the same incident; they do **not** signal recovery. In 1.11.0, turn
 progress or a successful turn clears an active retry warning internally
 (`completeRetryIncidentOnTurnProgress`/`completeSuccessfulTurn`/`clearSessionFailure`)
@@ -141,12 +142,17 @@ expired cleanup bounds: `cancel_response`, `session_close`, `term_grace`, or
 Conservative lossy mapping: the Codex `quota_exhausted` kind is emitted as
 `limit` with no actions, and is only an unknown quota/account condition;
 `limit` without retry -> unknown (not subscription, identity, or reset time);
-`limit` with retry -> retryable throttling only; `service` with retry ->
-retryable service condition (not uniquely overload); `access`/`request` ->
-authentication/permission/invalid-request evidence as named; `connection` ->
-local-or-remote connection failure, including App Server death. Never infer
-from text, and AIR `actions` are display data, not scheduler/owner
-authority. Process exit/signal/timeout remains an independent process fact.
+`limit` with retry and no unknown actions -> retryable throttling only;
+`service` with retry and no unknown actions -> retryable service condition
+(not uniquely overload). `access` and `request` are unknown failures, not
+authentication/permission/invalid-request evidence; `connection` remains an
+unknown local-or-remote connection failure, including App Server death. A
+single canonical active error record is required: unknown categories/actions,
+malformed evidence, or multiple active failures are nondeferred. Never infer
+from text: in particular, the T022 legacy subscription grammar must never
+classify ACP prose or derive an ACP reset time. AIR `login` and `new_session`
+actions are display data, never scheduler/owner authority. Process
+exit/signal/timeout remains independent and overrides AIR retry hints.
 
 Fixtures in `tests/fixtures/acp-*.synthetic.json` are invented, attributed
 schema examples—not captured incidents. Each is JSON-RPC-shaped and correlates

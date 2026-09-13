@@ -1,10 +1,13 @@
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from nc.acp_client import AcpTurnEvidence
 from nc.adapters import (
+    AcpAdapter,
     SessionResult,
     _category_from_terminal,
     _run,
@@ -259,6 +262,331 @@ def test_signal_killed_session_is_host_failure_for_both_adapter_paths(tmp_path, 
     )
     assert (assessment.status, assessment.category) == ("FAILED", "host_timeout")
     assert "SIGKILL (9)" in assessment.diagnostic
+
+
+def test_acp_assessment_uses_correlated_facts_not_log_text(tmp_path):
+    path = tmp_path / "quoted.log"
+    path.write_text('{"type":"turn.completed"}\nOK\n')
+    prompt = {
+        "request_id": "5", "prompt_id": "5", "session_id": "session-1",
+        "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+        "stop_reason": "end_turn", "air_observations": [], "session_failures": [],
+    }
+    result = SessionResult(0, path, 5, False, transport="acp", completion=True,
+                           acp_result_kind="success",
+                           acp_process={"pid": 42, "exit_code": 0, "signal": None,
+                                        "timed_out": False, "timeout_phases": [],
+                                        "stderr_available": True, "supervisor_terminated": False},
+                           acp_prompt=prompt)
+    assert not assess_session(result, "codex-acp").failed
+    result.completion = False
+    assert assess_session(result, "codex-acp").category == "protocol"
+
+
+def test_acp_supervisor_signal_after_response_is_not_manufactured_success(tmp_path):
+    path = tmp_path / "probe.log"
+    prompt = {"request_id": "5", "prompt_id": "5", "session_id": "session-1",
+              "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+              "stop_reason": "end_turn", "air_observations": [], "session_failures": []}
+    result = SessionResult(-15, path, None, False,
+                           transport="acp", completion=True,
+                           acp_result_kind="success",
+                           acp_process={"pid": 42, "exit_code": None, "signal": 15,
+                                        "timed_out": False, "timeout_phases": [],
+                                        "stderr_available": True, "supervisor_terminated": True},
+                           acp_prompt=prompt)
+    assert assess_session(result, "codex-acp").category == "local_error"
+
+
+def test_acp_unexpected_signal_is_local_error_without_diagnostic_authority(tmp_path):
+    path = tmp_path / "probe.log"
+    prompt = {"request_id": "5", "prompt_id": "5", "session_id": "session-1",
+              "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+              "stop_reason": "end_turn", "air_observations": [], "session_failures": []}
+    result = SessionResult(-15, path, None, False, terminal_diagnostic="ACP intentional shutdown",
+                           transport="acp", completion=True, acp_result_kind="success",
+                           acp_process={"pid": 42, "exit_code": None, "signal": 15,
+                                        "timed_out": False, "timeout_phases": [],
+                                        "stderr_available": True, "supervisor_terminated": False},
+                           acp_prompt=prompt)
+    assessment = assess_session(result, "codex-acp")
+    assert (assessment.status, assessment.category) == ("FAILED", "local_error")
+    assert "unexpectedly" in assessment.diagnostic
+
+
+@pytest.mark.parametrize(("severity", "category", "actions", "expected"), [
+    ("warning", "service", ["retry"], "protocol"),
+    ("error", "limit", ["new_session"], "unknown"),
+])
+def test_acp_valid_air_failure_respects_recovery_and_typed_policy(
+        tmp_path, severity, category, actions, expected):
+    prompt = {
+        "request_id": "5", "prompt_id": "5", "session_id": "session-1",
+        "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+        "stop_reason": "end_turn", "air_observations": [],
+        "session_failures": [{
+            "id": "air-1", "revision": 1, "category": category,
+            "severity": severity, "title": "provider condition", "actions": actions,
+        }],
+    }
+    result = SessionResult(0, tmp_path / "diagnostic.log", None, False, transport="acp",
+                           completion=True, acp_result_kind="success",
+                           acp_process={"pid": 4, "exit_code": 0, "signal": None,
+                                        "timed_out": False, "timeout_phases": [],
+                                        "stderr_available": True,
+                                        "supervisor_terminated": False}, acp_prompt=prompt)
+    assessment = assess_session(result, "codex-acp")
+    assert assessment.category == expected
+
+
+def test_acp_recovered_warning_with_progress_is_host_success(tmp_path):
+    """The bridge clears recovered AIR from the active set, retaining raw audit data."""
+    warning = {"id": "air-1", "revision": 1, "category": "service", "severity": "warning",
+               "title": "recovered", "actions": ["retry"]}
+    result = _acp_air_result(tmp_path, [])
+    result.completion = True
+    result.acp_result_kind = "success"
+    assert result.acp_prompt is not None
+    result.acp_prompt["air_observations"] = [warning]
+    assert assess_session(result, "codex-acp").status == "SUCCESS"
+
+
+def _acp_air_result(tmp_path, failures, *, process=None):
+    prompt = {
+        "request_id": "p", "prompt_id": "p", "session_id": "s",
+        "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+        "stop_reason": "end_turn", "air_observations": failures,
+        "session_failures": failures,
+    }
+    return SessionResult(
+        0, tmp_path / "acp-air.log", None, False, transport="acp", completion=True,
+        acp_result_kind="success",
+        acp_process=process or {"pid": 4, "exit_code": 0, "signal": None,
+                                "timed_out": False, "timeout_phases": [],
+                                "stderr_available": True, "supervisor_terminated": False},
+        acp_prompt=prompt,
+    )
+
+
+@pytest.mark.parametrize(("category", "actions", "expected"), [
+    ("limit", ["retry"], "throttled"),
+    ("service", ["retry"], "transient"),
+    ("limit", [], "unknown"),
+    ("access", ["login"], "unknown"),
+    ("request", ["new_session"], "unknown"),
+    ("connection", ["retry"], "unknown"),
+    ("service", ["retry", "future_action"], "unknown"),
+    ("unknown", ["retry"], "unknown"),
+])
+def test_acp_air_policy_is_typed_and_conservative(tmp_path, category, actions, expected):
+    failure = {"id": "air-1", "revision": 3, "category": category, "severity": "error",
+               "title": "provider retry_at=1999999999", "actions": actions}
+    assessment = assess_session(_acp_air_result(tmp_path, [failure]), "codex-acp")
+    assert (assessment.status, assessment.category) == ("FAILED", expected)
+    assert "provider retry_at" in assessment.diagnostic
+
+
+def test_acp_air_multiple_active_failures_cannot_use_last_retry_hint(tmp_path):
+    failures = [
+        {"id": "air-1", "revision": 1, "category": "access", "severity": "error",
+         "title": "access", "actions": []},
+        {"id": "air-2", "revision": 1, "category": "service", "severity": "error",
+         "title": "retry", "actions": ["retry"]},
+    ]
+    assert assess_session(_acp_air_result(tmp_path, failures), "codex-acp").category == "unknown"
+
+
+@pytest.mark.parametrize("warning_actions", [[], ["future_action"]])
+def test_acp_air_active_warning_conflicts_with_retryable_error(tmp_path, warning_actions):
+    """Every unrecovered effective failure blocks timer deferral, including warnings."""
+    failures = [
+        {"id": "air-warning", "revision": 1, "category": "access", "severity": "warning",
+         "title": "still active", "actions": warning_actions},
+        {"id": "air-error", "revision": 1, "category": "service", "severity": "error",
+         "title": "retry", "actions": ["retry"]},
+    ]
+    assessment = assess_session(_acp_air_result(tmp_path, failures), "codex-acp")
+    assert (assessment.status, assessment.category) == ("FAILED", "unknown")
+
+
+def test_acp_local_failure_overrides_typed_retry_hint(tmp_path):
+    failure = {"id": "air-1", "revision": 1, "category": "service", "severity": "error",
+               "title": "retry", "actions": ["retry"]}
+    process = {"pid": 4, "exit_code": None, "signal": 15, "timed_out": False,
+               "timeout_phases": [], "stderr_available": True, "supervisor_terminated": False}
+    assessment = assess_session(_acp_air_result(tmp_path, [failure], process=process), "codex-acp")
+    assert assessment.category == "local_error"
+
+
+@pytest.mark.parametrize(("result_kind", "completion", "stop_reason"), [
+    ("success", True, "cancelled"),
+    ("success", True, "max_tokens"),
+    ("success", True, "unknown"),
+])
+def test_acp_retryable_air_never_overrides_noncanonical_prompt(
+        tmp_path, result_kind, completion, stop_reason):
+    failure = {"id": "air-1", "revision": 1, "category": "service", "severity": "error",
+               "title": "retry", "actions": ["retry"]}
+    result = _acp_air_result(tmp_path, [failure])
+    result.acp_result_kind = result_kind
+    result.completion = completion
+    assert result.acp_prompt is not None
+    result.acp_prompt["stop_reason"] = stop_reason
+    result.acp_prompt["jsonrpc_result"] = {"stopReason": stop_reason}
+    assert assess_session(result, "codex-acp").category == "protocol"
+
+
+@pytest.mark.parametrize("prompt", [
+    {"prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+     "stop_reason": "end_turn", "air_observations": [], "session_failures": []},
+    {"request_id": "a", "prompt_id": "b", "session_id": "session-1",
+     "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+     "stop_reason": "end_turn", "air_observations": [], "session_failures": []},
+])
+def test_acp_requires_nonempty_correlated_prompt_identity(tmp_path, prompt):
+    result = SessionResult(0, tmp_path / "diagnostic.log", None, False, transport="acp",
+                           completion=True, acp_result_kind="success",
+                           acp_process={"pid": 4, "exit_code": 0, "signal": None,
+                                        "timed_out": False, "timeout_phases": [],
+                                        "stderr_available": True,
+                                        "supervisor_terminated": False}, acp_prompt=prompt)
+    assert assess_session(result, "codex-acp").category == "protocol"
+
+
+def test_acp_rejects_cleanup_timeout_phase_without_timeout(tmp_path):
+    prompt = {"request_id": "5", "prompt_id": "5", "session_id": "session-1",
+              "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+              "stop_reason": "end_turn", "air_observations": [], "session_failures": []}
+    result = SessionResult(0, tmp_path / "diagnostic.log", None, False, transport="acp",
+                           completion=True, acp_result_kind="success",
+                           acp_process={"pid": 4, "exit_code": 0, "signal": None,
+                                        "timed_out": False, "timeout_phases": ["term_grace"],
+                                        "stderr_available": True,
+                                        "supervisor_terminated": False}, acp_prompt=prompt)
+    assert assess_session(result, "codex-acp").category == "protocol"
+
+
+@pytest.mark.parametrize("process", [
+    {"exit_code": 0, "signal": None, "timed_out": False},
+    {"pid": True, "exit_code": 0, "signal": None, "timed_out": False,
+     "timeout_phases": [], "stderr_available": True},
+    {"pid": 4, "exit_code": 0, "signal": None, "timed_out": False,
+     "timeout_phases": ["invented"], "stderr_available": True},
+    {"pid": 4, "exit_code": 0, "signal": None, "timed_out": False,
+     "timeout_phases": [], "stderr_available": None},
+])
+def test_acp_requires_complete_typed_process_facts(tmp_path, process):
+    prompt = {"request_id": "5", "prompt_id": "5", "session_id": "session-1",
+              "prompt_response_valid": True, "jsonrpc_result": {}, "stop_reason": "end_turn",
+              "air_observations": [], "session_failures": []}
+    result = SessionResult(0, tmp_path / "diagnostic.log", None, False, transport="acp",
+                           completion=True, acp_result_kind="success", acp_process=process,
+                           acp_prompt=prompt)
+    assert assess_session(result, "codex-acp").category == "protocol"
+
+
+@pytest.mark.parametrize("status", ["eof", "timeout", "cleanup_failure"])
+def test_acp_adapter_persists_exception_usage_and_redacts_air_diagnostics(
+        tmp_path, monkeypatch, status):
+    class ClientFailure(Exception):
+        pass
+
+    failure = ClientFailure("transport token=supersecret")
+    failure.evidence = AcpTurnEvidence(
+        None, {"totalTokens": 19},
+        {"pid": 41, "exit_code": 1, "signal": None, "timed_out": status == "timeout",
+         "timeout_phases": [], "stderr_available": True},
+        "cleanup password=hunter2", status == "cleanup_failure", "unused.log", status,
+    )
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr("nc.acp_client.run_codex_acp_turn", fail)
+    adapter = AcpAdapter(["ignored"], object(), policy_factory=lambda cwd: object())
+    result = adapter.run("x", tmp_path, "m", tmp_path / f"{status}.log", 1)
+    assert result.tokens == 19
+    assert result.acp_usage == {"totalTokens": 19}
+    artifact = result.evidence_path.read_text()
+    assert "hunter2" not in artifact and "supersecret" not in artifact
+
+
+def test_acp_adapter_redacts_air_title_and_details(tmp_path, monkeypatch):
+    class ClientFailure(Exception):
+        pass
+
+    failure = ClientFailure("EOF")
+    failure.evidence = AcpTurnEvidence(
+        {"air_observations": [{"title": "token=topsecret", "details": "sk-abcdefghijk"}],
+         "session_failures": [{"title": "token=topsecret", "details": "sk-abcdefghijk"}]},
+        {"totalTokens": 3}, None, None, False, "unused.log", "eof",
+    )
+    monkeypatch.setattr(
+        "nc.acp_client.run_codex_acp_turn",
+        lambda *args, **kwargs: (_ for _ in ()).throw(failure),
+    )
+    result = AcpAdapter(["ignored"], object(), policy_factory=lambda cwd: object()).run(
+        "x", tmp_path, "m", tmp_path / "air.log", 1)
+    artifact = result.evidence_path.read_text()
+    assert "topsecret" not in artifact and "sk-abcdefghijk" not in artifact
+
+
+def test_acp_adapter_redacts_jsonrpc_error_diagnostics(tmp_path, monkeypatch):
+    class ClientFailure(Exception):
+        pass
+
+    failure = ClientFailure("EOF")
+    failure.evidence = AcpTurnEvidence(
+        {"request_id": "p", "prompt_id": "p", "session_id": "s",
+         "jsonrpc_error": {"code": "token=errorcode", "message": "token=supersecret",
+                           "data": {"detail": "password=hunter2"}}},
+        None, None, None, False, "unused.log", "eof",
+    )
+    monkeypatch.setattr(
+        "nc.acp_client.run_codex_acp_turn",
+        lambda *args, **kwargs: (_ for _ in ()).throw(failure),
+    )
+    result = AcpAdapter(["ignored"], object(), policy_factory=lambda cwd: object()).run(
+        "x", tmp_path, "m", tmp_path / "error.log", 1)
+    artifact = result.evidence_path.read_text()
+    assert "errorcode" not in artifact and "supersecret" not in artifact and "hunter2" not in artifact
+
+
+def test_acp_evidence_paths_are_unique_for_shared_preflight_directory(tmp_path, monkeypatch):
+    class ClientFailure(Exception):
+        pass
+
+    failure = ClientFailure("EOF")
+    failure.evidence = AcpTurnEvidence(None, {"totalTokens": 1}, None, None, False,
+                                        "unused.log", "eof")
+    monkeypatch.setattr(
+        "nc.acp_client.run_codex_acp_turn",
+        lambda *args, **kwargs: (_ for _ in ()).throw(failure),
+    )
+    adapter = AcpAdapter(["ignored"], object(), policy_factory=lambda cwd: object())
+    first = adapter.run("x", tmp_path, "one", tmp_path / "probe.log", 1)
+    second = adapter.run("x", tmp_path, "two", tmp_path / "probe.log", 1)
+    assert first.evidence_path != second.evidence_path
+    assert first.evidence_path.exists() and second.evidence_path.exists()
+
+
+def test_acp_planner_never_launches_with_injected_ordinary_policy(tmp_path, monkeypatch):
+    """The ACP seam retains the Adapter advisory-policy boundary."""
+    seen = []
+
+    def ordinary(_cwd):
+        raise AssertionError("ordinary worker policy reached advisory launch")
+
+    def fake_turn(*_args, policy, **_kwargs):
+        seen.append(policy)
+        return SimpleNamespace(process={}, prompt_fact={},
+                               prompt=SimpleNamespace(kind="failed"), shutdown=None)
+
+    monkeypatch.setattr("nc.acp_client.run_codex_acp_turn", fake_turn)
+    adapter = AcpAdapter(["ignored"], object(), policy_factory=ordinary)
+    adapter.run_planner("plan", tmp_path, "m", tmp_path / "planner.log", 1)
+    assert len(seen) == 1
+    assert seen[0].kind == "restricted"
 
 
 @pytest.mark.parametrize("adapter", ["codex", "claude"])

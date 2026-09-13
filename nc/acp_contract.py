@@ -39,6 +39,10 @@ class AcpProcessFact(TypedDict):
     timed_out: bool
     timeout_phases: list[TimeoutPhase]
     stderr_available: bool
+    # The local supervisor sent containment termination while it still owned
+    # a live child.  This is not inferred from a diagnostic string and is
+    # deliberately distinct from a child being killed unexpectedly.
+    supervisor_terminated: bool
 
 
 class AcpPromptFact(TypedDict):
@@ -106,7 +110,9 @@ def is_effective_completion(stop_reason: str | None, severities: Iterable[str]) 
     Callers must validate and revision-reconcile records before invoking this;
     it intentionally does not inspect raw wire metadata.
     """
-    return stop_reason == "end_turn" and all(severity == "warning" for severity in severities)
+    # Recovered warnings have been removed from this effective set by the
+    # bridge.  Any remaining record is active and prevents completion.
+    return stop_reason == "end_turn" and not tuple(severities)
 
 
 def is_completion_candidate(prompt: AcpPromptFact) -> bool:
@@ -120,9 +126,24 @@ def is_completion_candidate(prompt: AcpPromptFact) -> bool:
     failures = prompt.get("session_failures")
     if not isinstance(observations, list) or not isinstance(failures, list):
         return False
+    # These are captured when the prompt is dispatched, rather than inferred
+    # from a response-looking object.  The bridge uses the prompt JSON-RPC id
+    # for both names, so a mismatch is evidence from a different request.
+    request_id = prompt.get("request_id")
+    prompt_id = prompt.get("prompt_id")
+    session_id = prompt.get("session_id")
+    if (not isinstance(request_id, str) or not request_id
+            or not isinstance(prompt_id, str) or not prompt_id
+            or not isinstance(session_id, str) or not session_id
+            or request_id != prompt_id):
+        return False
+    result = prompt.get("jsonrpc_result")
     return (
         prompt.get("prompt_response_valid") is True
-        and isinstance(prompt.get("jsonrpc_result"), dict)
+        # Require the canonical terminal value itself, not merely a separately
+        # copied stop_reason field.
+        and isinstance(result, dict)
+        and result.get("stopReason") == "end_turn"
         and "jsonrpc_error" not in prompt
         # ``failures`` is the decoder's revision-reconciled effective view.
         # Do not revalidate raw observations here: stale records and unknown

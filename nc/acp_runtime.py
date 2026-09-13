@@ -248,7 +248,12 @@ def _verify_complete_node_modules_tree(root: Path, artifacts: Mapping[str, Path]
             name = relative.rsplit("/", 1)[-1]
             bins = {name: bins}
         if isinstance(bins, dict):
-            bin_dir = directory.parent / ".bin"
+            # npm puts a package's shims in the closest owning
+            # ``node_modules/.bin``.  In particular, a scoped package lives
+            # at ``node_modules/@scope/name`` but its shim is *not* in
+            # ``node_modules/@scope/.bin``.  The same rule matters for a
+            # dependency nested below another package's node_modules.
+            bin_dir = _npm_bin_dir(directory)
             allowed_dirs.add(bin_dir)
             for name, target in bins.items():
                 if isinstance(name, str) and isinstance(target, str) and target in contents:
@@ -266,6 +271,14 @@ def _verify_complete_node_modules_tree(root: Path, artifacts: Mapping[str, Path]
             raise AcpRuntimeNotReady("installed dependency tree has unexpected directories")
     if set(allowed_links) != {path for path in modules.rglob("*") if path.is_symlink()}:
         raise AcpRuntimeNotReady("installed dependency tree is missing required npm links")
+
+
+def _npm_bin_dir(package_directory: Path) -> Path:
+    """Return npm's .bin directory for an installed package directory."""
+    for ancestor in package_directory.parents:
+        if ancestor.name == "node_modules":
+            return ancestor / ".bin"
+    raise AcpRuntimeNotReady("installed package is outside node_modules")
 
 
 def _verify_reviewed_resolution(root: Path, node_arch: str) -> None:
@@ -460,17 +473,58 @@ def _overlaps(first: Path, second: Path) -> bool:
 
 def _require_private_parent_isolated(parent: Path, worktree: Path, runtime: Path) -> None:
     parent = parent.resolve()
-    # The repository root is inferred from the worktree's .git file/dir so a
-    # sibling worktree cannot become a credential-bearing writable location.
-    repository = worktree.resolve()
-    git = repository / ".git"
-    if git.is_file():
-        # A linked worktree's repository common dir is not a safe home either.
-        repository = git.resolve().parent
-    forbidden = (worktree.resolve(), runtime.resolve(), repository)
+    # A linked worktree has a .git *file*, whose contents point at a per-
+    # worktree gitdir.  That gitdir in turn has ``commondir`` pointing to the
+    # real repository metadata.  Path.resolve() on the .git file only resolves
+    # the file itself; parse both Git indirections so credentials cannot be
+    # placed in shared repository metadata.
+    forbidden = (worktree.resolve(), runtime.resolve(),
+                 *_worktree_git_metadata(worktree))
     if any(_overlaps(parent, path) for path in forbidden):
         raise AcpRuntimeNotReady(
             "credential readiness error: private-home parent overlaps worktree, runtime, or repository")
+
+
+def _worktree_git_metadata(worktree: Path) -> tuple[Path, ...]:
+    """Return Git metadata directories protected for this worktree.
+
+    Git's linked-worktree .git file uses ``gitdir: PATH`` and the pointed
+    directory uses ``commondir``.  Both targets may be relative to the file
+    containing them.  Invalid indirections are a readiness failure instead of
+    silently weakening the credential boundary.
+    """
+    git = worktree.resolve() / ".git"
+    if git.is_dir():
+        return (git.resolve(),)
+    if not git.is_file():
+        return ()
+    gitdir = _git_indirection(git, "gitdir:")
+    protected = [gitdir]
+    common = gitdir / "commondir"
+    if common.exists():
+        protected.append(_git_indirection(common, "", require_directory=True))
+    return tuple(protected)
+
+
+def _git_indirection(path: Path, prefix: str, *, require_directory: bool = True) -> Path:
+    """Parse one Git path indirection, resolving relative values safely."""
+    try:
+        value = path.read_text().strip()
+    except OSError as exc:
+        raise AcpRuntimeNotReady("credential readiness error: Git metadata is unreadable") from exc
+    if prefix:
+        if not value.startswith(prefix):
+            raise AcpRuntimeNotReady("credential readiness error: linked worktree gitdir is malformed")
+        value = value.removeprefix(prefix).strip()
+    if not value or "\n" in value:
+        raise AcpRuntimeNotReady("credential readiness error: Git metadata indirection is malformed")
+    target = Path(value)
+    if not target.is_absolute():
+        target = path.parent / target
+    target = target.resolve()
+    if require_directory and not target.is_dir():
+        raise AcpRuntimeNotReady("credential readiness error: Git metadata target is unavailable")
+    return target
 
 
 def credential_readiness(credential_file: Path) -> str:

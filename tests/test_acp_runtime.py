@@ -1,5 +1,7 @@
 """Offline runtime-inspection coverage; no npm, real credentials, or ACP binary."""
 
+import base64
+import hashlib
 import os
 import subprocess
 import tarfile
@@ -194,6 +196,61 @@ def test_sri_tree_check_rejects_extra_empty_package_directory(tmp_path, monkeypa
     (root / "node_modules" / "unreviewed").mkdir()
     with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="unexpected directories"):
         acp_runtime._verify_complete_node_modules_tree(root, {"node_modules/known": artifact})
+
+
+def _fixture_package_tarball(path: Path, files: dict[str, str]) -> None:
+    """Make a tiny npm-style package artifact for offline tree verification."""
+    source = path.parent / (path.name + "-source") / "package"
+    for relative, contents in files.items():
+        target = source / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(contents)
+    with tarfile.open(path, "w:gz") as archive:
+        archive.add(source, arcname="package")
+
+
+def test_sri_tree_check_accepts_scoped_root_npm_bin_link_end_to_end(tmp_path: Path) -> None:
+    """Exercise real tar/SRI derivation for npm's scoped root .bin layout."""
+    root = tmp_path / "runtime"
+    acp_dir = root / "node_modules" / "@agentclientprotocol" / "codex-acp"
+    dependency = root / "node_modules" / "dependency"
+    root_artifact = root / "codex-acp-1.11.0.tgz"
+    _fixture_package_tarball(root_artifact, {
+        "package.json": '{"bin": {"codex-acp": "dist/index.js"}}',
+        "dist/index.js": "#!/usr/bin/env node\n",
+    })
+    dependency_artifact = tmp_path / "dependency.tgz"
+    _fixture_package_tarball(dependency_artifact, {"package.json": '{"version": "1.0.0"}'})
+    for artifact, directory in ((root_artifact, acp_dir), (dependency_artifact, dependency)):
+        with tarfile.open(artifact, "r:gz") as archive:
+            archive.extractall(directory.parent, filter="data")
+        (directory.parent / "package").rename(directory)
+    launcher = root / "node_modules" / ".bin" / "codex-acp"
+    launcher.parent.mkdir()
+    launcher.symlink_to("../@agentclientprotocol/codex-acp/dist/index.js")
+    digest = hashlib.sha512(dependency_artifact.read_bytes()).digest()
+    sri = "sha512-" + base64.b64encode(digest).decode()
+    encoded = digest.hex()
+    cache = root / "npm-cache" / "_cacache" / "content-v2" / "sha512" / encoded[:2] / encoded[2:4] / encoded[4:]
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(dependency_artifact.read_bytes())
+    lock = {"packages": {"node_modules/dependency": {"integrity": sri}}}
+    acp_runtime._verify_sri_derived_contents(root, lock)
+
+
+def test_private_parent_rejects_linked_worktree_common_gitdir(tmp_path: Path) -> None:
+    """A linked worktree's relative gitdir/commondir protects shared metadata."""
+    common = tmp_path / "repository" / ".git"
+    gitdir = common / "worktrees" / "linked"
+    gitdir.mkdir(parents=True)
+    (gitdir / "commondir").write_text("../..\n")
+    worktree = tmp_path / "linked"
+    worktree.mkdir()
+    # This is relative to the .git file, as Git permits for linked worktrees.
+    (worktree / ".git").write_text("gitdir: ../repository/.git/worktrees/linked\n")
+    with pytest.raises(acp_runtime.AcpRuntimeNotReady, match="overlaps"):
+        acp_runtime._require_private_parent_isolated(
+            common / "private-homes", worktree, tmp_path / "runtime")
 
 
 def test_private_home_is_explicit_and_cleanup_is_scoped(tmp_path):

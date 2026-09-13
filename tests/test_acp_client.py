@@ -329,6 +329,12 @@ def test_usage_and_raw_air_are_retained_when_prompt_times_out(tmp_path: Path) ->
         run(tmp_path, "usage_timeout", timeout_s=.1)
     evidence = raised.value.evidence
     assert evidence.prompt is not None
+    # The response arrived only after the original prompt deadline, while the
+    # client was performing its bounded cancellation.  It remains terminal
+    # evidence even though the outcome must stay a timeout.
+    assert evidence.prompt["prompt_response_valid"] is True
+    assert evidence.prompt["stop_reason"] == "end_turn"
+    assert evidence.prompt["jsonrpc_result"] == {"stopReason": "end_turn"}
     assert evidence.prompt["air_observations"] == [{
         "id": evidence.prompt["prompt_id"] + ":x", "revision": 1,
         "category": "service", "severity": "error", "title": "retained",

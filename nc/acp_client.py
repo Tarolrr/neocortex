@@ -667,6 +667,60 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
                        "prompt_id": str(prompt_id), "prompt_response_valid": False,
                        "stop_reason": None, "air_observations": evidence.air_observations,
                        "session_failures": []}
+
+        def project_prompt_response(response: dict[str, object]) -> AcpPromptResult:
+            """Project a correlated terminal response into bounded evidence.
+
+            This is also used for a response received while performing the
+            mandatory cancellation after the prompt deadline.  Such a reply
+            cannot turn the deadline failure into success, but it is still
+            authoritative terminal AIR/usage evidence and must survive in the
+            failure envelope.
+            """
+            nonlocal prompt_fact
+            evidence.prompt_response(response)
+            # The transport intentionally uses compact numeric JSON-RPC ids,
+            # while AIR incident ownership is text-prefixed.  Give the pure
+            # decoder its pinned textual correlation view without changing
+            # the captured facts.
+            decoder_wire = [dict(item, id=str(prompt_id)) if isinstance(item, dict)
+                            and item.get("id") == prompt_id else item for item in evidence.records]
+            # The latest update snapshot is independent evidence, not a
+            # retained notification list.  Place it inside the prompt interval
+            # for the decoder, immediately before its terminal response.
+            if evidence.usage is not None:
+                response_index = next((index for index, item in enumerate(decoder_wire)
+                                       if isinstance(item, dict) and item.get("id") == str(prompt_id)
+                                       and "method" not in item), len(decoder_wire))
+                decoder_wire.insert(response_index, {"method": "session/update", "params": {
+                    "sessionId": session_id, "update": {
+                        "sessionUpdate": "usage_update", "usage": evidence.usage,
+                    },
+                }})
+            decoded = decode_acp_prompt_result(
+                decoder_wire, request_id=str(prompt_id), session_id=session_id,
+            )
+            prompt_fact = {
+                "request_id": str(prompt_id), "session_id": session_id, "prompt_id": str(prompt_id),
+                "prompt_response_valid": decoded.kind != "protocol_invalid",
+                "stop_reason": decoded.stop_reason, "air_observations": evidence.air_observations,
+                "session_failures": [
+                    {"id": item.incident_id, "revision": item.revision, "category": item.category,
+                     "severity": item.severity, "title": item.title, "actions": list(item.actions),
+                     **({"details": item.details} if item.details is not None else {})}
+                    for item in decoded.failures
+                ],
+            }
+            retained_response = evidence.records[-1]
+            if isinstance(retained_response, dict):
+                if isinstance(retained_response.get("result"), dict):
+                    prompt_fact["jsonrpc_result"] = retained_response["result"]
+                if isinstance(retained_response.get("error"), dict):
+                    prompt_fact["jsonrpc_error"] = retained_response["error"]
+            if evidence.usage is not None:
+                prompt_fact["usage"] = evidence.usage
+            return decoded
+
         try:
             prompt_response = stream.wait_for(prompt_id, deadline=time.monotonic() + timeout_s)
             raise_server_request_rejection()
@@ -684,6 +738,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
                     "session/cancel", {"sessionId": session_id}, deadline=cancel_deadline,
                 )
                 prompt_response = stream.wait_for(prompt_id, deadline=cancel_deadline)
+                project_prompt_response(prompt_response)
             except AcpDeadlineExpired:
                 timeout_phases.append("cancel_response")
             except (AcpProcessError, AcpStreamError) as cleanup_error:
@@ -703,45 +758,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
             error = AcpProcessTimeout("ACP prompt deadline expired after bounded cancellation")
             error.timeout_phases = tuple(timeout_phases)
             raise error from exc
-        evidence.prompt_response(prompt_response)
-        # The transport intentionally uses compact numeric JSON-RPC ids, while
-        # AIR incident ownership is text-prefixed.  Give the pure decoder its
-        # pinned textual correlation view without changing the captured facts.
-        decoder_wire = [dict(item, id=str(prompt_id)) if isinstance(item, dict)
-                        and item.get("id") == prompt_id else item for item in evidence.records]
-        # The latest update snapshot is independent evidence, not a retained
-        # notification list.  Place it inside the prompt interval for the
-        # decoder, immediately before its terminal response.
-        if evidence.usage is not None:
-            response_index = next((index for index, item in enumerate(decoder_wire)
-                                   if isinstance(item, dict) and item.get("id") == str(prompt_id)
-                                   and "method" not in item), len(decoder_wire))
-            decoder_wire.insert(response_index, {"method": "session/update", "params": {
-                "sessionId": session_id, "update": {
-                    "sessionUpdate": "usage_update", "usage": evidence.usage,
-                },
-            }})
-        decoded = decode_acp_prompt_result(decoder_wire, request_id=str(prompt_id), session_id=session_id)
-        observations = evidence.air_observations
-        prompt_fact = {
-            "request_id": str(prompt_id), "session_id": session_id, "prompt_id": str(prompt_id),
-            "prompt_response_valid": decoded.kind != "protocol_invalid",
-            "stop_reason": decoded.stop_reason, "air_observations": observations,
-            "session_failures": [
-                {"id": item.incident_id, "revision": item.revision, "category": item.category,
-                 "severity": item.severity, "title": item.title, "actions": list(item.actions),
-                 **({"details": item.details} if item.details is not None else {})}
-                for item in decoded.failures
-            ],
-        }
-        retained_response = evidence.records[-1]
-        if isinstance(retained_response, dict):
-            if isinstance(retained_response.get("result"), dict):
-                prompt_fact["jsonrpc_result"] = retained_response["result"]
-            if isinstance(retained_response.get("error"), dict):
-                prompt_fact["jsonrpc_error"] = retained_response["error"]
-        if evidence.usage is not None:
-            prompt_fact["usage"] = evidence.usage
+        decoded = project_prompt_response(prompt_response)
         # A completed response is not permission to hide a process which has
         # already failed.  Yield briefly so an immediate post-response exit
         # is observed before this client starts deliberate cleanup.

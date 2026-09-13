@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 from .acp_contract import is_completion_candidate
 
 if TYPE_CHECKING:
-    from .acp_client import CodexAcpLaunchEvidence, CodexAcpPolicy
+    from .acp_client import CodexAcpLaunchEvidence
 
 # codex exec's text footer is two lines: "tokens used\n26,457".
 TOKENS_RE = re.compile(
@@ -514,7 +514,10 @@ class CodexAcpAdapter(Adapter):
             shutdown = turn.shutdown or ""
             result_kind = turn.prompt.kind
             cleanup_uncertain = "containment uncertain" in shutdown.lower()
-        except BaseException as exc:
+        # The bridge turns every client-side termination into persisted negative
+        # evidence; this includes cancellation/interrupt exceptions that are not
+        # ordinary ``Exception`` subclasses.
+        except BaseException as exc:  # noqa: BLE001
             evidence = getattr(exc, "evidence", None)
             process = dict(getattr(evidence, "process", None) or getattr(exc, "process", None) or {})
             prompt_fact = dict(getattr(evidence, "prompt", None) or {})

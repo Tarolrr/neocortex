@@ -396,6 +396,19 @@ def test_acp_air_multiple_active_failures_cannot_use_last_retry_hint(tmp_path):
     assert assess_session(_acp_air_result(tmp_path, failures), "codex-acp").category == "unknown"
 
 
+@pytest.mark.parametrize("warning_actions", [[], ["future_action"]])
+def test_acp_air_active_warning_conflicts_with_retryable_error(tmp_path, warning_actions):
+    """Every unrecovered effective failure blocks timer deferral, including warnings."""
+    failures = [
+        {"id": "air-warning", "revision": 1, "category": "access", "severity": "warning",
+         "title": "still active", "actions": warning_actions},
+        {"id": "air-error", "revision": 1, "category": "service", "severity": "error",
+         "title": "retry", "actions": ["retry"]},
+    ]
+    assessment = assess_session(_acp_air_result(tmp_path, failures), "codex-acp")
+    assert (assessment.status, assessment.category) == ("FAILED", "unknown")
+
+
 def test_acp_local_failure_overrides_typed_retry_hint(tmp_path):
     failure = {"id": "air-1", "revision": 1, "category": "service", "severity": "error",
                "title": "retry", "actions": ["retry"]}

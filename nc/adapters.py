@@ -481,8 +481,9 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
     if (not _is_canonical_acp_terminal(prompt)
             or not (normal_completion or (decoded_air_failure and active_air_errors))):
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
-    # AIR is structured provider evidence, but only a single canonical active
-    # error record can select the deliberately small timer policy below.  In
+    # AIR is structured provider evidence, but only one canonical active
+    # effective record, which must be an error, can select the deliberately
+    # small timer policy below.  In
     # particular, do not use titles, details, stderr, or an apparent live ACP
     # parent to guess whether a connection failure was remote.
     if active_air_errors:
@@ -523,19 +524,26 @@ def _assess_air_failures(prompt: dict[str, object], failures: list[object]) -> H
     This is intentionally a table over AIR fields, never prose.  AIR actions
     remain display data: ``login`` and ``new_session`` neither authenticate
     nor cause an internal retry/session replacement.  More than one active
-    error, unknown actions/categories, malformed/corrupt prompt evidence, and
-    every non-table category fail closed as ``unknown``.
+    effective failure (including warnings), unknown actions/categories,
+    malformed/corrupt prompt evidence, and every non-table category fail
+    closed as ``unknown``.
     """
     # A malformed record makes the decoder's prompt fact noncanonical.  Do
     # not allow another, valid-looking record later in the observation list to
     # obtain a deferral.
     if prompt.get("prompt_response_valid") is not True:
         return HostAssessment("FAILED", "protocol", "ACP prompt evidence is malformed")
-    active = [failure for failure in failures
-              if isinstance(failure, dict) and failure.get("severity") == "error"]
+    # ``session_failures`` is already the decoder's complete effective set.
+    # A warning that has not been recovered is still active evidence, so it
+    # must participate in this cardinality check.  Filtering it out here
+    # would let an unrelated retryable error select a timer policy despite a
+    # concurrent (possibly extension-action) provider condition.
+    active = failures
     if len(active) != 1:
         return HostAssessment("FAILED", "unknown", "ACP has conflicting active session failures")
     failure = active[0]
+    if not isinstance(failure, dict) or failure.get("severity") != "error":
+        return HostAssessment("FAILED", "unknown", "ACP active session failure is not an eligible error")
     category = failure["category"]
     actions = failure["actions"]
     # is_air_session_failure above establishes these types.  Keep the check

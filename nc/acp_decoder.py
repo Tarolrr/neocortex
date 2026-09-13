@@ -12,6 +12,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from .acp_contract import is_effective_completion
+
 ResultKind = Literal["success", "failed", "cancelled", "protocol_invalid"]
 _KNOWN_CATEGORIES = {"connection", "access", "limit", "request", "service", "unknown"}
 _KNOWN_ACTIONS = {"retry", "new_session", "login"}
@@ -37,6 +39,8 @@ class AirFailureEvidence:
     category: str
     actions: tuple[str, ...]
     severity: Literal["warning", "error"]
+    title: str
+    details: str | None
     diagnostic: str
     unknown_category: str | None = None
     unknown_actions: tuple[str, ...] = ()
@@ -192,8 +196,8 @@ def _failure(value: object) -> tuple[AirFailureEvidence | None, str | None]:
     unknown_actions = tuple(action for action in actions if action not in _KNOWN_ACTIONS)
     diagnostic = _diagnostic(f"{title}: {details}" if details else title)
     return AirFailureEvidence(incident_id, revision, category if unknown_category is None else "unknown",
-                              tuple(actions), severity, diagnostic, unknown_category,
-                              unknown_actions), None
+                              tuple(actions), severity, title, details, diagnostic,
+                              unknown_category, unknown_actions), None
 
 
 def decode_acp_prompt_result(
@@ -246,7 +250,7 @@ def decode_acp_prompt_result(
         return AcpPromptResult("protocol_invalid", None, "prompt stopReason is invalid", (), usage)
     # A caller's negotiated profile is still an input fact, but do not discard
     # independently received terminal data when it is unsupported.
-    if air_version != 1:
+    if not isinstance(air_version, int) or isinstance(air_version, bool) or air_version != 1:
         return AcpPromptResult("protocol_invalid", stop_reason, "unsupported AIR extension version", (), usage)
     raw_failures: list[object] = []
     for item in wire[request_index + 1:response_index]:
@@ -299,10 +303,10 @@ def decode_acp_prompt_result(
         return AcpPromptResult("cancelled", stop_reason, None, evidence, usage)
     if stop_reason != "end_turn":
         return AcpPromptResult("failed", stop_reason, None, evidence, usage)
+    if is_effective_completion(stop_reason, (item.severity for item in evidence)):
+        return AcpPromptResult("success", stop_reason, None, evidence, usage)
     errors = [item for item in evidence if item.severity == "error"]
-    if errors:
-        return AcpPromptResult("failed", stop_reason, errors[-1].diagnostic or None, evidence, usage)
-    return AcpPromptResult("success", stop_reason, None, evidence, usage)
+    return AcpPromptResult("failed", stop_reason, errors[-1].diagnostic or None, evidence, usage)
 
 
 # A short public name is convenient for a future adapter without making it one.

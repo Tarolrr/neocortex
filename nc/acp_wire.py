@@ -213,10 +213,24 @@ class AcpSubprocess:
             if callback is not None:
                 try:
                     callback(self.proc.pid)
-                except BaseException:
+                except BaseException as exc:
                     self._cleanup_process(close_pipes=True)
                     self.log_path.parent.mkdir(parents=True, exist_ok=True)
                     self.log_path.write_text("")
+                    # Construction failed before ownership can be returned to
+                    # the client.  Preserve the observed child facts on the
+                    # original callback exception so its stable client
+                    # envelope does not invent a pre-launch state.
+                    exc.acp_launch_process = {
+                        "pid": self.proc.pid,
+                        "exit_code": self.proc.returncode if self.proc.returncode is None or self.proc.returncode >= 0 else None,
+                        "signal": -self.proc.returncode if isinstance(self.proc.returncode, int) and self.proc.returncode < 0 else None,
+                        "timed_out": bool(self.timeout_phases),
+                        "timeout_phases": list(self.timeout_phases),
+                        "stderr_available": bool(self.diagnostics),
+                    }
+                    exc.acp_launch_shutdown = self.shutdown_outcome
+                    exc.acp_launch_cleanup_uncertain = self.cleanup_uncertain
                     raise
         except (OSError, subprocess.SubprocessError) as exc:
             if not launched:

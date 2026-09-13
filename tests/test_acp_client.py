@@ -11,12 +11,13 @@ from pathlib import Path
 import pytest
 
 from nc.acp_client import (
+    AcpCleanupUncertain,
     AcpClientRejected,
     CodexAcpLaunchEvidence,
     CodexAcpPolicy,
     run_codex_acp_turn,
 )
-from nc.acp_wire import AcpProcessTimeout, AcpTransportEof, AcpUnexpectedExit
+from nc.acp_wire import AcpProcessTimeout, AcpSubprocess, AcpTransportEof, AcpUnexpectedExit
 
 
 def fake_server(scenario: str) -> list[str]:
@@ -50,13 +51,22 @@ if scenario == "unsupported_profile":
     response(init, {"protocolVersion":2, "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}})
     assert sys.stdin.readline() == ""
     sys.exit(0)
+if scenario in {"bool_protocol_version", "bool_air_version"}:
+    profile = {"protocolVersion": True, "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}}
+    if scenario == "bool_air_version":
+        profile["protocolVersion"] = 1
+        profile["_meta"]["jetbrains"]["air"]["version"] = True
+    response(init, profile)
+    # The rejected initialize profile must not create a session.
+    assert sys.stdin.readline() == ""
+    sys.exit(0)
 response(init, {"protocolVersion":1, "_meta":{"jetbrains":{"air":{"version":1,"capabilities":["sessionFailure"]}}}})
 new = read()
 mode = "agent"
 options = [{"id":"model","options":[{"value":"model"}],"currentValue":"x"}, {"id":"mode","options":[{"value":mode}],"currentValue":"x"}]
 if scenario == "unsupported": options[0]["options"] = []
 response(new, {"sessionId":"fresh", "configOptions":options,
-               "sessionCapabilities":{"close": scenario == "timeout"}})
+               "sessionCapabilities":{"close": scenario in {"timeout", "cancel_timeout", "close_timeout"}}})
 if scenario == "unsupported": sys.exit(0)
 for expected in ("model", "mode"):
     request = read()
@@ -80,7 +90,18 @@ if scenario == "reset_model":
     sys.exit(0)
 prompt = read()
 assert prompt["method"] == "session/prompt" and prompt["params"]["sessionId"] == "fresh"
-if scenario == "timeout":
+if scenario in {"usage_eof", "air_overflow"}:
+    failure = {"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"error","title":"retained","actions":[]}
+    if scenario == "usage_eof":
+        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}},"sessionUpdate":"usage_update","usage":{"inputTokens":2,"outputTokens":3},"toolPayload":"must-not-retain"}}})
+        os.close(1); time.sleep(.2); sys.exit(0)
+    for number in range(200):
+        failure["revision"] = number + 1
+        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+    time.sleep(.2); sys.exit(0)
+if scenario == "usage_timeout":
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":{"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"error","title":"retained","details":"full detail","actions":[]}}}},"sessionUpdate":"usage_update","usage":{"inputTokens":2,"outputTokens":3},"toolPayload":"must-not-retain"}}})
+if scenario in {"timeout", "usage_timeout"}:
     cancel = read()
     assert cancel["method"] == "session/cancel"
     # This is deliberately late: it proves cancellation is not completion.
@@ -89,12 +110,36 @@ if scenario == "timeout":
     assert close["method"] == "session/close"
     response(close, {})
     time.sleep(.1); sys.exit(0)
+if scenario == "cancel_timeout":
+    cancel = read()
+    assert cancel["method"] == "session/cancel"
+    # Exceed the actual client cancel-response deadline, then still service
+    # the close request so the test observes this phase separately.
+    time.sleep(10.2)
+    close = read()
+    assert close["method"] == "session/close"
+    response(close, {})
+    sys.exit(0)
+if scenario == "close_timeout":
+    cancel = read()
+    assert cancel["method"] == "session/cancel"
+    response(prompt, {"stopReason":"end_turn"})
+    close = read()
+    assert close["method"] == "session/close"
+    time.sleep(5.2)
+    sys.exit(0)
 if scenario == "permission":
     send({"jsonrpc":"2.0","id":"permission","method":"session/request_permission","params":{"sessionId":"fresh"}})
     assert read()["result"] == {"outcome":{"outcome":"cancelled"}}
 if scenario == "elicitation":
     send({"jsonrpc":"2.0","id":"elicit","method":"elicitation/create","params":{"sessionId":"fresh"}})
     assert read()["result"] == {"action":"cancel", "content":None}
+if scenario == "numeric_overlap":
+    # JSON-RPC ids are bidirectional namespaces.  A peer request may use the
+    # same numeric value as our outstanding prompt id without becoming its
+    # response.
+    send({"jsonrpc":"2.0","id":prompt["id"],"method":"session/request_permission","params":{"sessionId":"fresh"}})
+    assert read()["id"] == prompt["id"] and read is not None
 if scenario in {"malformed_request", "foreign_request", "unsupported_request"}:
     if scenario == "malformed_request":
         method, params = "session/request_permission", {}
@@ -108,6 +153,16 @@ if scenario == "agent_tool":
     # This is an agent-owned update; it requires no client terminal or
     # filesystem capability and is not a client-directed tool request.
     send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"sessionUpdate":"tool_call_update","toolCallId":"agent-owned-command","status":"completed"}}})
+if scenario == "stale_duplicate":
+    failure = {"id":str(prompt["id"])+":x","revision":2,"category":"service","severity":"warning","title":"current","actions":[]}
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+    failure["revision"] = 1
+    failure["title"] = "stale"
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+if scenario == "unknown_warning":
+    failure = {"id":str(prompt["id"])+":future","revision":1,"category":"future","severity":"warning","title":"future warning","actions":["future_action"]}
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
 if scenario == "error":
     send({"jsonrpc":"2.0","id":prompt["id"],"error":{"code":-1,"message":"bad"}}); time.sleep(.2); sys.exit(0)
 if scenario == "malformed":
@@ -127,13 +182,17 @@ if scenario == "delayed_post_response_exit":
     time.sleep(.15); sys.exit(9)
 failure = {"id":str(prompt["id"])+":x","revision":1,"category":"service","severity":"warning","title":"retry","actions":["retry"]}
 if scenario == "warning": send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+if scenario == "raw_extension":
+    failure["providerExtension"] = {"nested": ["retained", {"shape": "exact"}]}
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
 if scenario == "foreign_incident":
     # Same session, but a late failure emitted by an earlier prompt.
     failure["id"] = "previous-prompt:x"
     failure["severity"] = "error"
     send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
-if scenario == "terminal":
+if scenario in {"terminal", "terminal_details"}:
     failure["severity"] = "error"
+    if scenario == "terminal_details": failure["details"] = "provider detail"
     response(prompt, {"stopReason":"end_turn","_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}})
 else: response(prompt, {"stopReason":"end_turn","usage":{"inputTokens":2,"outputTokens":3}})
 time.sleep(.2)
@@ -255,8 +314,106 @@ def test_fake_delayed_shutdown_nonzero_exit_cannot_be_success(tmp_path: Path) ->
     assert "failure during deliberate shutdown" in raised.value.shutdown
 
 
+def test_usage_and_air_are_retained_when_prompt_ends_in_eof(tmp_path: Path) -> None:
+    with pytest.raises(AcpTransportEof) as raised:
+        run(tmp_path, "usage_eof")
+    evidence = raised.value.evidence
+    assert evidence.prompt is not None
+    assert evidence.prompt["air_observations"][0]["id"].endswith(":x")
+    assert evidence.usage == {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5}
+    assert "toolPayload" not in str(evidence.prompt)
+
+
+def test_usage_and_raw_air_are_retained_when_prompt_times_out(tmp_path: Path) -> None:
+    with pytest.raises(AcpProcessTimeout) as raised:
+        run(tmp_path, "usage_timeout", timeout_s=.1)
+    evidence = raised.value.evidence
+    assert evidence.prompt is not None
+    # The response arrived only after the original prompt deadline, while the
+    # client was performing its bounded cancellation.  It remains terminal
+    # evidence even though the outcome must stay a timeout.
+    assert evidence.prompt["prompt_response_valid"] is True
+    assert evidence.prompt["stop_reason"] == "end_turn"
+    assert evidence.prompt["jsonrpc_result"] == {"stopReason": "end_turn"}
+    assert evidence.prompt["air_observations"] == [{
+        "id": evidence.prompt["prompt_id"] + ":x", "revision": 1,
+        "category": "service", "severity": "error", "title": "retained",
+        "details": "full detail", "actions": [],
+    }]
+    assert evidence.usage == {"inputTokens": 2, "outputTokens": 3, "totalTokens": 5}
+    assert "toolPayload" not in str(evidence.prompt)
+
+
+def test_notification_flood_after_air_failure_fails_closed_with_evidence(tmp_path: Path) -> None:
+    from nc.acp_client import AcpEvidenceOverflow
+
+    with pytest.raises(AcpEvidenceOverflow) as raised:
+        run(tmp_path, "air_overflow")
+    evidence = raised.value.evidence
+    assert evidence.status == "evidence_overflow"
+    assert evidence.prompt is not None and evidence.prompt["air_observations"]
+    # The rejected 128th notification was never committed as raw evidence.
+    assert len(evidence.prompt["air_observations"]) <= 127
+
+
 def test_fake_elicitation_is_cancelled_noninteractively(tmp_path: Path) -> None:
     assert run(tmp_path, "elicitation").prompt.kind == "success"
+
+
+def test_fake_numeric_bidirectional_request_id_overlap_is_not_prompt_response(tmp_path: Path) -> None:
+    assert run(tmp_path, "numeric_overlap").prompt.kind == "success"
+
+
+def test_fake_stale_air_revision_cannot_override_decoder_effective_failure(tmp_path: Path) -> None:
+    turn = run(tmp_path, "stale_duplicate")
+    assert turn.prompt.kind == "success"
+    assert turn.prompt.failures[0].revision == 2
+    assert turn.prompt_fact["session_failures"][0]["revision"] == 2
+
+
+def test_unknown_air_warning_uses_decoder_effective_completion_semantics(tmp_path: Path) -> None:
+    from nc.acp_contract import is_completion_candidate
+
+    turn = run(tmp_path, "unknown_warning")
+    assert turn.prompt.kind == "success"
+    assert turn.prompt_fact["session_failures"] == [{
+        "id": turn.prompt_fact["prompt_id"] + ":future", "revision": 1,
+        "category": "unknown", "severity": "warning", "title": "future warning",
+        "actions": ["future_action"],
+    }]
+    assert is_completion_candidate(turn.prompt_fact)
+
+
+def test_raw_air_observation_keeps_bounded_unknown_extension_separately(tmp_path: Path) -> None:
+    turn = run(tmp_path, "raw_extension")
+    raw = turn.prompt_fact["air_observations"]
+    assert raw[0]["providerExtension"] == {"nested": ["retained", {"shape": "exact"}]}
+    assert "providerExtension" not in turn.prompt_fact["session_failures"][0]
+
+
+def test_effective_air_record_preserves_title_and_details_separately(tmp_path: Path) -> None:
+    # Use a normal terminal exchange so this asserts the effective, decoder
+    # reconciled record rather than only the failure envelope above.
+    # ``terminal_details`` shares the fake server's terminal path below.
+    turn = run(tmp_path, "terminal_details")
+    assert turn.prompt_fact["session_failures"] == [{
+        "id": turn.prompt_fact["prompt_id"] + ":x", "revision": 1,
+        "category": "service", "severity": "error", "title": "retry",
+        "details": "provider detail", "actions": ["retry"],
+    }]
+
+
+def test_uncertain_cleanup_has_typed_failure_envelope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Simulate unavailable cgroup membership proof after the fake server has
+    # exited.  The child is reaped, but that is deliberately insufficient to
+    # claim its owned helper tree was contained.
+    monkeypatch.setattr(AcpSubprocess, "_cgroup_empty", lambda self: None)
+    with pytest.raises(AcpCleanupUncertain) as raised:
+        run(tmp_path, "success")
+    evidence = raised.value.evidence
+    assert evidence.status == "cleanup_uncertain"
+    assert evidence.cleanup_uncertain is True
+    assert evidence.process and evidence.process["exit_code"] == 0
 
 
 @pytest.mark.parametrize("scenario", ["malformed_request", "foreign_request", "unsupported_request"])
@@ -284,6 +441,28 @@ def test_fake_rejections_timeout_and_eof_fail_closed(tmp_path: Path, scenario: s
         assert raised.value.process["pid"] > 0
         assert isinstance(raised.value.shutdown, str)
         assert raised.value.process["timed_out"] is False
+
+
+@pytest.mark.parametrize("scenario", ["bool_protocol_version", "bool_air_version"])
+def test_fake_boolean_initialize_versions_are_rejected_before_session_creation(
+    tmp_path: Path, scenario: str,
+) -> None:
+    with pytest.raises(AcpClientRejected, match="does not advertise") as raised:
+        run(tmp_path, scenario)
+    assert raised.value.process["exit_code"] == 0
+    assert "intentional shutdown" in raised.value.shutdown
+
+
+@pytest.mark.parametrize(("scenario", "phase"), [
+    ("cancel_timeout", "cancel_response"), ("close_timeout", "session_close"),
+])
+def test_fake_expired_cancel_and_close_deadlines_are_distinct(
+    tmp_path: Path, scenario: str, phase: str,
+) -> None:
+    with pytest.raises(AcpProcessTimeout) as raised:
+        run(tmp_path, scenario, timeout_s=.05)
+    assert phase in raised.value.timeout_phases
+    assert phase in raised.value.process["timeout_phases"]
 
 
 def test_restricted_policy_is_explicit_but_fails_closed_without_source_backing(tmp_path: Path) -> None:

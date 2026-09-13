@@ -188,7 +188,7 @@ def test_generic_air_failure_without_severity_is_conservatively_terminal():
 
 @pytest.mark.parametrize("malformed", [
     {"severity": "warning"},
-    {"id": "x", "revision": 1, "category": "unknown", "severity": "warning",
+    {"id": "x", "revision": 1, "category": "future", "severity": "warning",
      "title": "x", "actions": ["owner_approve"]},
 ])
 def test_malformed_air_dict_cannot_be_a_completion_candidate(malformed):

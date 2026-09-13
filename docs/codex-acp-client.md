@@ -38,11 +38,12 @@ process facts and distinct intentional-shutdown evidence.  Before it creates a p
 ## Bounded turn evidence
 
 The isolated client keeps a correlated evidence envelope rather than an ACP
-transcript: at most 128 retained AIR/usage/prompt-response records and 64 KiB
-of JSON. Tool and message notifications are not retained. The final direct
-usage snapshot is retained independently. If an authoritative retained record
-would exceed either bound, the turn fails with `ACP evidence-overflow`; it is
-not silently discarded. The envelope is attached to local failures with the
+transcript: at most 128 retained prompt/AIR/terminal decoder records and 64
+KiB of JSON. Tool and message notifications are not retained. The final direct
+usage snapshot is retained independently. A raw AIR observation is committed
+only after its correlated decoder record fits those bounds. If an authoritative
+retained record would exceed either bound, the turn fails with
+`ACP evidence-overflow`; it is not silently discarded. The envelope is attached to local failures with the
 observed prompt facts, nullable exit/signal facts, intentional-shutdown and
 cleanup-uncertainty disposition, and log reference. This documents the client
 interface only; it does not claim that a live deployment enforces a sandbox.

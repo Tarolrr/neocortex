@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Literal, NotRequired, TypedDict
 
 AirFailureCategory = Literal[
     "connection", "access", "limit", "request", "service", "unknown",
 ]
 AirFailureSeverity = Literal["warning", "error"]
-AirFailureAction = Literal["retry", "new_session", "login"]
+# AIR permits extension action strings.  The decoder preserves them on its
+# effective record, so this boundary must not re-interpret a warning extension
+# as a malformed failure after decoding.
+AirFailureAction = str
 TimeoutPhase = Literal["cancel_response", "session_close", "term_grace", "kill_grace"]
 
 
@@ -66,7 +70,12 @@ class AcpCorrelation(TypedDict):
 
 
 def is_air_session_failure(value: object) -> bool:
-    """Validate the complete pinned AIR record; malformed metadata is not benign."""
+    """Validate a decoder-normalized effective AIR record.
+
+    Categories unknown to AIR v1 are normalized to ``unknown`` by the
+    decoder; action extensions remain strings.  Raw wire observations are not
+    accepted here and never decide completion independently.
+    """
     if not isinstance(value, dict):
         return False
     required = {"id", "revision", "category", "severity", "title", "actions"}
@@ -86,10 +95,18 @@ def is_air_session_failure(value: object) -> bool:
         return False
     if not isinstance(value["actions"], list):
         return False
-    if not all(isinstance(action, str) and action in {"retry", "new_session", "login"}
-               for action in value["actions"]):
+    if not all(isinstance(action, str) for action in value["actions"]):
         return False
     return "details" not in value or isinstance(value["details"], str)
+
+
+def is_effective_completion(stop_reason: str | None, severities: Iterable[str]) -> bool:
+    """The single AIR completion rule for decoder-effective records.
+
+    Callers must validate and revision-reconcile records before invoking this;
+    it intentionally does not inspect raw wire metadata.
+    """
+    return stop_reason == "end_turn" and all(severity == "warning" for severity in severities)
 
 
 def is_completion_candidate(prompt: AcpPromptFact) -> bool:
@@ -107,11 +124,11 @@ def is_completion_candidate(prompt: AcpPromptFact) -> bool:
         prompt.get("prompt_response_valid") is True
         and isinstance(prompt.get("jsonrpc_result"), dict)
         and "jsonrpc_error" not in prompt
-        and prompt.get("stop_reason") == "end_turn"
         # ``failures`` is the decoder's revision-reconciled effective view.
         # Do not revalidate raw observations here: stale records and unknown
         # extensions are intentionally decoder semantics, not a second route
         # to completion or rejection.
-        and all(is_air_session_failure(failure) and failure["severity"] != "error"
-                for failure in failures)
+        and all(is_air_session_failure(failure) for failure in failures)
+        and is_effective_completion(prompt.get("stop_reason"),
+                                    (failure["severity"] for failure in failures))
     )

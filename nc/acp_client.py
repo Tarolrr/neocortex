@@ -62,6 +62,10 @@ class AcpEvidenceOverflow(RuntimeError):
     """Authoritative correlated evidence exceeded the published local bound."""
 
 
+class AcpCleanupUncertain(RuntimeError):
+    """Owned ACP helpers could not be proven contained after cleanup."""
+
+
 @dataclass(frozen=True)
 class CodexAcpLaunchEvidence:
     """Recorded result of the isolated pinned-artifact launch verification.
@@ -217,12 +221,16 @@ class _TurnEvidenceCollector:
             # into a bounded transcript merely to give the decoder a value.
             # ``decoder_wire`` below injects this one final snapshot.
             self.usage = usage
-        if raw_failure is not None and _incident_belongs(raw_failure, self.prompt_id):
-            self.air_observations.append(raw_failure)
         if air is not None:
-            self._add({"method": "session/update", "params": {
+            record = {"method": "session/update", "params": {
                 "sessionId": self.session_id, "update": projected,
-            }})
+            }}
+            # Commit the raw audit observation only with its bounded decoder
+            # record.  In particular, a rejected overflow record cannot leak
+            # through the failure envelope beyond the published limit.
+            self._add(record)
+            if raw_failure is not None and _incident_belongs(raw_failure, self.prompt_id):
+                self.air_observations.append(raw_failure)
 
     def prompt_response(self, value: object) -> None:
         if not isinstance(value, dict):
@@ -266,9 +274,9 @@ class _TurnEvidenceCollector:
                 }
             else:
                 retained["error"] = None
+        self._add(retained)
         if raw_failure is not None and _incident_belongs(raw_failure, self.prompt_id):
             self.air_observations.append(raw_failure)
-        self._add(retained)
 
 
 def _project_usage(value: object) -> dict[str, int] | None:
@@ -704,6 +712,11 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         # successful prompt evidence.
         if failure is None and child.shutdown_failure is not None:
             failure = child.shutdown_failure
+        if failure is None and child.cleanup_uncertain:
+            # A successful prompt is not enough when the owned helper tree
+            # cannot be proved gone.  Return the same typed envelope as every
+            # other local failure instead of hiding this in a shutdown string.
+            failure = AcpCleanupUncertain("ACP cleanup containment is uncertain")
         if failure is not None:
             # Prompt expiry remains a timeout fact even if cancellation and
             # closing complete inside their separately bounded windows.
@@ -715,9 +728,11 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
             prompt_fact = partial_prompt_fact()
             failure.evidence = AcpTurnEvidence(
                 prompt_fact, evidence.usage, process, child.shutdown_outcome, child.cleanup_uncertain,
-                str(log_path), "evidence_overflow" if evidence.overflow else "local_failure",
+                str(log_path), "evidence_overflow" if evidence.overflow else (
+                    "cleanup_uncertain" if child.cleanup_uncertain else "local_failure"
+                ),
             )
-            if child.shutdown_failure is not None:
+            if child.shutdown_failure is not None or isinstance(failure, AcpCleanupUncertain):
                 raise failure
             if isinstance(failure, AcpProcessTimeout):
                 failure.timeout_phases = tuple(timeout_phases)

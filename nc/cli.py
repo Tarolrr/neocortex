@@ -504,10 +504,7 @@ def cmd_acp_doctor(args) -> int:
         runtime = inspect_runtime(Path(args.runtime), profile=args.profile)
         print(f"ACP artifact: ready ({runtime.platform}; {runtime.command})")
         print("ACP profile: ready (agent / workspaceWrite / on-request / auto_review)")
-        if args.auth:
-            print("ACP auth: " + credential_readiness(Path(args.auth)))
-        else:
-            print("ACP auth: not checked (pass --auth /absolute/path/to/auth.json)")
+        print("ACP auth: " + credential_readiness(Path(args.auth)))
         print("ACP model/network/sandbox: unverified; owner smoke is a separate explicit operation")
         return 0
     except AcpRuntimeNotReady as exc:
@@ -817,7 +814,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("acp-doctor", help="offline isolated ACP artifact/profile/auth readiness")
     sp.add_argument("--runtime", required=True)
     sp.add_argument("--profile", default="agent")
-    sp.add_argument("--auth", help="explicit existing Codex auth.json; read-only check")
+    sp.add_argument("--auth", required=True,
+                    help="explicit existing Codex auth.json; read-only readiness check")
     sp.set_defaults(func=cmd_acp_doctor)
     sp = sub.add_parser("acp-ordinary-smoke", help="explicit owner-only live ordinary ACP handshake")
     sp.add_argument("--runtime", required=True)

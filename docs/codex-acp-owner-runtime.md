@@ -43,7 +43,7 @@ At an idle lifecycle boundary, as the owner, run:
 
 ```sh
 scripts/codex_acp_runtime.sh install /srv/neocortex/acp-1.11.0 /secure/codex-acp-1.11.0.tgz
-nc acp-doctor --runtime /srv/neocortex/acp-1.11.0
+nc acp-doctor --runtime /srv/neocortex/acp-1.11.0 --auth /secure/auth.json
 ```
 
 The command rejects an existing directory, a bad tarball, anything other than

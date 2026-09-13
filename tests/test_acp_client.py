@@ -104,6 +104,12 @@ if scenario == "permission":
 if scenario == "elicitation":
     send({"jsonrpc":"2.0","id":"elicit","method":"elicitation/create","params":{"sessionId":"fresh"}})
     assert read()["result"] == {"action":"cancel", "content":None}
+if scenario == "numeric_overlap":
+    # JSON-RPC ids are bidirectional namespaces.  A peer request may use the
+    # same numeric value as our outstanding prompt id without becoming its
+    # response.
+    send({"jsonrpc":"2.0","id":prompt["id"],"method":"session/request_permission","params":{"sessionId":"fresh"}})
+    assert read()["id"] == prompt["id"] and read is not None
 if scenario in {"malformed_request", "foreign_request", "unsupported_request"}:
     if scenario == "malformed_request":
         method, params = "session/request_permission", {}
@@ -117,6 +123,13 @@ if scenario == "agent_tool":
     # This is an agent-owned update; it requires no client terminal or
     # filesystem capability and is not a client-directed tool request.
     send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"sessionUpdate":"tool_call_update","toolCallId":"agent-owned-command","status":"completed"}}})
+if scenario == "stale_duplicate":
+    failure = {"id":str(prompt["id"])+":x","revision":2,"category":"service","severity":"warning","title":"current","actions":[]}
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
+    failure["revision"] = 1
+    failure["title"] = "stale"
+    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fresh","update":{"_meta":{"jetbrains":{"air":{"version":1,"sessionFailure":failure}}}}}})
 if scenario == "error":
     send({"jsonrpc":"2.0","id":prompt["id"],"error":{"code":-1,"message":"bad"}}); time.sleep(.2); sys.exit(0)
 if scenario == "malformed":
@@ -286,6 +299,17 @@ def test_notification_flood_after_air_failure_fails_closed_with_evidence(tmp_pat
 
 def test_fake_elicitation_is_cancelled_noninteractively(tmp_path: Path) -> None:
     assert run(tmp_path, "elicitation").prompt.kind == "success"
+
+
+def test_fake_numeric_bidirectional_request_id_overlap_is_not_prompt_response(tmp_path: Path) -> None:
+    assert run(tmp_path, "numeric_overlap").prompt.kind == "success"
+
+
+def test_fake_stale_air_revision_cannot_override_decoder_effective_failure(tmp_path: Path) -> None:
+    turn = run(tmp_path, "stale_duplicate")
+    assert turn.prompt.kind == "success"
+    assert turn.prompt.failures[0].revision == 2
+    assert turn.prompt_fact["session_failures"][0]["revision"] == 2
 
 
 @pytest.mark.parametrize("scenario", ["malformed_request", "foreign_request", "unsupported_request"])

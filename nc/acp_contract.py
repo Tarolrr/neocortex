@@ -112,6 +112,6 @@ def is_completion_candidate(prompt: AcpPromptFact) -> bool:
         # Do not revalidate raw observations here: stale records and unknown
         # extensions are intentionally decoder semantics, not a second route
         # to completion or rejection.
-        and all(isinstance(failure, dict) and failure.get("severity") != "error"
+        and all(is_air_session_failure(failure) and failure["severity"] != "error"
                 for failure in failures)
     )

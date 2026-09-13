@@ -23,11 +23,19 @@ install)
   # Never generate a lock here: published dependency ranges would make the
   # registry state part of this installation.  npm ci receives the reviewed,
   # exact lock shipped with this script and the package manifest in the SRI-
-  # checked tarball.
+  # checked tarball.  npm ci deliberately does *not* install its root project,
+  # so install its exact dependencies first, then unpack that verified root
+  # artifact and create the same local bin link npm would create for it.
   test -f "$reviewed_lock" || { echo 'reviewed ACP lock is missing' >&2; exit 1; }
   tar -xOf "$runtime/codex-acp-1.11.0.tgz" package/package.json > "$runtime/package.json"
   cp "$reviewed_lock" "$runtime/package-lock.json"
   npm ci --ignore-scripts --omit=dev --prefix "$runtime"
+  acp_dir="$runtime/node_modules/@agentclientprotocol/codex-acp"
+  mkdir -p "$acp_dir" "$runtime/node_modules/.bin"
+  tar -xzf "$runtime/codex-acp-1.11.0.tgz" -C "$acp_dir" --strip-components=1
+  test -f "$acp_dir/dist/index.js" || { echo 'verified ACP artifact lacks dist/index.js' >&2; exit 1; }
+  chmod +x "$acp_dir/dist/index.js"
+  ln -s ../@agentclientprotocol/codex-acp/dist/index.js "$runtime/node_modules/.bin/codex-acp"
   npm ls --all --json --prefix "$runtime" > "$runtime/resolved-dependencies.json"
   (cd "$runtime" && find node_modules -type f -print0 | sort -z | xargs -0 sha256sum) > "$runtime/installed.sha256"
   (cd "$runtime" && sha256sum node_modules/.bin/codex-acp) > "$runtime/launcher.sha256"

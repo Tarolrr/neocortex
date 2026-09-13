@@ -15,7 +15,11 @@ The published manifest is the primary artifact evidence for its dependencies;
 the published [Codex 0.153.4 version document](https://registry.npmjs.org/@openai/codex/0.153.4)
 states Node `>=16` and declares the platform optional packages. The installer
 uses the reviewed `scripts/codex_acp_runtime.lock.json` with `npm ci`; it never
-generates a lock during installation. That lock contains exact resolved URLs
+generates a lock during installation. Because `npm ci` does not install the
+root project into `node_modules`, the script then extracts the SRI-verified
+published tarball itself to `node_modules/@agentclientprotocol/codex-acp` and
+creates its local `node_modules/.bin/codex-acp` link to its `dist/index.js`.
+That lock contains exact resolved URLs
 and SRI entries, including both published Linux packages
 `0.153.4-linux-x64` and `0.153.4-linux-arm64`. The installer selects and
 checks only the host package. It records `npm ls` separately. The

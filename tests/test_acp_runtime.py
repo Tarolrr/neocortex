@@ -1,10 +1,64 @@
 """Offline runtime-inspection coverage; no npm, real credentials, or ACP binary."""
 
+import os
+import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
 
 from nc import acp_runtime
+
+
+def _stub_executable(path: Path, body: str) -> None:
+    path.write_text("#!/usr/bin/env bash\nset -eu\n" + body)
+    path.chmod(0o700)
+
+
+def test_owner_installer_unpacks_verified_root_artifact_and_launcher(tmp_path, monkeypatch):
+    """Exercise the shell layout, rather than inventing its post-install paths."""
+    source = tmp_path / "source" / "package"
+    (source / "dist").mkdir(parents=True)
+    (source / "package.json").write_text('{"version":"1.11.0"}')
+    (source / "dist" / "index.js").write_text("#!/usr/bin/env node\n")
+    tarball = tmp_path / "codex-acp.tgz"
+    with tarfile.open(tarball, "w:gz") as archive:
+        archive.add(source, arcname="package")
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    _, node_arch = acp_runtime._host_platform()
+    _stub_executable(tools / "openssl", "printf x")
+    # The script forms SRI by piping openssl's bytes to base64.
+    _stub_executable(tools / "base64", "cat >/dev/null\nprintf '%s' 'opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ=='")
+    _stub_executable(tools / "npm", """
+prefix="${@: -1}"
+if [ "$1" = ls ]; then printf '{}\\n'; exit 0; fi
+for spec in '@agentclientprotocol/sdk:1.4.0' '@openai/codex:0.153.4' "@openai/codex-linux-${ACP_TEST_ARCH}:0.153.4-linux-${ACP_TEST_ARCH}"; do
+  name="${spec%%:*}"; version="${spec#*:}"; dir="$prefix/node_modules/$name"
+  mkdir -p "$dir"; printf '{"version":"%s"}\\n' "$version" > "$dir/package.json"
+done
+mkdir -p "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/bin"
+printf '#!/bin/sh\\n' > "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/bin/codex"
+chmod +x "$prefix/node_modules/@openai/codex-linux-${ACP_TEST_ARCH}/bin/codex"
+""")
+    _stub_executable(tools / "node", """
+case "$*" in
+  *codex-acp*) printf 1.11.0;; *'@openai/codex/package.json'*) printf 0.153.4;;
+  *sdk/package.json*) printf 1.4.0;; *codex-linux-*) printf '0.153.4-linux-%s' "$ACP_TEST_ARCH";; *) exit 0;;
+esac
+""")
+    runtime = tmp_path / "runtime"
+    script = Path(__file__).parents[1] / "scripts" / "codex_acp_runtime.sh"
+    environment = os.environ | {"PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                                "ACP_TEST_ARCH": node_arch}
+    subprocess.run([str(script), "install", str(runtime), str(tarball)], check=True, env=environment)
+    launcher = runtime / "node_modules" / ".bin" / "codex-acp"
+    assert launcher.is_symlink()
+    assert launcher.resolve() == runtime / "node_modules" / "@agentclientprotocol" / "codex-acp" / "dist" / "index.js"
+    assert (launcher.resolve()).is_file()
+    monkeypatch.setattr(acp_runtime, "_verify_tarball", lambda _root: None)
+    inspected = acp_runtime.inspect_runtime(runtime)
+    assert inspected.evidence.command == (str(launcher),)
 
 
 def runtime_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, arch: str = "x64") -> Path:

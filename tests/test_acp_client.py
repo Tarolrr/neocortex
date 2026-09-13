@@ -236,17 +236,25 @@ def test_fake_success_has_independent_shutdown_evidence(tmp_path: Path) -> None:
     assert turn.live_sandbox_enforcement_verified is False
 
 
-@pytest.mark.parametrize("scenario,kind", [("terminal", "failed"), ("warning", "failed"),
-                                              ("error", "failed"), ("malformed", "protocol_invalid")])
+@pytest.mark.parametrize("scenario,kind", [("terminal", "failed"), ("error", "failed"),
+                                              ("malformed", "protocol_invalid")])
 def test_fake_terminal_and_recoverable_evidence(tmp_path: Path, scenario: str, kind: str) -> None:
     turn = run(tmp_path, scenario)
     assert turn.prompt.kind == kind
-    if scenario in {"terminal", "warning"}:
+    if scenario == "terminal":
         assert turn.prompt_fact["air_observations"]
 
 
 def test_fake_warning_progress_then_end_turn_is_recovered_success(tmp_path: Path) -> None:
     turn = run(tmp_path, "warning_recovery")
+    assert turn.prompt.kind == "success"
+    assert turn.prompt_fact["air_observations"]
+    assert turn.prompt_fact["session_failures"] == []
+
+
+def test_fake_warning_then_successful_end_turn_is_recovered_success(tmp_path: Path) -> None:
+    """A canonical completion clears a known update warning without progress."""
+    turn = run(tmp_path, "warning")
     assert turn.prompt.kind == "success"
     assert turn.prompt_fact["air_observations"]
     assert turn.prompt_fact["session_failures"] == []
@@ -374,11 +382,11 @@ def test_fake_numeric_bidirectional_request_id_overlap_is_not_prompt_response(tm
     assert run(tmp_path, "numeric_overlap").prompt.kind == "success"
 
 
-def test_fake_stale_air_revision_cannot_override_decoder_effective_failure(tmp_path: Path) -> None:
+def test_fake_stale_air_revision_cannot_override_recovered_warning(tmp_path: Path) -> None:
     turn = run(tmp_path, "stale_duplicate")
-    assert turn.prompt.kind == "failed"
+    assert turn.prompt.kind == "success"
     assert turn.prompt.failures[0].revision == 2
-    assert turn.prompt_fact["session_failures"][0]["revision"] == 2
+    assert turn.prompt_fact["session_failures"] == []
 
 
 def test_unknown_air_warning_remains_a_conservative_decoder_failure(tmp_path: Path) -> None:
@@ -398,7 +406,8 @@ def test_raw_air_observation_keeps_bounded_unknown_extension_separately(tmp_path
     turn = run(tmp_path, "raw_extension")
     raw = turn.prompt_fact["air_observations"]
     assert raw[0]["providerExtension"] == {"nested": ["retained", {"shape": "exact"}]}
-    assert "providerExtension" not in turn.prompt_fact["session_failures"][0]
+    assert not hasattr(turn.prompt.failures[0], "providerExtension")
+    assert turn.prompt_fact["session_failures"] == []
 
 
 def test_effective_air_record_preserves_title_and_details_separately(tmp_path: Path) -> None:

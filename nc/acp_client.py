@@ -709,10 +709,11 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
             decoded = decode_acp_prompt_result(
                 decoder_wire, request_id=str(prompt_id), session_id=session_id,
             )
-            # A warning is no longer active only after independently
-            # structured agent progress *following* the AIR update.  Keep an
-            # unrecovered warning active despite its canonical decoder shape;
-            # raw AIR remains audit evidence in both cases.
+            # A known warning is no longer active after independently
+            # structured agent progress, or after a canonical successful
+            # completion that does not repeat it as terminal AIR evidence.
+            # Do not let success recover unknown, malformed, conflicting, or
+            # terminal warning evidence; raw AIR remains audit evidence.
             def air_update(item: object) -> bool:
                 if not isinstance(item, dict) or item.get("method") != "session/update":
                     return False
@@ -730,9 +731,25 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
 
             last_air = max((index for index, item in enumerate(evidence.records) if air_update(item)),
                            default=-1)
-            recovered_warning = any(
-                progress_update(item)
-                for item in evidence.records[last_air + 1:]
+            progress_after_warning = any(
+                progress_update(item) for item in evidence.records[last_air + 1:]
+            )
+            terminal_result = response.get("result")
+            terminal_meta = terminal_result.get("_meta") if isinstance(terminal_result, dict) else None
+            terminal_jetbrains = terminal_meta.get("jetbrains") if isinstance(terminal_meta, dict) else None
+            terminal_air = terminal_jetbrains.get("air") if isinstance(terminal_jetbrains, dict) else None
+            terminal_air_failure = isinstance(terminal_air, dict) and "sessionFailure" in terminal_air
+            known_warning_only = bool(decoded.failures) and all(
+                item.severity == "warning" and item.unknown_category is None
+                and not item.unknown_actions
+                for item in decoded.failures
+            )
+            recovered_warning = (
+                decoded.kind == "success" and known_warning_only and not terminal_air_failure
+                # ``end_turn`` itself is structured recovery.  Keep the explicit
+                # progress fact for audit/readability and for the documented
+                # equivalent recovery path.
+                and (progress_after_warning or decoded.stop_reason == "end_turn")
             )
             prompt_fact = {
                 "request_id": str(prompt_id), "session_id": session_id, "prompt_id": str(prompt_id),

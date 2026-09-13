@@ -330,7 +330,7 @@ def test_acp_valid_air_failure_respects_recovery_and_typed_policy(
         }],
     }
     result = SessionResult(0, tmp_path / "diagnostic.log", None, False, transport="acp",
-                           completion=False, acp_result_kind="failed",
+                           completion=True, acp_result_kind="success",
                            acp_process={"pid": 4, "exit_code": 0, "signal": None,
                                         "timed_out": False, "timeout_phases": [],
                                         "stderr_available": True,
@@ -359,8 +359,8 @@ def _acp_air_result(tmp_path, failures, *, process=None):
         "session_failures": failures,
     }
     return SessionResult(
-        0, tmp_path / "acp-air.log", None, False, transport="acp", completion=False,
-        acp_result_kind="failed",
+        0, tmp_path / "acp-air.log", None, False, transport="acp", completion=True,
+        acp_result_kind="success",
         acp_process=process or {"pid": 4, "exit_code": 0, "signal": None,
                                 "timed_out": False, "timeout_phases": [],
                                 "stderr_available": True, "supervisor_terminated": False},
@@ -403,6 +403,25 @@ def test_acp_local_failure_overrides_typed_retry_hint(tmp_path):
                "timeout_phases": [], "stderr_available": True, "supervisor_terminated": False}
     assessment = assess_session(_acp_air_result(tmp_path, [failure], process=process), "codex-acp")
     assert assessment.category == "local_error"
+
+
+@pytest.mark.parametrize(("result_kind", "completion", "stop_reason"), [
+    ("failed", False, "end_turn"),
+    ("success", True, "cancelled"),
+    ("success", True, "max_tokens"),
+    ("success", True, "unknown"),
+])
+def test_acp_retryable_air_never_overrides_noncanonical_prompt(
+        tmp_path, result_kind, completion, stop_reason):
+    failure = {"id": "air-1", "revision": 1, "category": "service", "severity": "error",
+               "title": "retry", "actions": ["retry"]}
+    result = _acp_air_result(tmp_path, [failure])
+    result.acp_result_kind = result_kind
+    result.completion = completion
+    assert result.acp_prompt is not None
+    result.acp_prompt["stop_reason"] = stop_reason
+    result.acp_prompt["jsonrpc_result"] = {"stopReason": stop_reason}
+    assert assess_session(result, "codex-acp").category == "protocol"
 
 
 @pytest.mark.parametrize("prompt", [

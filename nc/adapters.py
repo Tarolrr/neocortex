@@ -461,6 +461,15 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
                               f"ACP process terminated unexpectedly by signal {signal_number}")
     if process["exit_code"] != 0:
         return HostAssessment("FAILED", "local_error", "ACP process did not exit successfully")
+    # A retry action cannot turn a cancelled, truncated, or otherwise
+    # noncanonical prompt into a timer-retryable provider condition.  Require
+    # the independent terminal result before consulting active AIR evidence.
+    # ``is_completion_candidate`` is intentionally checked below: active AIR
+    # errors make a successful *outcome* ineligible, while this narrower
+    # envelope check establishes that the failed prompt itself ended cleanly.
+    if (result.acp_result_kind != "success" or result.completion is not True
+            or not _is_canonical_acp_terminal(prompt)):
+        return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
     # AIR is structured provider evidence, but only a single canonical active
     # error record can select the deliberately small timer policy below.  In
     # particular, do not use titles, details, stderr, or an apparent live ACP
@@ -471,11 +480,34 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
             and any(isinstance(item, dict) and item.get("severity") == "error"
                     for item in failures)):
         return _assess_air_failures(prompt, failures)
-    if result.acp_result_kind != "success" or result.completion is not True:
-        return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
     if not is_completion_candidate(prompt):
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
     return HostAssessment("SUCCESS", "none", "")
+
+
+def _is_canonical_acp_terminal(prompt: dict[str, object]) -> bool:
+    """Validate the terminal prompt envelope before AIR policy selection.
+
+    Active AIR errors deliberately prevent ``is_completion_candidate``: they
+    are failures, not agent outcomes.  They still need a correlated successful
+    ``end_turn`` response so a retry hint cannot override cancellation,
+    max-token exhaustion, JSON-RPC failure, or an unknown stop reason.
+    """
+    request_id = prompt.get("request_id")
+    prompt_id = prompt.get("prompt_id")
+    session_id = prompt.get("session_id")
+    response = prompt.get("jsonrpc_result")
+    return (
+        prompt.get("prompt_response_valid") is True
+        and isinstance(request_id, str) and bool(request_id)
+        and isinstance(prompt_id, str) and bool(prompt_id)
+        and request_id == prompt_id
+        and isinstance(session_id, str) and bool(session_id)
+        and isinstance(response, dict)
+        and response.get("stopReason") == "end_turn"
+        and prompt.get("stop_reason") == "end_turn"
+        and "jsonrpc_error" not in prompt
+    )
 
 
 def _assess_air_failures(prompt: dict[str, object], failures: list[object]) -> HostAssessment:

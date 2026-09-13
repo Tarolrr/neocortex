@@ -1650,6 +1650,48 @@ class TimerFlakyAdapter(ScriptedAdapter):
         return result
 
 
+class AcpTimerFlakyAdapter(ScriptedAdapter):
+    """Isolated ACP facts for timer policy tests; no ACP transport is started."""
+
+    name = "codex-acp"
+
+    def __init__(self, script, category, actions, *, local_failure=False):
+        super().__init__(script)
+        self.category = category
+        self.actions = actions
+        self.local_failure = local_failure
+        self.temporary_failures = 1
+
+    def run(self, *args, **kwargs):
+        result = super().run(*args, **kwargs)
+        result.transport = "acp"
+        result.completion = True
+        result.acp_result_kind = "success"
+        result.acp_process = {
+            "pid": 41, "exit_code": 0, "signal": None, "timed_out": False,
+            "timeout_phases": [], "stderr_available": True,
+            "supervisor_terminated": False,
+        }
+        failures = []
+        if self.temporary_failures:
+            self.temporary_failures -= 1
+            failures = [{
+                "id": "air-1", "revision": 1, "category": self.category,
+                "severity": "error", "title": "isolated provider condition",
+                "actions": self.actions,
+            }]
+            if self.local_failure:
+                result.acp_process["exit_code"] = 1
+        result.acp_prompt = {
+            "request_id": "p", "prompt_id": "p", "session_id": "s",
+            "prompt_response_valid": True,
+            "jsonrpc_result": {"stopReason": "end_turn"},
+            "stop_reason": "end_turn", "air_observations": failures,
+            "session_failures": failures,
+        }
+        return result
+
+
 def timer_invocation(cfg, state, adapter):
     """Fresh Scheduler instance: equivalent to the next five-minute timer run."""
     scheduler = Scheduler(cfg, state)
@@ -1661,7 +1703,11 @@ def timer_invocation(cfg, state, adapter):
 
 
 @pytest.mark.parametrize("role", ["worker", "critic", "planner", "plan_critic"])
-def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
+@pytest.mark.parametrize(("category", "actions"), [
+    ("limit", ["retry"]), ("service", ["retry"]),
+])
+def test_acp_timer_invocation_defers_each_role_and_later_applies_once(
+        setup, role, category, actions):
     """A provider outage ends this timer run; its next run resumes logical work."""
     cfg, state, _repo = setup
     def partial(cwd, outcome_path):
@@ -1670,10 +1716,10 @@ def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
         outcome_path.write_text(json.dumps({"outcome": "YIELD", "summary": "interrupted"}))
     if role == "worker":
         task = state.add_task("neocortex", "worker outage", "objective", [])
-        adapter = TimerFlakyAdapter([
+        adapter = AcpTimerFlakyAdapter([
             partial,
             commit_and_emit("complete", "ok\n", {"outcome": "DONE", "summary": "done"}),
-        ], captured_codex_limit=True)
+        ], category, actions)
         # Undelivered feedback must survive the failed host session.
         state.add_agent(f"worker-{task}", "worker", "neocortex", task, "model")
         state.set_task(task, status="in_progress")
@@ -1685,22 +1731,22 @@ def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
         state.set_agent(f"worker-{task}", state="blocked")
         state.add_agent(f"critic-{task}-1", "critic", "neocortex", task, "model")
         state.send(protocol.FEEDBACK, "owner", f"critic-{task}-1", {"text": "retain"}, task)
-        adapter = TimerFlakyAdapter([
+        adapter = AcpTimerFlakyAdapter([
             partial,
             emit({"outcome": "DONE", "verdict": "rework", "findings": ["fix"]}),
-        ], captured_codex_limit=True)
+        ], category, actions)
     elif role == "planner":
         planner, _ = state.planner_feedback(None, "retain revision wake", "model")
-        adapter = TimerFlakyAdapter([
+        adapter = AcpTimerFlakyAdapter([
             partial,
             emit({"outcome": "DONE", "summary": "proposal", "proposal": [planner_spec()]}),
-        ], captured_codex_limit=True)
+        ], category, actions)
     else:
         proposal = state.add_proposal("neocortex", "planner", "", [planner_spec()])
-        adapter = TimerFlakyAdapter([
+        adapter = AcpTimerFlakyAdapter([
             partial,
             emit({"outcome": "DONE", "recommendation": "keep", "findings": ["sound"]}),
-        ], captured_codex_limit=True)
+        ], category, actions)
         adapter.run_planner = adapter.run
 
     # The first invocation makes exactly one dispatch and returns on deferral.
@@ -1740,6 +1786,28 @@ def test_timer_invocation_defers_each_role_and_later_applies_once(setup, role):
                            (review["id"],))
         assert review["status"] == "done"
         assert [row["status"] for row in attempts] == ["retryable", "done"]
+
+
+@pytest.mark.parametrize(("category", "actions", "local_failure", "expected"), [
+    ("limit", [], False, "unknown"),
+    ("access", ["login"], False, "unknown"),
+    ("connection", ["retry"], False, "unknown"),
+    ("service", ["retry"], True, "local_error"),
+])
+def test_acp_nondeferrable_failures_keep_worker_failure_policy(
+        setup, category, actions, local_failure, expected):
+    """Typed ACP quota/access/connection and local facts never enter T009."""
+    cfg, state, _repo = setup
+    task = state.add_task("neocortex", "nondeferrable ACP", "objective", [])
+    adapter = AcpTimerFlakyAdapter(
+        [emit({"outcome": "YIELD", "summary": "partial retained"})],
+        category, actions, local_failure=local_failure)
+    timer_invocation(cfg, state, adapter)
+    host = state.one("SELECT terminal_category AS category FROM run ORDER BY id DESC LIMIT 1")
+    agent = state.one("SELECT turns FROM agent WHERE role='worker' ORDER BY id LIMIT 1")
+    assert host["category"] == expected
+    assert state.one("SELECT attempts FROM task WHERE id=?", (task,))[0] == 1
+    assert agent["turns"] == 1
 
 
 def test_timer_outages_exceed_task_and_turn_budgets_without_breaker(setup):

@@ -186,6 +186,7 @@ class AcpSubprocess:
         # orderly stdin-EOF cleanup is in progress.
         self.shutdown_failure: AcpUnexpectedExit | None = None
         self._shutdown_failure_during_cleanup = False
+        self._post_response_failure_observed = False
         # This is deliberately separate from a process exit code: closing a
         # server is cleanup, not a successful ACP result.
         self.shutdown_outcome: str | None = None
@@ -302,6 +303,10 @@ class AcpSubprocess:
             return
         code = self.proc.returncode
         if isinstance(code, int) and code != 0:
+            # Preserve the observation boundary across finally/close().  A
+            # later poll may race with cleanup, but this exit was established
+            # before the client started deliberate shutdown.
+            self._post_response_failure_observed = True
             raise AcpUnexpectedExit(self._exit_message(code))
 
     def _raise_if_intentional_shutdown(self) -> None:
@@ -491,6 +496,7 @@ class AcpSubprocess:
         uncertainty = "; containment uncertain" if self.cleanup_uncertain else ""
         prefix = "ACP process failure during deliberate shutdown" if (
             self.shutdown_failure and self._shutdown_failure_during_cleanup
+            and not self._post_response_failure_observed
         ) else (
             "ACP process exit observed before deliberate shutdown" if self.shutdown_failure else (
             "ACP intentional shutdown" if preexisting_exit is None else (

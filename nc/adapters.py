@@ -167,6 +167,9 @@ class SessionResult:
     acp_prompt: dict[str, object] | None = None
     acp_cleanup_uncertain: bool = False
     evidence_path: Path | None = None
+    # A collector snapshot is retained independently from the prompt fact so
+    # accounting survives EOF and other post-response local failures.
+    acp_usage: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -440,23 +443,66 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
     process, prompt = result.acp_process, result.acp_prompt
     if not isinstance(process, dict) or not isinstance(prompt, dict):
         return HostAssessment("FAILED", "protocol", "ACP completion evidence is absent")
-    if result.acp_cleanup_uncertain or "containment uncertain" in result.terminal_diagnostic.lower():
+    # A zero exit status without the rest of the independently observed
+    # process envelope is not process success.  In particular, do not let a
+    # hand-written partial fact paper over an unobserved signal or cleanup.
+    if not _valid_acp_process(process):
+        return HostAssessment("FAILED", "protocol", "ACP process evidence is incomplete")
+    if (result.acp_cleanup_uncertain
+            or "containment uncertain" in result.terminal_diagnostic.lower()):
         return HostAssessment("FAILED", "local_error", "ACP cleanup containment is uncertain")
     if process.get("timed_out") is True:
         return HostAssessment("FAILED", "host_timeout", "ACP host deadline expired")
-    signal_number = process.get("signal")
-    if isinstance(signal_number, int) and not isinstance(signal_number, bool):
+    signal_number = process["signal"]
+    if signal_number is not None:
         shutdown = result.terminal_diagnostic.lower()
         category = "local_error" if "intentional shutdown" in shutdown else "host_timeout"
         detail = ("ACP deliberately terminated by supervisor after response"
-                  if category == "local_error" else f"ACP process terminated by signal {signal_number}")
+                  if category == "local_error"
+                  else f"ACP process terminated by signal {signal_number}")
         return HostAssessment("FAILED", category, detail)
-    if process.get("exit_code") != 0:
+    if process["exit_code"] != 0:
         return HostAssessment("FAILED", "local_error", "ACP process did not exit successfully")
     if (result.acp_result_kind != "success" or result.completion is not True
             or not is_completion_candidate(prompt)):
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
     return HostAssessment("SUCCESS", "none", "")
+
+
+def _valid_acp_process(process: dict[str, object]) -> bool:
+    """Validate the complete, independently captured local process envelope."""
+    required = {"pid", "exit_code", "signal", "timed_out", "timeout_phases", "stderr_available"}
+    if not required <= process.keys():
+        return False
+    pid, code, signum = process["pid"], process["exit_code"], process["signal"]
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if code is not None and (not isinstance(code, int) or isinstance(code, bool) or code < 0):
+        return False
+    if signum is not None and (
+            not isinstance(signum, int) or isinstance(signum, bool) or signum <= 0):
+        return False
+    if (not isinstance(process["timed_out"], bool)
+            or not isinstance(process["stderr_available"], bool)):
+        return False
+    phases = process["timeout_phases"]
+    return isinstance(phases, list) and all(
+        isinstance(phase, str) and phase in {
+            "cancel_response", "session_close", "term_grace", "kill_grace",
+        }
+        for phase in phases
+    )
+
+
+def _sanitize_evidence(value: object) -> object:
+    """Redact every string in the diagnostic-only ACP audit envelope."""
+    if isinstance(value, str):
+        return sanitize_diagnostic(value)
+    if isinstance(value, list):
+        return [_sanitize_evidence(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _sanitize_evidence(item) for key, item in value.items()}
+    return value
 
 
 class Adapter:
@@ -503,13 +549,18 @@ class CodexAcpAdapter(Adapter):
 
     def _run(self, prompt: str, cwd: Path, model: str, log_path: Path,
              timeout_s: int) -> SessionResult:
-        evidence_path = log_path.with_name("acp-evidence.json")
+        # The caller gives every invocation its own log directory.  Include a
+        # nonce nevertheless: preflight probes share a parent and each row
+        # must retain its own immutable evidence reference.
+        evidence_path = log_path.with_name(f"acp-evidence-{uuid.uuid4().hex}.json")
+        usage: dict[str, int] | None = None
         try:
             from .acp_client import run_codex_acp_turn
             turn = run_codex_acp_turn(self.command, launch=self.launch,
                                       policy=self.policy_factory(cwd), model=model, prompt=prompt,
                                       log_path=log_path, timeout_s=timeout_s)
             process, prompt_fact = dict(turn.process), dict(turn.prompt_fact)
+            usage = prompt_fact.get("usage") if isinstance(prompt_fact.get("usage"), dict) else None
             completion = turn.prompt.kind == "success" and is_completion_candidate(prompt_fact)
             shutdown = turn.shutdown or ""
             result_kind = turn.prompt.kind
@@ -519,21 +570,30 @@ class CodexAcpAdapter(Adapter):
         # ordinary ``Exception`` subclasses.
         except BaseException as exc:  # noqa: BLE001
             evidence = getattr(exc, "evidence", None)
-            process = dict(getattr(evidence, "process", None) or getattr(exc, "process", None) or {})
+            process = dict(getattr(evidence, "process", None)
+                           or getattr(exc, "process", None) or {})
             prompt_fact = dict(getattr(evidence, "prompt", None) or {})
+            raw_usage = getattr(evidence, "usage", None)
+            usage = dict(raw_usage) if isinstance(raw_usage, dict) else None
+            if usage is None and isinstance(prompt_fact.get("usage"), dict):
+                usage = prompt_fact["usage"]
+            if usage is not None and "usage" not in prompt_fact:
+                prompt_fact["usage"] = usage
             completion, shutdown = False, str(getattr(evidence, "shutdown", "") or exc)
             result_kind = "local_failure"
             cleanup_uncertain = bool(getattr(evidence, "cleanup_uncertain", False))
         payload: dict[str, Any] = {"transport": "acp", "completion": completion,
-                                   "result_kind": result_kind, "process": process, "prompt": prompt_fact,
-                                   "shutdown": sanitize_diagnostic(shutdown)}
-        evidence_path.write_text(json.dumps(payload, sort_keys=True))
+                                   "result_kind": result_kind, "process": process,
+                                   "prompt": prompt_fact,
+                                   "usage": usage, "shutdown": shutdown}
+        evidence_path.write_text(json.dumps(_sanitize_evidence(payload), sort_keys=True))
         exit_code = process.get("exit_code")
         return SessionResult(exit_code if isinstance(exit_code, int) else 1, log_path,
-                             _acp_usage_total(prompt_fact.get("usage")),
+                             _acp_usage_total(usage),
                              process.get("timed_out") is True, None,
                              sanitize_diagnostic(shutdown), "acp", completion,
-                             result_kind, process, prompt_fact, cleanup_uncertain, evidence_path)
+                             result_kind, process, prompt_fact, cleanup_uncertain,
+                             evidence_path, usage)
 
 
 # Short alias for tests and future callers which describe the transport, not its vendor.

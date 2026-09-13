@@ -12,6 +12,7 @@ import logging
 import sqlite3
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 from . import arbiter, protocol, turn
@@ -65,7 +66,9 @@ class Scheduler:
         if free_mb is not None and free_mb < self.cfg.min_free_mb:
             return False, f"only {free_mb} MB RAM available"
 
-        probe_dir = self.cfg.home / "preflight"
+        # A probe's evidence is retained by its attempt row.  It cannot share
+        # a fixed log/evidence filename with later adapter/model probes.
+        probe_dir = self.cfg.home / "preflight" / f"probe-{time.time_ns()}-{uuid.uuid4().hex}"
         probe_dir.mkdir(parents=True, exist_ok=True)
         model = self.cfg.model_for(role)
         result = adapter.run(
@@ -114,7 +117,9 @@ class Scheduler:
                 return "preflight_failed"
             self._preflight_category = assessment.category
             self._preflight_diagnostic = assessment.diagnostic
-            ok, detail = False, f"model {pair[1]} is not usable ({assessment.category}): {assessment.diagnostic}"
+            ok, detail = False, (
+                f"model {pair[1]} is not usable ({assessment.category}): {assessment.diagnostic}"
+            )
         if ok:
             return None
         # Preflight output is host diagnostics.  It has no task/agent effects.

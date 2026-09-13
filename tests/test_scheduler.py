@@ -1818,6 +1818,47 @@ def test_preflight_reset_in_log_tail_is_not_trusted_without_terminal_evidence(se
     assert attempt["defer_until"] is None
 
 
+def test_acp_preflight_success_persists_typed_evidence_without_a_log(setup, monkeypatch):
+    """Successful ACP probes retain usage/process facts instead of orphaning them."""
+    cfg, state, _repo = setup
+    scheduler = Scheduler(cfg, state)
+    evidence = cfg.home / "preflight-evidence.json"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text('{"usage":{"totalTokens":7}}')
+
+    class AcpProbe:
+        name = "codex-acp"
+
+        def available(self):
+            return True
+
+        def run(self, _prompt, _cwd, _model, log_path, _timeout):
+            return SessionResult(
+                0, log_path, 7, False, transport="acp", completion=True,
+                acp_result_kind="success", evidence_path=evidence,
+                acp_usage={"totalTokens": 7},
+                acp_process={"pid": 77, "exit_code": 0, "signal": None,
+                             "timed_out": False, "timeout_phases": [],
+                             "stderr_available": False},
+                acp_prompt={"request_id": "p", "prompt_id": "p", "session_id": "s",
+                            "prompt_response_valid": True,
+                            "jsonrpc_result": {"stopReason": "end_turn"},
+                            "stop_reason": "end_turn", "air_observations": [],
+                            "session_failures": []},
+            )
+
+    scheduler._adapter_for = lambda _role: AcpProbe()
+    monkeypatch.setattr(scheduler, "_free_mb", lambda: 9999)
+    scheduler._in_run = True
+    try:
+        assert scheduler._preflight_selected("worker") is None
+    finally:
+        scheduler._in_run = False
+    attempt = state.one("SELECT * FROM preflight_attempt")
+    assert (attempt["category"], attempt["usage"], attempt["evidence_path"]) == (
+        "success", 7, str(evidence))
+
+
 @pytest.mark.parametrize("failure", ["nonzero", "timeout", "terminal"])
 def test_planner_host_failure_with_valid_done_keeps_revision_context(setup, failure):
     """A planner's valid proposal never consumes feedback after host failure."""

@@ -121,6 +121,12 @@ class Scheduler:
                 f"model {pair[1]} is not usable ({assessment.category}): {assessment.diagnostic}"
             )
         if ok:
+            # Typed ACP probes retain their independent evidence even on
+            # success; otherwise usage and host facts are orphaned artifacts.
+            if self._preflight_evidence_path is not None:
+                self.state.record_preflight_attempt(
+                    role, pair[0], pair[1], "success", detail, None,
+                    self._preflight_usage, self._preflight_evidence_path)
             return None
         # Preflight output is host diagnostics.  It has no task/agent effects.
         # ACP's run-local typed facts must remain inspectable for *every*

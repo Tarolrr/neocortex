@@ -233,7 +233,7 @@ def test_fake_success_has_independent_shutdown_evidence(tmp_path: Path) -> None:
     assert turn.live_sandbox_enforcement_verified is False
 
 
-@pytest.mark.parametrize("scenario,kind", [("terminal", "failed"), ("warning", "success"),
+@pytest.mark.parametrize("scenario,kind", [("terminal", "failed"), ("warning", "failed"),
                                               ("error", "failed"), ("malformed", "protocol_invalid")])
 def test_fake_terminal_and_recoverable_evidence(tmp_path: Path, scenario: str, kind: str) -> None:
     turn = run(tmp_path, scenario)
@@ -366,22 +366,22 @@ def test_fake_numeric_bidirectional_request_id_overlap_is_not_prompt_response(tm
 
 def test_fake_stale_air_revision_cannot_override_decoder_effective_failure(tmp_path: Path) -> None:
     turn = run(tmp_path, "stale_duplicate")
-    assert turn.prompt.kind == "success"
+    assert turn.prompt.kind == "failed"
     assert turn.prompt.failures[0].revision == 2
     assert turn.prompt_fact["session_failures"][0]["revision"] == 2
 
 
-def test_unknown_air_warning_uses_decoder_effective_completion_semantics(tmp_path: Path) -> None:
+def test_unknown_air_warning_remains_a_conservative_decoder_failure(tmp_path: Path) -> None:
     from nc.acp_contract import is_completion_candidate
 
     turn = run(tmp_path, "unknown_warning")
-    assert turn.prompt.kind == "success"
+    assert turn.prompt.kind == "failed"
     assert turn.prompt_fact["session_failures"] == [{
         "id": turn.prompt_fact["prompt_id"] + ":future", "revision": 1,
         "category": "unknown", "severity": "warning", "title": "future warning",
         "actions": ["future_action"],
     }]
-    assert is_completion_candidate(turn.prompt_fact)
+    assert not is_completion_candidate(turn.prompt_fact)
 
 
 def test_raw_air_observation_keeps_bounded_unknown_extension_separately(tmp_path: Path) -> None:

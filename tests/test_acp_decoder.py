@@ -31,11 +31,11 @@ def decode(name):
 
 @pytest.mark.parametrize(("name", "kind"), [
     ("acp-success.synthetic.json", "success"),
-    ("acp-warning-success.synthetic.json", "success"),
+    ("acp-warning-success.synthetic.json", "failed"),
     ("acp-typed-terminal.synthetic.json", "failed"),
     ("acp-quota.synthetic.json", "failed"),
-    ("acp-retryable-limit.synthetic.json", "success"),
-    ("acp-retryable-service.synthetic.json", "success"),
+    ("acp-retryable-limit.synthetic.json", "failed"),
+    ("acp-retryable-service.synthetic.json", "failed"),
     ("acp-access.synthetic.json", "failed"),
     ("acp-request.synthetic.json", "failed"),
     ("acp-cancelled.synthetic.json", "cancelled"),

@@ -306,7 +306,8 @@ def decode_acp_prompt_result(
     if is_effective_completion(stop_reason, (item.severity for item in evidence)):
         return AcpPromptResult("success", stop_reason, None, evidence, usage)
     errors = [item for item in evidence if item.severity == "error"]
-    return AcpPromptResult("failed", stop_reason, errors[-1].diagnostic or None, evidence, usage)
+    diagnostic = errors[-1].diagnostic if errors else "ACP reported session failure"
+    return AcpPromptResult("failed", stop_reason, diagnostic or None, evidence, usage)
 
 
 # A short public name is convenient for a future adapter without making it one.

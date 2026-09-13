@@ -297,6 +297,31 @@ def test_acp_signal_after_response_is_not_manufactured_success(tmp_path):
     assert assess_session(result, "codex-acp").category == "local_error"
 
 
+@pytest.mark.parametrize(("severity", "category", "actions"), [
+    ("warning", "service", ["retry"]),
+    ("error", "limit", ["new_session"]),
+])
+def test_acp_valid_air_failure_is_conservative_unknown_not_protocol_or_success(
+        tmp_path, severity, category, actions):
+    """AIR policy belongs to the later mapping task, not completion parsing."""
+    prompt = {
+        "request_id": "5", "prompt_id": "5", "session_id": "session-1",
+        "prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
+        "stop_reason": "end_turn", "air_observations": [],
+        "session_failures": [{
+            "id": "air-1", "revision": 1, "category": category,
+            "severity": severity, "title": "provider condition", "actions": actions,
+        }],
+    }
+    result = SessionResult(0, tmp_path / "diagnostic.log", None, False, transport="acp",
+                           completion=False, acp_result_kind="failed",
+                           acp_process={"pid": 4, "exit_code": 0, "signal": None,
+                                        "timed_out": False, "timeout_phases": [],
+                                        "stderr_available": True}, acp_prompt=prompt)
+    assessment = assess_session(result, "codex-acp")
+    assert (assessment.status, assessment.category) == ("FAILED", "unknown")
+
+
 @pytest.mark.parametrize("prompt", [
     {"prompt_response_valid": True, "jsonrpc_result": {"stopReason": "end_turn"},
      "stop_reason": "end_turn", "air_observations": [], "session_failures": []},

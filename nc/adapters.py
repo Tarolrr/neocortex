@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .acp_contract import is_completion_candidate
+from .acp_contract import is_air_session_failure, is_completion_candidate
 
 if TYPE_CHECKING:
     from .acp_client import CodexAcpLaunchEvidence
@@ -463,8 +463,19 @@ def _assess_acp(result: SessionResult) -> HostAssessment:
         return HostAssessment("FAILED", category, detail)
     if process["exit_code"] != 0:
         return HostAssessment("FAILED", "local_error", "ACP process did not exit successfully")
-    if (result.acp_result_kind != "success" or result.completion is not True
-            or not is_completion_candidate(prompt)):
+    # A decoder-normalized AIR condition is valid transport evidence but has
+    # no scheduler mapping yet.  It must remain a conservative host failure,
+    # rather than becoming either protocol corruption or a warning-success.
+    failures = prompt.get("session_failures")
+    if isinstance(failures, list) and failures and all(is_air_session_failure(item)
+                                                       for item in failures):
+        without_failures = dict(prompt)
+        without_failures["session_failures"] = []
+        if is_completion_candidate(without_failures):
+            return HostAssessment("FAILED", "unknown", "ACP reported session failure")
+    if result.acp_result_kind != "success" or result.completion is not True:
+        return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
+    if not is_completion_candidate(prompt):
         return HostAssessment("FAILED", "protocol", "ACP prompt did not complete canonically")
     return HostAssessment("SUCCESS", "none", "")
 

@@ -106,7 +106,11 @@ def is_effective_completion(stop_reason: str | None, severities: Iterable[str]) 
     Callers must validate and revision-reconcile records before invoking this;
     it intentionally does not inspect raw wire metadata.
     """
-    return stop_reason == "end_turn" and all(severity == "warning" for severity in severities)
+    # AIR has no settled scheduler policy yet.  A decoded sessionFailure is
+    # evidence of a provider condition, not evidence that the turn completed
+    # successfully.  Keep this deliberately conservative until the mapping
+    # layer owns category/action policy.
+    return stop_reason == "end_turn" and not tuple(severities)
 
 
 def is_completion_candidate(prompt: AcpPromptFact) -> bool:

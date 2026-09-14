@@ -606,6 +606,7 @@ def _run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidenc
     evidence = _TurnEvidenceCollector()
     prompt_fact: AcpPromptFact | None = None
     session_id: str | None = None
+    cancelled_permission_requests = 0
     # AcpJsonRpcStream must reply to a peer request before it can resume the
     # host request it was pumping.  Retain a policy-owner rejection across
     # that JSON-RPC error reply so a cooperative (or racing) prompt response
@@ -620,7 +621,7 @@ def _run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidenc
         evidence.notification(value)
 
     def deny_request(value: dict[str, object]) -> object:
-        nonlocal server_request_rejection
+        nonlocal cancelled_permission_requests, server_request_rejection
         method = value.get("method")
         params = value.get("params")
         if (not isinstance(params, dict) or session_id is None
@@ -630,6 +631,7 @@ def _run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidenc
         if method == "session/request_permission":
             # ACP v1 has no ``denied`` permission outcome.  Cancellation is
             # the pinned, fail-closed response shape.
+            cancelled_permission_requests += 1
             return {"outcome": {"outcome": "cancelled"}}
         if method == "elicitation/create":
             return {"action": "cancel", "content": None}
@@ -661,6 +663,7 @@ def _run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidenc
         # immediately before EOF/overflow remains attached to this envelope.
         partial = dict(prompt_fact)
         partial["air_observations"] = evidence.air_observations
+        partial["cancelled_permission_requests"] = cancelled_permission_requests
         if evidence.usage is not None:
             partial["usage"] = evidence.usage
         return partial  # type: ignore[return-value]
@@ -798,6 +801,7 @@ def _run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidenc
                 "request_id": str(prompt_id), "session_id": session_id, "prompt_id": str(prompt_id),
                 "prompt_response_valid": decoded.kind != "protocol_invalid",
                 "stop_reason": decoded.stop_reason, "air_observations": evidence.air_observations,
+                "cancelled_permission_requests": cancelled_permission_requests,
                 # Recovered warnings remain losslessly in ``air_observations``
                 # but are not active failures in the host-facing effective set.
                 "session_failures": [

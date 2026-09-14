@@ -313,7 +313,9 @@ def test_fake_warning_then_successful_end_turn_is_recovered_success(tmp_path: Pa
 
 
 def test_fake_permission_is_denied_noninteractively(tmp_path: Path) -> None:
-    assert run(tmp_path, "permission").prompt.kind == "success"
+    turn = run(tmp_path, "permission")
+    assert turn.prompt.kind == "success"
+    assert turn.prompt_fact["cancelled_permission_requests"] == 1
 
 
 def test_fake_setup_air_metadata_cannot_taint_prompt_evidence(tmp_path: Path) -> None:

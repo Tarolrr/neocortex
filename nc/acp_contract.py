@@ -53,6 +53,10 @@ class AcpPromptFact(TypedDict):
     prompt_id: str
     prompt_response_valid: bool
     stop_reason: str | None
+    # Count of ACP ``session/request_permission`` requests for this session
+    # answered with the pinned fail-closed cancelled outcome.  Permission
+    # arguments are deliberately not retained.
+    cancelled_permission_requests: int
     # The last complete structured usage snapshot observed for this prompt.
     # It is independent of a terminal response, so local transport failure
     # cannot erase provider accounting already received.

@@ -520,8 +520,12 @@ def cmd_acp_ordinary_smoke(args) -> int:
             private_parent=Path(args.private_parent), worktree=Path(args.worktree),
             model=args.model, prompt=args.prompt, log_path=Path(args.log), timeout_s=args.timeout,
         )
-        print("ACP ordinary smoke completed; live model/network/sandbox result is recorded in the log")
-        return 0 if turn.prompt.kind == "success" else 1
+        cancelled = turn.prompt_fact["cancelled_permission_requests"]
+        if turn.prompt.kind != "success" or cancelled < 1:
+            print("ACP ordinary smoke FAILED: no cancelled permission request was observed", file=sys.stderr)
+            return 1
+        print("ACP ordinary smoke completed; cancelled permission requests: " + str(cancelled))
+        return 0
     except (AcpRuntimeNotReady, RuntimeError) as exc:
         print("ACP ordinary smoke ERROR: " + str(exc), file=sys.stderr)
         return 1

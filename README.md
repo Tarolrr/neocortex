@@ -113,6 +113,11 @@ data, resumes agents, or reconciles Git automatically.
 
 ## Usage
 
+For a proposed, independent OpenCode-based experimental successor and a
+no-side-effects owner onboarding walkthrough, see
+[OpenCode successor design](docs/opencode-successor-design.md) and
+[new project guide](docs/new-project-guide.md).
+
 ```bash
 pip install -e .
 export NC_HOME=~/.neocortex

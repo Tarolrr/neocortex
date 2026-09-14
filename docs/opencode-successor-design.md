@@ -1,241 +1,169 @@
 # OpenCode-based experimental successor
 
-## Decision
+## Decision and evidence boundary
 
-Build a **separate TypeScript coordinator** that consumes OpenCode as an
-external dependency through its headless server and supported JS/TS SDK (or the
-documented HTTP interface). It is an experiment developed through the existing
-Neocortex workflow, not a migration of this Python runner and not a change to
-its deployment. Start with one configured execution slot, then raise it only
-after an evidenced limiter and recovery behaviour work in an owner pilot.
+This is a bounded refinement of the T028/earlier planner proposal, not a new
+architecture study or implementation plan. The baseline remains an external
+OpenCode server and its TypeScript SDK (or documented server interface), with a
+small TypeScript coordinator. The current Python runner, its `outcome.json`
+protocol, historical artifacts, deployed services, credentials and queued or
+blocked work are unchanged.
 
-This recommends upstream reuse over legacy-code preservation, per owner
-feedback #345. OpenCode already supplies the expensive and fast-moving parts:
-sessions, messages, context management, model/provider integration, tool
-execution, permissions, and session inspection. The coordinator supplies only
-governance OpenCode does not document as providing: owner authority, task
-dependencies, durable owner correspondence, durable claims, and independent
-acceptance/merge. A fork or duplicated OpenCode subsystem is rejected unless a
-specific missing capability is demonstrated; none is demonstrated here.
+The coordinator adds governance; OpenCode remains the execution, context and
+history owner. Git remains the authority for commits and refs. Observations are
+from official documentation viewed 2026-09-14 (SDK page revision 2026-09-13);
+unobserved runtime behaviour is **unknown**, not absent. The
+[SDK](https://opencode.ai/docs/sdk/) documents a type-safe server client,
+sessions, messages, prompt, abort, and SSE. The [CLI](https://opencode.ai/docs/cli/)
+documents TUI, `attach`, `session`, and `export`; the [web UI](https://opencode.ai/docs/web/)
+is an upstream UI surface. [Custom tools](https://opencode.ai/docs/custom-tools/)
+are an extension mechanism. URLs are capability evidence, not a release lock,
+security claim, or proof of delivery semantics.
 
-OpenCode's SDK is expressly a type-safe JS/TS client for its server and can
-create or connect to a server; its generated types and structured JSON output
-are useful integration boundaries. [SDK](https://opencode.ai/docs/sdk/)
+## Ownership contract
 
-## Evidence and limits
+Coordinator IDs are local opaque IDs. `coordinator_project_id` identifies its
+governance record; it is neither OpenCode's project ID nor a directory. Store
+canonical repository identity, worktree path/base/ref, and the OpenCode
+server/store namespace (base URL or configured instance/store identity) with
+every upstream session ID: a bare session ID is not interpretable across stores.
 
-Observations below were made 2026-09-14 from the live documentation and the
-`dev` source URLs linked here. The latter are mutable development observations,
-not release guarantees or a dependency commitment. No exact version lock,
-platform certification, full upstream audit, live credentials, or JS toolchain
-was used.
-
-* The [server API](https://opencode.ai/docs/server/) documents session creation,
-  status, messages, async prompting, abort, session message retrieval, SSE
-  events, agents, provider/auth endpoints, and permission responses. It also
-  labels experimental tools as experimental.
-* The [agents](https://opencode.ai/docs/agents/) and
-  [permissions](https://opencode.ai/docs/permissions/) docs describe configured
-  agents and allow/ask/deny tool rules. Permission prompting is an application
-  control, not an OS sandbox. `--auto` approves requests not explicitly denied.
-* The [CLI](https://opencode.ai/docs/cli/) documents TUI sessions and continuing
-  by session ID; use it for inspection where it supports the need instead of
-  rebuilding a transcript viewer. [ACP support](https://opencode.ai/docs/acp/)
-  is OpenCode acting as an ACP-compatible subprocess for an editor. It is not
-  this coordinator's transport and says nothing about codex-acp AIR or vendor
-  subscription/auth equivalence.
-* Mutable source observations: [`session.ts`](https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/src/session/session.ts)
-  maps persisted session rows with IDs, directory, parent, agent/model, version,
-  token/cost and summaries; [`prompt.ts`](https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/src/session/prompt.ts)
-  composes prompt, agent, provider, permission, compaction, tools and event
-  services and has cancellation; [`task.ts`](https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/opencode/src/tool/task.ts)
-  supports resumed task IDs and background subagent work. These support reuse,
-  not a stability promise.
-* Local inspection found `nc/state.py` persists projects, proposals/tasks,
-  messages and runs; `nc/scheduler.py` has repository/lifecycle exclusions;
-  `nc/arbiter.py` runs checks; and `nc/cli.py` separates owner proposal approval
-  from task work. The successor preserves the invariants, not that schema/code.
-
-Missing evidence is **unknown**, not evidence of absence: production event
-delivery/reconnect semantics, exact cancellation acknowledgement, authentication
-storage/rotation, provider errors, background-task limiting and API stability
-need a later small smoke experiment.
-
-## Options considered
-
-| Option | Assessment | Decision |
+| Record | Authoritative writer and minimum durable data | References, not copied authority |
 | --- | --- | --- |
-| OpenCode dependency + small coordinator | Reuses agent loop and adds only governance. | **Choose** |
-| Plugin/configuration only | Can configure roles/tools but cannot authoritatively add owner-approved task identity, cross-session dependency claims, or deterministic independent merge. | Insufficient alone; may complement it |
-| Fork OpenCode | Carries session/provider/tool maintenance. | No, absent a concrete proved capability gap |
-| Retain current runner | Already governs work but duplicates adapter/agent-loop concerns and does not test the OpenCode direction. | Keep unchanged as current system; not successor |
+| Project | Coordinator: project ID, repo identity, checks, owner policy | OpenCode project/directory and server namespace |
+| Proposal | Coordinator: ID, text/version, owner approval identity/time | Planner session/message IDs; output is evidence, not approval |
+| Task | Coordinator: approved proposal ID, objective, dependencies, phase, acceptance/boundaries | Project and current attempt/claim IDs |
+| Execution attempt | Coordinator: immutable attempt/claim ID, role, worktree/base/candidate SHA, state, outbound intents | `(namespace, session ID, message ID)` and Git refs |
+| Owner message | Coordinator: message/correlation ID, question/answer, delivery state/evidence | Bound attempt/session/message IDs |
+| Review/merge evidence | Coordinator: immutable check-output digest, critic verdict/reviewer, candidate/base, decision; Git writes commit/ref facts | Git candidate/merge SHA and ref observations |
 
-## Capability and ownership matrix
+OpenCode owns session/context/message/tool history; Git owns commit/ref facts;
+the coordinator owns approvals, dependency readiness, claims, owner delivery,
+review and acceptance decisions. Persisted observations (timestamps, probes,
+IDs, bounded errors, candidate SHA) and small immutable decision evidence are
+not a second transcript or authoritative session copy. Optional exports are
+diagnostic snapshots. Retain the coordinator DB and decision/diagnostic evidence
+under normal owner backup policy, and retain/backup the OpenCode server/store
+long enough to reconcile active attempts; this does not design a backup system.
 
-`Native` means documented upstream behaviour; `configurable` means use upstream
-configuration; `extension/custom` means coordinator-owned; `unknown` means
-not established by the cited evidence.
+## Reuse and deliberately dropped surfaces
 
-| Capability | Status | Owner / boundary |
+Local inspection on 2026-09-14 of `nc/turn.py`, `nc/protocol.py`, `nc/roles.py`
+and CLI/TUI-facing `nc/cli.py` found per-turn briefs/`outcome.json`, role
+templates, durable inbox/outcomes, and owner governance commands. Keep their
+governance intent, not their session implementation.
+
+| Current/surface | Successor decision | Reason/boundary |
 | --- | --- | --- |
-| Role configuration | configurable | OpenCode agents/config; coordinator records selected role |
-| Sessions and context | native | OpenCode session/message/compaction; record IDs only |
-| Tool execution | native | OpenCode tools and permissions; coordinator never reimplements loop |
-| Provider/auth integration | native | OpenCode provider/auth; credential custody and rotation policy are owner/unknown |
-| Structured results/errors | native + custom | SDK schema output; coordinator persists requested transition separately from transport/execution failure |
-| Task dependencies | extension/custom | Governance store determines eligible/blocked tasks |
-| Durable owner questions/approvals | extension/custom | Governance message/proposal records; upstream prompt is delivery channel |
-| Review/merge | extension/custom | Independent critic, deterministic checks and serialized repository merger |
-| Concurrency | configurable + custom | Coordinator slot/claims; upstream background-subagent limit is unknown |
-| Restart recovery | extension/custom | Governance reconciliation, with upstream session/message lookup; stream semantics unknown |
+| `turn.py` transcript `session.log` | Drop | OpenCode session history is authoritative. |
+| Session browser/context management | Drop | Use OpenCode inspection/export and CLI/TUI/web, not a duplicate UI. |
+| Per-turn memo as sole agent memory | Drop | Upstream session/context is agent memory; coordinator retains governance facts. |
+| Agent-written `outcome.json` | Drop | Native schema-constrained SDK result is the sole result path. |
+| `protocol.py` question/answer and `roles.py` role intent | Keep narrowly | Coordinator owns durable owner correspondence and role/task binding. |
+| `nc/cli.py` approval, inbox/status/why/stop/cancel ideas | Keep narrowly | Governance operations and coordinator diagnostics only. |
+| Acceptance command output; critic and merge evidence | Keep | Required candidate-bound evidence upstream history cannot replace. |
 
-## Minimal architecture and data flow
+The task screen shows server namespace, session ID and configured directory; an
+owner uses those with documented CLI/TUI/web session selection/attachment. No
+unsupported task-to-session deep link is invented. Attachment is interactive and
+can mutate a session, not guaranteed read-only inspection. Manual continuation
+of managed work requires coordinator exclusion first and then reconciliation.
 
-The TypeScript coordinator has five small components:
+Plugins can host custom logic, so it is too strong to say they cannot implement
+governance. Configuration alone does not establish durable cross-store authority.
+Use a custom tool only if a concrete native-final-result gap is demonstrated; it
+must still feed one authoritative result path with host-side identity/dedup.
 
-1. **Governance store** — initially SQLite is reasonable, but its schema need
-   not copy `nc/state.py`. It is authoritative for project, owner-approved
-   proposal, task, attempt, owner message, review and acceptance/merge state.
-2. **Dispatcher** — transactionally claims an eligible task, allocates exactly
-   one mutable worktree execution, binds role/repository/worktree/session, and
-   invokes the SDK client.
-3. **OpenCode adapter** — starts/connects to the headless server, creates or
-   resumes sessions, sends prompts, reads structured output/status/messages and
-   requests abort. It records external IDs and facts but does not infer success
-   from an event.
-4. **Acceptance coordinator** — checks the candidate commit, runs the configured
-   commands, asks an independent critic against that same candidate commit, and
-   serializes integration per repository.
-5. **Owner interface** — narrow project/proposal/task/approval/inbox/status
-   operations only. OpenCode CLI/TUI remains the session inspector.
+## Native structured result contract
 
-Entities: `project`; `proposal` (owner approval evidence); `task` (objective,
-dependencies, acceptance and phase); `execution_attempt` (claim token,
-repository/worktree, role, candidate commit, upstream session/message IDs and
-external-effect reconciliation fields); `owner_message` (question/answer,
-delivery and correlation); and `review` (checks, critic identity/verdict and
-candidate commit). Upstream owns transcripts and execution. Governance owns
-approval, phase and acceptance truth: there are not two authoritative copies.
+Default transport is SDK schema-constrained structured output, never an
+agent-written file. The SDK documents the model-facing `StructuredOutput` tool,
+`structured_output` result, bounded validation retries, and
+`StructuredOutputError` when retries are exhausted. The host binds
+role/task/attempt/session/message identity in its prompt, validates schema **and
+semantics**, and persists a transition request. The agent supplies no authority.
 
-`owner -> approved proposal -> task/dependency readiness -> durable claim ->
-attempt + worktree + OpenCode session -> structured worker request -> checks +
-critic -> serialized merge -> durable accepted result`. Questions travel
-`worker request -> owner_message -> owner answer -> resumed upstream message`.
+The docs show `body.format` in the structured-output example but
+`body.outputFormat` in the sessions API table. Exact invocation below is
+pseudocode, not a selected-runtime claim. A later compatibility smoke chooses
+the installed SDK generated type and verifies behaviour; version selection stays
+later work.
 
-## Authority and lifecycle
-
-Only an owner approval turns a proposal into executable tasks. A worker's
-validated structured result may request `waiting`, `review`, `blocked`, or
-`rework`; it never approves itself. A session history, an idle event, a clean
-process exit, or an upstream task completion does not establish acceptance.
-
-```text
-queued --dispatcher claim--> running --ASK--> waiting --owner answer--> queued/running
-  |                         | result request                         |
-  |                         +--> review --checks+critic--> accepted --merger--> accepted
-  |                                              \--> rework --> queued
-  +--owner cancel--> cancelled       --unresolved dependency/error--> blocked
+```ts
+// Pseudocode: use the release type (format vs outputFormat).
+const reply = await client.session.prompt({ path: { id: sessionId }, body: {
+  parts: [{ type: "text", text: hostEnvelope }],
+  structuredFormat: { type: "json_schema", retryCount: 2, schema: ResultSchema }
+}})
+// Require structured_output and matching task/attempt/session/message identity;
+// validate transition semantics and apply once by result-correlation ID.
 ```
 
-Owner authorizes proposal approval, cancellation and answers. Dispatcher only
-claims/releases. Worker requests transitions. Independent critic can request
-rework/reject; acceptance coordinator records deterministic evidence. The
-serialized merger, only after required passing review, authorizes the merge.
-STOP/cancellation intent remains durable: stop dispatching, request abort where
-safe, reconcile an in-flight attempt before any replacement; never blindly
-replay a prompt or merge.
+`ResultSchema.kind` is `completion_for_review` (candidate SHA/evidence),
+`owner_question` (question/correlation), or `unfinished_progress`
+(status/blocker). Planner proposals and critic verdicts use separate
+role-specific schemas: proposal/task specs and candidate-SHA-bound
+pass/rework/reject. Missing output, invalid schema/semantic identity,
+`StructuredOutputError`, provider/transport failure, and failed/uncertain
+execution are distinct. A syntactically valid payload never overrides failed or
+uncertain execution, authorizes a task, merges, or accepts. Validation retries
+are bounded; stale/duplicate result correlations are rejected.
 
-More precisely: dispatcher changes `queued -> running`; worker may only request
-`running -> waiting/review/blocked`; owner answer permits resumption and owner
-cancellation permits `cancelled`; the critic/acceptance coordinator can record
-`review -> rework` or `blocked`; only passing commands plus required independent
-review permit the merger to record `accepted`. This keeps acceptance authority
-outside both the worker and OpenCode.
+## Lifecycle, review and integration
 
-## Execution, acceptance, and recovery
+Only owner approval creates executable tasks. A worker result can request
+waiting, review, blocked or progress; it cannot accept or merge. A passing
+pre-merge check/critic verdict is **review evidence**, not acceptance.
 
-1. In one durable transaction, select a dependency-ready approved task and
-   write a unique claim/lease plus attempt. Exclude another live claim and one
-   mutating execution per worktree.
-2. Establish a worktree at a recorded base SHA, record role and session ID
-   before/with dispatch, then prompt through the SDK. Persist message IDs,
-   dispatch request key/time, status observations and candidate SHA when known.
-3. Parse a schema-constrained worker result into a *transition request*; store
-   it independently from HTTP/process/provider failure diagnostics. On ASK,
-   store a durable owner question, move to waiting and release the execution
-   slot. Answer delivery resumes the bound session with a correlated message.
-4. For review, capture the candidate commit. Run project acceptance commands in
-   its worktree and run an independent critic against the same immutable SHA.
-   Neither worker nor critic merges.
-5. Acquire a per-repository acceptance/merge lock. Re-read candidate and base;
-   after conflicts, changed base, or changed candidate, rerun the relevant
-   checks/critic rather than accepting stale evidence. Persist merge commit and
-   acceptance decision atomically as far as Git/store reconciliation permits.
+```text
+queued -> claimed/running -> waiting -> answer-intent-dispatched -> running
+                         \-> review evidence -> merge lock -> integrated+verified -> accepted
+review evidence --rework/failure--> queued or blocked
+unsettled outbound/execution --> uncertain/blocked (no replacement)
+```
 
-On restart, inspect incomplete attempts by claim, worktree/branch, session and
-message IDs, recorded dispatch key, process/abort evidence, candidate/base SHA,
-and review/merge IDs. Query upstream status/messages where available; reconcile
-instead of resending. An interrupted call with unknown delivery is `uncertain`,
-not permission to prompt again. Reconcile Git before merge; a discovered merge
-commit is recorded after verification. Disconnected SSE is advisory only.
+For ASK, durably write answer intent and exclusion before dispatch; mark delivery
+acknowledged only with evidence. Waiting releases capacity only after preceding
+execution is settled. Review captures immutable candidate/base SHA, runs checks
+and an independent critic against that candidate, then takes a serialized
+repository merge lock. Revalidate candidate/base and rerun affected evidence on
+change. Record `accepted` only after Git integration is verified and required
+independent checks/review are recorded. STOP/cancel is durable, requests abort
+where safe, and prevents replacement until settlement.
 
-Worked examples (design traces, not a demand for an exhaustive new test suite):
+## Cross-store reconciliation
 
-* **Success:** claim T7 at base A; bind S9/M1; worker requests review at commit
-  C; checks pass and independent critic passes C; merge lock observes base A,
-  merges C to D and writes accepted(D).
-* **ASK/resume:** S9 requests a database choice; coordinator records Q4 and
-  changes T7 to waiting, releasing capacity. Owner answers A4; dispatcher
-  records message M2 delivered to S9, reclaims T7, and later sends it to review.
-* **Crash/uncertain execution:** process dies after outbound prompt intent but
-  before response persistence. Restart sees claim, S9 and uncertain M1; it
-  retrieves session/messages, records what occurred, and only resumes or
-  abandons with an explicit reconciled decision—no duplicate prompt.
-* **Critic rework:** C passes commands but critic identifies an unmet boundary;
-  review records rework(C), task returns queued with fresh attempt evidence,
-  while C remains inspectable and unmerged.
+Do not assume atomic SQLite/OpenCode/Git transactions, API idempotency, or that
+lease expiry proves execution stopped.
 
-## Concurrency, permissions and credentials
+1. In one coordinator transaction create immutable claim/attempt and durable
+   outbound intent with correlation key and `prepared` state; exclude concurrent
+   worktree mutation.
+2. Create a session or send prompt/owner answer, append namespace/session/message
+   IDs and response facts, then mark intent observed/acknowledged. Record repeated
+   observations idempotently by identity; apply a validated result at most once
+   by attempt plus correlation.
+3. On restart reconcile every nonterminal intent with namespace session/message
+   inspection, worktree and Git refs. Before-session-create crash may create only
+   after confirming no bound session. After-create-before-record crash is
+   uncertain and searched by recorded correlation/metadata before human decision.
+   Prompt or answer delivery uncertainty remains uncertain, never replayable.
+4. A stale claim blocks replacement until session/Git/worktree evidence settles;
+   expiry only starts reconciliation. Missing/deleted upstream sessions are
+   unrecoverable evidence and block/require owner resolution, not silent
+   recreation. If Git merge precedes DB recording, verify target ref/merge commit
+   and required evidence, then append integration/acceptance; otherwise uncertain.
 
-Expose `execution_concurrency`, initially `1`, with no hardware-target claim,
-fixed maximum, RAM budget or CPU certification. Durable claim uniqueness plus a
-worktree mutation lock prevents duplicate mutation; repository acceptance/merge
-is always serialized even if worker slots rise. A waiting owner question frees a
-slot. Increase concurrency only after testing claims, worktree isolation and
-recovery.
+Where evidence cannot establish delivery or continued execution, retain explicit
+`uncertain`/`blocked`, preserve claim/exclusion, and prohibit automatic replay
+or replacement until reconciliation makes an owner/coordinator decision.
 
-OpenCode's task source supports background/subagent work. The top-level slot
-does not automatically bound that. Initially disable uncontrolled delegation in
-roles/configuration, or route it through a documented, measured limiter before
-counting it against the configured limit. This is deliberately an unresolved
-integration check, not a guessed implementation.
+## Focused later smoke items
 
-Use narrowly scoped OpenCode permission rules (`allow`/`ask`/`deny`) and
-repository/worktree isolation. They do not become an OS sandbox merely by
-prompting or configuration; host sandboxing, network access and secret mounts
-need explicit owner policy. OpenCode provider credentials belong to the owner
-and OpenCode's supported auth path, not this store. Do not conflate provider
-use with installed vendor CLI reuse, nor assume Codex subscription credentials
-work through OpenCode or its ACP mode.
-
-## Staged implementation
-
-1. **Minimal session execution:** TypeScript package, one local headless
-   OpenCode session, role/config selection, ID recording and CLI/TUI inspection.
-2. **Governance and recovery:** SQLite proposals/tasks/claims/questions,
-   structured transition requests, STOP/cancel reconciliation and restart cases.
-3. **Independent review/merge:** candidate-bound checks, critic, repository lock
-   and recheck-on-change merger.
-4. **Owner pilot:** a separate small repository, configured concurrency one,
-   explicit credentials/permissions, and observation before expansion.
-
-Unexecuted smoke steps: install nothing here; owner later verifies a supported
-OpenCode server/SDK can create, prompt, retrieve and abort a session; validates
-provider authentication/error categories with non-production credentials;
-disconnects/reconnects event consumption; verifies background delegation policy;
-and kills/restarts during dispatch, ASK, review and merge reconciliation.
-
-Open assumptions remain: exact supported release/version selection, event and
-abort acknowledgement semantics, provider credential lifecycle, SDK error shape
-across versions, and a safe evidenced subagent limiter. These are reasons for a
-small smoke, not reasons to prebuild a fork or transport.
+No installation, model call, registration or activation occurs here. Later smoke
+work verifies only: selected SDK result/error retrieval
+(`structured_output`/ `StructuredOutputError`), restart correlation across
+create/prompt/answer crashes and duplicate observations, and session
+inspection/control including attachment mutation and abort evidence. This is not
+version certification or exhaustive audit. `pytest -q` and `ruff check .`
+validate repository health only, not OpenCode deployability.

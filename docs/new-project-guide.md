@@ -88,12 +88,44 @@ modify the current Python Neocortex runner. Reuse upstream sessions, messages,
 context, tool execution, providers and CLI/TUI inspection. Add only governance
 with durable owner-approved proposals/tasks, dependencies, questions/answers,
 claims, candidate-bound checks, independent critic review and serialized merge.
-Upstream execution completion is never acceptance. Start configurable execution
-concurrency at one, preserve STOP/cancel and worktree isolation, and treat
-background subagent limiting, auth/error/cancellation semantics as smoke items.
-Do not install software, use paid agents, register anything, or expose secrets
-in planning. Propose staged work only: minimal session execution; governance and
-recovery; independent review/merge; owner pilot.
+Keep the external OpenCode server/TypeScript SDK baseline aligned with T028 and
+the earlier planner proposal; this is a refinement, not another architecture
+study. OpenCode owns session/context/message/tool history and Git owns commits
+and refs; the coordinator owns approvals, readiness, claims, owner delivery,
+review and acceptance. Record a coordinator project ID separately from upstream
+project/directory identity and bind every session ID to its server/store
+namespace. Drop duplicate session.log/transcript browsing, coordinator context
+management, per-turn memo as sole memory, and agent-written outcome.json; use
+upstream session inspection/export and CLI/TUI/web, treating exports as
+diagnostics only. Do not invent a deep link from task to session; show the bound
+namespace/session ID and directory. Attachment can mutate a session, so manual
+continuation requires coordinated exclusion.
+
+Use SDK schema-constrained structured output as the sole agent result path; the
+host binds identity, validates semantics, deduplicates and persists it. Results
+can request completion-for-review, owner question or unfinished progress, never
+approval, merge or acceptance. Treat missing/invalid output, validation error,
+provider failure and uncertain execution separately. Because SDK docs currently
+show format/outputFormat inconsistently, label exact syntax pseudocode and defer
+version/live behaviour to a focused smoke. Use a custom tool only for a proven
+native-result gap; plugins may host logic but configuration alone is not durable
+governance.
+
+Use durable outbound intent, claim/attempt identity and message correlation;
+never assume cross-store atomicity, API idempotency, or lease expiry means work
+stopped. Reconcile crashes, duplicate observations, stale attempts, deleted
+sessions, uncertain prompt/answer delivery and Git merge-before-DB-recording.
+Unsettled cases stay uncertain/blocked with no automatic replay/replacement.
+For ASK, durably store answer intent/exclusion before dispatch and acknowledge
+delivery only with evidence; release capacity only after prior execution settles.
+Pre-merge checks/critic are review evidence only. Record accepted only after
+serialized merge, verified integration and required independent checks/review;
+revalidate candidate/base on change. Start configurable execution concurrency at
+one, preserve STOP/cancel and worktree isolation. Do not install software, use
+paid agents, register anything, or expose secrets in planning. Propose staged
+work only: minimal session execution; governance/recovery; independent
+review/merge; owner pilot, with focused smoke for result/error retrieval,
+restart correlation and session inspection/control.
 ```
 
 The proposed successor's future milestones are intentionally small: (1) minimal

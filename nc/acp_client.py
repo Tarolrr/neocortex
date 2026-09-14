@@ -12,7 +12,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -29,6 +29,7 @@ _MAX_AIR_ACTION_BYTES = 256
 _MAX_RAW_AIR_FAILURE_BYTES = 8 * 1024
 _MAX_JSONRPC_ERROR_BYTES = 4 * 1024
 _MISSING = object()
+_LAUNCH_EVIDENCE_CAPABILITY = object()
 
 _ORDINARY_MODE = "agent"
 # These are the effective sandbox values of ``AgentMode.Agent`` in the pinned
@@ -86,8 +87,16 @@ class CodexAcpLaunchEvidence:
     codex_version: str
     sdk_version: str
     profile: str
+    platform: str
+    binary_package: str
+    binary_resolution: str
+    # A record made up of strings is not an attestation.  Only the runtime
+    # inspector receives this unexported capability when it constructs one.
+    _capability: object | None = field(default=None, repr=False, compare=False)
 
     def validate_for(self, command: Sequence[str], profile: str) -> None:
+        if self._capability is not _LAUNCH_EVIDENCE_CAPABILITY:
+            raise AcpClientRejected("launch evidence was not produced by runtime inspection")
         if tuple(command) != self.command:
             raise AcpClientRejected("launch command does not match verified ACP evidence")
         if (self.package != _PINNED_ACP_PACKAGE
@@ -96,8 +105,15 @@ class CodexAcpLaunchEvidence:
                 or self.codex_version != _PINNED_CODEX_VERSION
                 or self.sdk_version != _PINNED_SDK_VERSION):
             raise AcpClientRejected("launch evidence does not match pinned ACP contract")
+        if not self.platform or not self.binary_package or not self.binary_resolution:
+            raise AcpClientRejected("launch evidence lacks verified platform binary resolution")
         if self.profile != profile:
             raise AcpClientRejected("launch evidence does not bind the selected ACP profile")
+
+
+def _inspected_launch_evidence(**values: str) -> CodexAcpLaunchEvidence:
+    """Internal capability boundary used solely by ``inspect_runtime``."""
+    return CodexAcpLaunchEvidence(**values, _capability=_LAUNCH_EVIDENCE_CAPABILITY)
 
 
 @dataclass(frozen=True)
@@ -526,18 +542,39 @@ def _process_fact(child: AcpSubprocess, timed_out: bool,
     }
 
 
-def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence,
+def run_codex_acp_turn(command: Sequence[str], *, runtime_root: Path,
                        policy: CodexAcpPolicy, model: str, prompt: str,
                        log_path: Path, timeout_s: float = 60,
-                       environment: Mapping[str, str] | None = None) -> CodexAcpTurn:
+                       environment: Mapping[str, str] | None = None,
+                       private_home: Path | None = None) -> CodexAcpTurn:
     """Run the pinned initialize/new/configure/prompt sequence once.
 
-    ``launch`` is the verified codex-acp 1.11.0 artifact/dependency evidence
-    bound to ``command``.  It is checked before a child exists; the live ACP
+    The runtime is inspected again at this use point; caller-provided command
+    and version strings are never launch verification.  The live ACP
     v1/AIR handshake is then checked before session creation.  No installation,
     authentication, outcome-file handling, or role validation is performed
     here.  Exceptions are deliberate fail-closed evidence.
     """
+    # Import lazily to avoid the runtime/client import cycle.  This public
+    # boundary deliberately makes artifact inspection non-optional.
+    from .acp_runtime import inspect_runtime
+
+    runtime = inspect_runtime(runtime_root)
+    if tuple(command) != runtime.evidence.command:
+        raise AcpClientRejected("launch command does not match inspected isolated runtime",
+                                log_path=str(log_path))
+    return _run_codex_acp_turn(command, launch=runtime.evidence, policy=policy,
+                               model=model, prompt=prompt, log_path=log_path,
+                               timeout_s=timeout_s, environment=environment,
+                               private_home=private_home)
+
+
+def _run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence,
+                        policy: CodexAcpPolicy, model: str, prompt: str,
+                        log_path: Path, timeout_s: float = 60,
+                        environment: Mapping[str, str] | None = None,
+                        private_home: Path | None = None) -> CodexAcpTurn:
+    """Protocol engine after the public entry point has inspected the runtime."""
     # Setup is fallible too.  Give every setup exception the same stable
     # envelope as a post-launch failure, including the caller's log reference.
     try:
@@ -548,7 +585,13 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
                                     log_path=str(log_path))
         launch.validate_for(command, _mode_for(policy))
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        config_home = Path(tempfile.mkdtemp(prefix="nc-acp-codex-", dir=log_path.parent))
+        # The explicit owner opt-in supplies a fresh private home containing
+        # only a copied auth.json.  Config is written into that same home so
+        # CODEX_HOME cannot point at a credential-free sibling directory.
+        config_home = (private_home.resolve() if private_home is not None else
+                       Path(tempfile.mkdtemp(prefix="nc-acp-codex-", dir=log_path.parent)))
+        if private_home is not None and not (config_home / "auth.json").is_file():
+            raise AcpClientRejected("private ACP home has no prepared auth.json", log_path=str(log_path))
         _write_pinned_config(policy, config_home)
     except BaseException as exc:
         exc.evidence = getattr(exc, "evidence", AcpTurnEvidence(
@@ -563,6 +606,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
     evidence = _TurnEvidenceCollector()
     prompt_fact: AcpPromptFact | None = None
     session_id: str | None = None
+    cancelled_permission_requests = 0
     # AcpJsonRpcStream must reply to a peer request before it can resume the
     # host request it was pumping.  Retain a policy-owner rejection across
     # that JSON-RPC error reply so a cooperative (or racing) prompt response
@@ -577,7 +621,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         evidence.notification(value)
 
     def deny_request(value: dict[str, object]) -> object:
-        nonlocal server_request_rejection
+        nonlocal cancelled_permission_requests, server_request_rejection
         method = value.get("method")
         params = value.get("params")
         if (not isinstance(params, dict) or session_id is None
@@ -587,6 +631,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         if method == "session/request_permission":
             # ACP v1 has no ``denied`` permission outcome.  Cancellation is
             # the pinned, fail-closed response shape.
+            cancelled_permission_requests += 1
             return {"outcome": {"outcome": "cancelled"}}
         if method == "elicitation/create":
             return {"action": "cancel", "content": None}
@@ -618,6 +663,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
         # immediately before EOF/overflow remains attached to this envelope.
         partial = dict(prompt_fact)
         partial["air_observations"] = evidence.air_observations
+        partial["cancelled_permission_requests"] = cancelled_permission_requests
         if evidence.usage is not None:
             partial["usage"] = evidence.usage
         return partial  # type: ignore[return-value]
@@ -755,6 +801,7 @@ def run_codex_acp_turn(command: Sequence[str], *, launch: CodexAcpLaunchEvidence
                 "request_id": str(prompt_id), "session_id": session_id, "prompt_id": str(prompt_id),
                 "prompt_response_valid": decoded.kind != "protocol_invalid",
                 "stop_reason": decoded.stop_reason, "air_observations": evidence.air_observations,
+                "cancelled_permission_requests": cancelled_permission_requests,
                 # Recovered warnings remain losslessly in ``air_observations``
                 # but are not active failures in the host-facing effective set.
                 "session_failures": [

@@ -12,6 +12,14 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from . import arbiter, backup_worker, operations, protocol
+from .acp_runtime import (
+    AcpRuntimeNotReady,
+    credential_readiness,
+    inspect_runtime,
+    reject_inherited_redirection,
+    run_verified_ordinary_turn,
+)
+from .adapter_readiness import configured_requirements
 from .config import Config
 from .lifecycle import LifecycleBusy, lifecycle_lock, repository_identity, repository_lock
 from .scheduler import Scheduler
@@ -463,8 +471,7 @@ def cmd_preflight(args) -> int:
 def cmd_doctor(args) -> int:
     """Report host readiness even if opening the state database is impossible."""
     cfg = Config.load(args.home)
-    adapters = {cfg.adapter, *cfg.adapters.values()}
-    reports, errors, python = arbiter.host_requirements(adapters)
+    reports, errors, python = arbiter.host_requirements(configured_requirements(cfg))
     try:
         state = State(cfg.db_path)
         project = state.one("SELECT id, repo_path, test_cmd FROM project WHERE id=?", (args.project,))
@@ -488,6 +495,40 @@ def cmd_doctor(args) -> int:
         return 1
     print("doctor: ready")
     return 0
+
+
+def cmd_acp_doctor(args) -> int:
+    """Offline ACP preparation diagnostic; never prompts, logs in, or launches."""
+    try:
+        reject_inherited_redirection()
+        runtime = inspect_runtime(Path(args.runtime), profile=args.profile)
+        print(f"ACP artifact: ready ({runtime.platform}; {runtime.command})")
+        print("ACP profile: ready (agent / workspaceWrite / on-request / auto_review)")
+        print("ACP auth: " + credential_readiness(Path(args.auth)))
+        print("ACP model/network/sandbox: unverified; owner smoke is a separate explicit operation")
+        return 0
+    except AcpRuntimeNotReady as exc:
+        print("ACP readiness ERROR: " + str(exc), file=sys.stderr)
+        return 1
+
+
+def cmd_acp_ordinary_smoke(args) -> int:
+    """Owner's explicit live opt-in, separate from ordinary doctor/readiness."""
+    try:
+        turn = run_verified_ordinary_turn(
+            runtime_root=Path(args.runtime), credential_file=Path(args.auth),
+            private_parent=Path(args.private_parent), worktree=Path(args.worktree),
+            model=args.model, prompt=args.prompt, log_path=Path(args.log), timeout_s=args.timeout,
+        )
+        cancelled = turn.prompt_fact["cancelled_permission_requests"]
+        if turn.prompt.kind != "success" or cancelled < 1:
+            print("ACP ordinary smoke FAILED: no cancelled permission request was observed", file=sys.stderr)
+            return 1
+        print("ACP ordinary smoke completed; cancelled permission requests: " + str(cancelled))
+        return 0
+    except (AcpRuntimeNotReady, RuntimeError) as exc:
+        print("ACP ordinary smoke ERROR: " + str(exc), file=sys.stderr)
+        return 1
 
 
 def cmd_health(args) -> int:
@@ -774,6 +815,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("doctor", help="check service host tools and one project's base checkout")
     sp.add_argument("--project", required=True)
     sp.set_defaults(func=cmd_doctor)
+    sp = sub.add_parser("acp-doctor", help="offline isolated ACP artifact/profile/auth readiness")
+    sp.add_argument("--runtime", required=True)
+    sp.add_argument("--profile", default="agent")
+    sp.add_argument("--auth", required=True,
+                    help="explicit existing Codex auth.json; read-only readiness check")
+    sp.set_defaults(func=cmd_acp_doctor)
+    sp = sub.add_parser("acp-ordinary-smoke", help="explicit owner-only live ordinary ACP handshake")
+    sp.add_argument("--runtime", required=True)
+    sp.add_argument("--auth", required=True)
+    sp.add_argument("--private-parent", required=True)
+    sp.add_argument("--worktree", required=True)
+    sp.add_argument("--model", required=True)
+    sp.add_argument("--prompt", required=True)
+    sp.add_argument("--log", required=True)
+    sp.add_argument("--timeout", type=float, default=60)
+    sp.set_defaults(func=cmd_acp_ordinary_smoke)
     sub.add_parser("health", help="show state database and counts").set_defaults(func=cmd_health)
     sub.add_parser("step", help="run exactly one agent turn").set_defaults(func=cmd_step)
 

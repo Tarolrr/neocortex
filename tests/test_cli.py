@@ -133,6 +133,17 @@ def test_project_test_cmd_changes_only_named_project(tmp_path, capsys):
     assert state.one("SELECT test_cmd FROM project WHERE id='two'")[0] == "old two"
 
 
+def test_acp_doctor_requires_explicit_auth_path(capsys):
+    """A successful readiness gate must include the offline auth boundary."""
+    with pytest.raises(SystemExit) as exc:
+        cli.build_parser().parse_args([
+            "acp-doctor", "--runtime", "/srv/neocortex/acp-1.11.0",
+        ])
+
+    assert exc.value.code == 2
+    assert "--auth" in capsys.readouterr().err
+
+
 def test_health_counts(tmp_path, capsys):
     state = State(Config.load(tmp_path).db_path)
     for project in ("one", "two"):

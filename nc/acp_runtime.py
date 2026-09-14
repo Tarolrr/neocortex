@@ -410,7 +410,12 @@ def _verify_reviewed_resolution(root: Path, node_arch: str) -> None:
             raise AcpRuntimeNotReady("installed transitive dependency differs from reviewed lock")
         if not isinstance(entry.get("integrity"), str):
             raise AcpRuntimeNotReady("reviewed lock lacks transitive dependency integrity")
-    _verify_sri_derived_contents(root, lock, arch=node_arch)
+    # The content verifier derives its platform from the same host probe.  Do
+    # not pass the optional testing override here: inspection hooks (and
+    # downstream users which wrap this verifier) have historically accepted
+    # its two-argument public shape.  The required platform package above
+    # already binds this resolution to ``node_arch`` before this call.
+    _verify_sri_derived_contents(root, lock)
 
 
 def _verify_launcher(root: Path, command: Path) -> None:

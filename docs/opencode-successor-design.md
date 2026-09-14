@@ -90,20 +90,49 @@ the installed SDK generated type and verifies behaviour; version selection stays
 later work.
 
 ```ts
-// Pseudocode: use the release type (format vs outputFormat).
+// Pseudocode: use the release type and its field name (format vs outputFormat).
+const ResultSchema = {
+  type: "object", additionalProperties: false,
+  required: ["task_id", "attempt_id", "session_id", "message_id",
+             "result_correlation", "kind"],
+  properties: {
+    task_id: { type: "string" }, attempt_id: { type: "string" },
+    session_id: { type: "string" }, message_id: { type: "string" },
+    result_correlation: { type: "string" },
+    kind: { enum: ["completion_for_review", "owner_question", "unfinished_progress"] },
+    candidate_sha: { type: "string" }, evidence: { type: "array", items: { type: "string" } },
+    question: { type: "string" }, question_correlation: { type: "string" },
+    progress: { type: "string" }, blocker: { type: "string" }
+  },
+  allOf: [
+    { if: { properties: { kind: { const: "completion_for_review" } } }, then: { required: ["candidate_sha", "evidence"] } },
+    { if: { properties: { kind: { const: "owner_question" } } }, then: { required: ["question", "question_correlation"] } },
+    { if: { properties: { kind: { const: "unfinished_progress" } } }, then: { required: ["progress"] } }
+  ]
+}
 const reply = await client.session.prompt({ path: { id: sessionId }, body: {
   parts: [{ type: "text", text: hostEnvelope }],
-  structuredFormat: { type: "json_schema", retryCount: 2, schema: ResultSchema }
+  FORMAT_FIELD: { type: "json_schema", retryCount: 2, schema: ResultSchema }
 }})
 // Require structured_output and matching task/attempt/session/message identity;
 // validate transition semantics and apply once by result-correlation ID.
 ```
 
-`ResultSchema.kind` is `completion_for_review` (candidate SHA/evidence),
-`owner_question` (question/correlation), or `unfinished_progress`
-(status/blocker). Planner proposals and critic verdicts use separate
-role-specific schemas: proposal/task specs and candidate-SHA-bound
-pass/rework/reject. Missing output, invalid schema/semantic identity,
+For example, the returned `reply.structured_output` is respectively
+`{task_id:"T7",attempt_id:"A3",session_id:"S9",message_id:"M12",result_correlation:"R1",kind:"completion_for_review",candidate_sha:"abc123",evidence:["pytest -q: pass"]}`,
+`{task_id:"T7",attempt_id:"A3",session_id:"S9",message_id:"M12",result_correlation:"R2",kind:"owner_question",question:"Choose migration window?",question_correlation:"Q4"}`, or
+`{task_id:"T7",attempt_id:"A3",session_id:"S9",message_id:"M12",result_correlation:"R3",kind:"unfinished_progress",progress:"migration started",blocker:"awaiting access"}`.
+The host compares every echoed binding to its dispatch record, checks the SHA
+and permitted state transition, and stores only the validated result request.
+
+Planner and critic calls have narrower, role-specific schemas and explicit host
+bindings: `ProposalSchema` requires `{project_id, proposal_id, planner_run_id,
+tasks:[{key,title,dependencies,acceptance}]}`; `CriticVerdictSchema` requires
+`{task_id, attempt_id, candidate_sha, verdict:"pass"|"rework"|"reject",
+findings:[...]}`. The host supplies and compares the planner's project/proposal
+scope and run ID, and the critic's task/attempt/candidate SHA, rejecting an
+output that does not echo or match its scope; neither schema can create tasks,
+approve, merge, or accept. Missing output, invalid schema/semantic identity,
 `StructuredOutputError`, provider/transport failure, and failed/uncertain
 execution are distinct. A syntactically valid payload never overrides failed or
 uncertain execution, authorizes a task, merges, or accepts. Validation retries
